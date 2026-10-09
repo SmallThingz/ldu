@@ -30,6 +30,7 @@ pub struct EntryMetadata {
 pub enum MetadataReader {
     #[cfg(target_os = "linux")]
     Native(rustix::fd::OwnedFd),
+    #[cfg(not(target_os = "linux"))]
     Std(PathBuf),
 }
 
@@ -47,7 +48,8 @@ impl MetadataReader {
                     }
                 }
             }
-            Self::Std(path) => root_metadata(&path.join(name)),
+            #[cfg(not(target_os = "linux"))]
+            Self::Std(path) => std_path_metadata(&path.join(name)),
         }
     }
 }
@@ -310,7 +312,6 @@ pub fn enumerate_anchored(
     mut emit: impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     check_cancel(cancel)?;
-    validate_relative(relative)?;
     let batch_size = batch_size.max(1);
     #[cfg(target_os = "linux")]
     {
@@ -332,15 +333,14 @@ pub fn enumerate_anchored(
                 result => return result,
             }
         }
-        let MetadataReader::Native(fd) = &reader else {
-            unreachable!()
-        };
+        let MetadataReader::Native(fd) = &reader;
         use std::os::fd::AsRawFd;
         let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
         enumerate_std(&path, &reader, batch_size, cancel, &mut emit)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        validate_relative(relative)?;
         let _ = buffer_size;
         if backend == Backend::Native {
             return Err(io::Error::new(
@@ -355,8 +355,9 @@ pub fn enumerate_anchored(
                 "enumeration requires a directory without a symbolic link",
             ));
         }
-        let reader = MetadataReader::Std(path.clone());
-        enumerate_std(&path, &reader, batch_size, cancel, &mut emit)
+        let reader = MetadataReader::Std(path);
+        let MetadataReader::Std(path) = &reader;
+        enumerate_std(path, &reader, batch_size, cancel, &mut emit)
     }
 }
 
@@ -368,23 +369,28 @@ fn enumerate_std(
     emit: &mut impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     let entries = fs::read_dir(path)?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch = Vec::new();
     for entry in entries {
         check_cancel(cancel)?;
         match entry {
-            Ok(entry) => batch.push(entry.file_name()),
+            Ok(entry) => {
+                if batch.is_empty() {
+                    batch.reserve_exact(batch_size);
+                }
+                batch.push(entry.file_name());
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                flush(&mut batch, batch_size, reader, emit)?;
+                flush(&mut batch, reader, emit)?;
                 return Err(error);
             }
         }
         if batch.len() == batch_size {
-            flush(&mut batch, batch_size, reader, emit)?;
+            flush(&mut batch, reader, emit)?;
         }
     }
     check_cancel(cancel)?;
-    flush(&mut batch, batch_size, reader, emit)
+    flush(&mut batch, reader, emit)
 }
 
 #[cfg(target_os = "linux")]
@@ -399,14 +405,12 @@ fn enumerate_native(
     use rustix::io::Errno;
     use std::os::unix::ffi::OsStrExt;
 
-    let MetadataReader::Native(fd) = reader else {
-        unreachable!()
-    };
+    let MetadataReader::Native(fd) = reader;
     let mut buffer = Vec::<u8>::new();
     buffer
         .try_reserve_exact(buffer_size.max(4096))
         .map_err(io::Error::other)?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch = Vec::new();
     loop {
         let mut resize = false;
         let capacity = buffer.capacity();
@@ -425,7 +429,7 @@ fn enumerate_native(
                         break;
                     }
                     Err(error) => {
-                        flush(&mut batch, batch_size, reader, emit)?;
+                        flush(&mut batch, reader, emit)?;
                         return Err(error.into());
                     }
                 };
@@ -433,9 +437,12 @@ fn enumerate_native(
                 if bytes == b"." || bytes == b".." {
                     continue;
                 }
+                if batch.is_empty() {
+                    batch.reserve_exact(batch_size);
+                }
                 batch.push(OsStr::from_bytes(bytes).to_owned());
                 if batch.len() == batch_size {
-                    flush(&mut batch, batch_size, reader, emit)?;
+                    flush(&mut batch, reader, emit)?;
                 }
             }
         }
@@ -448,22 +455,18 @@ fn enumerate_native(
             .map_err(io::Error::other)?;
     }
     check_cancel(cancel)?;
-    flush(&mut batch, batch_size, reader, emit)
+    flush(&mut batch, reader, emit)
 }
 
 fn flush(
     batch: &mut Vec<OsString>,
-    batch_size: usize,
     reader: &MetadataReader,
     emit: &mut impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
-    emit(
-        std::mem::replace(batch, Vec::with_capacity(batch_size)),
-        reader,
-    )
+    emit(std::mem::take(batch), reader)
 }
 
 fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {

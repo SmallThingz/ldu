@@ -10,7 +10,7 @@ use std::{io, path::PathBuf, time::Instant};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Live breadth-first disk usage; ncdu-style navigation"
+    about = "Live disk usage with effort-first scanning; ncdu-style navigation"
 )]
 struct Args {
     #[arg(default_value = ".")]

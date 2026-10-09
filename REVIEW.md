@@ -2,7 +2,7 @@
 
 Completion requires two consecutive adversarial review passes, each using all six reviewer slots, with no valid findings. A valid finding and its fix reset the clean-pass count. Tests and measurements are separate evidence and do not count as review passes.
 
-Current consecutive clean passes: **2**. The active revision passed release qualification and consecutive saturated Passes 29 and 30 on unchanged source. Publication is authorized. Passes 22 and 23 qualify the earlier commit `9ffe71e` only.
+Current consecutive clean passes: **2**. Qualified effort-first source `2afcfe273c5d87ffbf4b89f0db19e36e737d715412a3652b5452d921ac3f66db` passed consecutive saturated Passes 31 and 32 unchanged. Publication is authorized.
 
 | Pass | Reviewers | Result | Status |
 | --- | --- | --- | --- |
@@ -34,7 +34,9 @@ Current consecutive clean passes: **2**. The active revision passed release qual
 | 27 | 6 of 6 | Three findings; three reviewers reported none | Fixed and requalified; streak 0 |
 | 28 | 6 of 6 | Two findings; four reviewers reported none | Fixed and requalified; streak 0 |
 | 29 | 6 of 6 | No findings | Clean; streak 1 |
-| 30 | 6 of 6 | No findings | Clean; streak 2; current revision qualified |
+| 30 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
+| 31 | 6 of 6 | No findings | Clean; streak 1 |
+| 32 | 6 of 6 | No findings | Clean; streak 2; current revision qualified |
 
 Pass 1 findings, now closed:
 
@@ -345,3 +347,26 @@ All six fresh reviewers were verified running concurrently before RELEASE on qua
 ### Pass 30
 
 All six fresh reviewers were verified running simultaneously before RELEASE on the same qualified source as Pass 29: `745bcf043a8526ff68e60b7af413dc8ac021d53a94fb0bb9647658aabefec57d`. Domains: keyboard, mouse, selection lifecycle, deletion, scanning/accounting, and rendering/validation. All six independently reported **NO FINDINGS**. Source remained unchanged through both rounds, with no repository writes during either review. Clean streak is **2**. Working, staged and committed publication source bytes are checked against the qualification digest before the authorized push.
+
+
+## Effort-first scheduling and compact data
+
+User scope excludes a persistent index or background service. Approximate subtree effort replaces strict breadth-first barriers; hovered pending work retains priority. File-only effort reports coalesce at 1,024 entries, dispatch samples at most eight siblings per ancestor, and active readers continue without preemption. All application Rust now forbids unsafe code. Release remains opt-level 3 with thin LTO and one codegen unit; unused underline-color support and release symbols are removed.
+
+Qualification passed on frozen digest `2afcfe273c5d87ffbf4b89f0db19e36e737d715412a3652b5452d921ac3f66db`: 217 unit plus seven filesystem tests (224 total), formatting, warnings-denied Linux Clippy, macOS all-target compilation, release build, four PTY corpora and nine backend JSON comparisons. macOS runtime remains untested; three existing test-only dead-code warnings remain. Evidence: `.tmp/effort-checks.log`, `.tmp/qualification-effort.log`, `.tmp/qualified-effort.json`.
+
+Measured x86_64 layouts: Node 136→128 bytes, RowState 72→64, CachedDirectory 104→96, Scheduler 176→128, ScheduledDirectory unchanged at 88 with vector pending children replacing tree allocations. Release executable: 2,531,408→2,018,448 bytes; stripping the baseline alone yields 2,060,928 bytes, so 42,480 bytes of reduction remain with matching symbol stripping. Size evidence: `.tmp/effort-layouts.json`, `.tmp/effort-binary-sizes.json`. No throughput claim is established by these size measurements.
+
+### Pass 31
+
+Six fresh reviewers prepared at a READY barrier. Source is frozen for scheduler, backend, accounting, ordering/UI, deletion integration, and validation/docs review. Qualification evidence does not count as a clean review pass.
+
+All six fresh Pass 31 reviewers were verified running simultaneously after READY and before RELEASE. All six independently reported **NO FINDINGS**. No source files changed during the pass; the qualification digest is unchanged. Clean streak is **1**.
+
+The paired benchmark attempt collected no timings: unrelated host work kept the host-quiet gate busy for its 45-second limit. The gate was not weakened and no unrelated process was signalled. Performance claims remain limited to verified layouts, allocation/work reductions, and executable size.
+
+### Pass 32
+
+Fresh six-agent adversarial review on the same qualified source is preparing at the READY barrier.
+
+All six fresh Pass 32 reviewers were verified running simultaneously after READY and before RELEASE on the same qualified source as Pass 31. All six independently reported **NO FINDINGS**. Source remained frozen through both passes and still matches the qualification digest. Clean streak is **2**. Working, staged and committed source bytes are checked against that digest before publication.

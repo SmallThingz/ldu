@@ -4,11 +4,11 @@
 ![Linux](https://img.shields.io/badge/platform-Linux-495057?logo=linux&logoColor=ffffff)
 ![Ratatui](https://img.shields.io/badge/TUI-Ratatui-526d82)
 
-Terminal disk-usage browser written in Rust. Browse folder sizes while a parallel breadth-first scan runs.
+Terminal disk-usage browser written in Rust. Browse folder sizes while a parallel scan runs.
 
 ## Highlights
 
-- Live totals from a parallel breadth-first scan
+- Live totals with scan work balanced by entries checked
 - Gray Braille spinners beside folders still scanning
 - Cached sorted directory views, with matching subfolder previews on wide terminals
 - Fractional block bars for size distribution

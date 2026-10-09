@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     ffi::OsStr,
     io,
+    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
@@ -29,7 +30,6 @@ pub struct OrderConfig {
     pub descending: bool,
     pub show_hidden: bool,
     pub directories_first: bool,
-    pub directories_only: bool,
 }
 
 impl Default for OrderConfig {
@@ -40,7 +40,6 @@ impl Default for OrderConfig {
             descending: true,
             show_hidden: true,
             directories_first: false,
-            directories_only: false,
         }
     }
 }
@@ -73,12 +72,14 @@ impl OrderRow {
 
 struct SortedRows {
     ids: Vec<NodeId>,
+    directory_ids: Vec<NodeId>,
     positions: HashMap<NodeId, usize>,
 }
 
 struct RowState {
     row: OrderRow,
-    rank: Option<usize>,
+    // One-based ranks leave zero for rows not yet published.
+    rank: Option<NonZeroUsize>,
 }
 
 struct State {
@@ -97,33 +98,35 @@ impl State {
     }
 
     fn snapshot(&mut self) -> SortedRows {
+        let config = self.config;
         let mut ranked: Vec<_> = self
             .rows
-            .values()
+            .values_mut()
             .filter(|state| {
-                (!self.config.directories_only || state.row.kind == NodeKind::Directory)
-                    && (self.config.show_hidden
-                        || state.row.name.as_encoded_bytes().first() != Some(&b'.'))
+                config.show_hidden || state.row.name.as_encoded_bytes().first() != Some(&b'.')
             })
             .collect();
-        ranked.sort_unstable_by(|a, b| compare_rows(a, b, self.config));
-        if self.config.sort_mode == SortMode::Size {
-            stabilize_size_groups(&mut ranked, self.config);
+        ranked.sort_unstable_by(|a, b| compare_rows(a, b, config));
+        if config.sort_mode == SortMode::Size {
+            stabilize_size_groups(&mut ranked, config);
         }
-        let ids: Vec<_> = ranked.iter().map(|state| state.row.id).collect();
-        let positions: HashMap<_, _> = ids
-            .iter()
-            .enumerate()
-            .map(|(index, &id)| (id, index))
-            .collect();
-        drop(ranked);
-        for (&id, &rank) in &positions {
-            if let Some(state) = self.rows.get_mut(&id) {
-                state.rank = Some(rank);
+        let mut ids = Vec::with_capacity(ranked.len());
+        let mut directory_ids = Vec::new();
+        let mut positions = HashMap::with_capacity(ranked.len());
+        for (rank, state) in ranked.into_iter().enumerate() {
+            state.rank = NonZeroUsize::new(rank + 1);
+            ids.push(state.row.id);
+            positions.insert(state.row.id, rank);
+            if state.row.kind == NodeKind::Directory {
+                directory_ids.push(state.row.id);
             }
         }
         self.dirty = false;
-        SortedRows { ids, positions }
+        SortedRows {
+            ids,
+            directory_ids,
+            positions,
+        }
     }
 }
 
@@ -170,7 +173,7 @@ fn compare_group_rows(a: &RowState, b: &RowState, config: OrderConfig) -> Orderi
     }
 }
 
-fn stabilize_size_groups(rows: &mut [&RowState], config: OrderConfig) {
+fn stabilize_size_groups(rows: &mut [&mut RowState], config: OrderConfig) {
     let mut start = 0;
     while start < rows.len() {
         let anchor = rows[start].row.size;
@@ -291,13 +294,7 @@ impl CachedOrderWorker {
     fn set_config(&mut self, config: OrderConfig, clear: bool) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         let clear = clear || self.pending_config.is_some_and(|(_, pending)| pending);
-        self.pending_config = Some((
-            OrderConfig {
-                directories_only: false,
-                ..config
-            },
-            clear,
-        ));
+        self.pending_config = Some((config, clear));
         self.flush_config();
         self.generation
     }
@@ -389,10 +386,10 @@ impl Drop for CachedOrderWorker {
 struct CachedDirectory {
     order: State,
     published: Option<Instant>,
-    published_rows: usize,
+    published_has_rows: bool,
     directory_count: usize,
     visible_count: usize,
-    published_directories: usize,
+    published_has_directories: bool,
 }
 
 impl CachedDirectory {
@@ -403,10 +400,10 @@ impl CachedDirectory {
         Self {
             order,
             published: None,
-            published_rows: 0,
+            published_has_rows: false,
             directory_count: 0,
             visible_count: 0,
-            published_directories: 0,
+            published_has_directories: false,
         }
     }
 }
@@ -558,8 +555,8 @@ impl CacheState {
                     for (&id, directory) in &mut self.directories {
                         directory.order.config = config;
                         directory.published = None;
-                        directory.published_rows = 0;
-                        directory.published_directories = 0;
+                        directory.published_has_rows = false;
+                        directory.published_has_directories = false;
                         directory.directory_count = 0;
                         directory.visible_count = 0;
                         for state in directory.order.rows.values_mut() {
@@ -708,8 +705,8 @@ impl CacheState {
                 && (directory
                     .published
                     .is_none_or(|last| last.elapsed() >= SORT_INTERVAL)
-                    || (directory.published_rows == 0 && directory.visible_count != 0)
-                    || (directory.published_directories == 0 && directory.directory_count != 0))
+                    || (!directory.published_has_rows && directory.visible_count != 0)
+                    || (!directory.published_has_directories && directory.directory_count != 0))
         }) && !self.is_removed(id)
     }
 
@@ -741,22 +738,16 @@ impl CacheState {
     fn publish(&mut self, id: NodeId, cache: &SharedCache) {
         let directory = self.directories.get_mut(&id).unwrap();
         let snapshot = directory.order.snapshot();
-        let directory_ids = snapshot
-            .ids
-            .iter()
-            .copied()
-            .filter(|id| directory.order.rows[id].row.kind == NodeKind::Directory)
-            .collect();
         let view = Arc::new(CachedSnapshot {
             generation: self.generation,
             child_epoch: self.parents.get(&id).map_or(0, |link| link.child_epoch),
             ids: snapshot.ids,
-            directory_ids,
+            directory_ids: snapshot.directory_ids,
             positions: snapshot.positions,
         });
         directory.published = Some(Instant::now());
-        directory.published_rows = view.ids.len();
-        directory.published_directories = view.directory_ids.len();
+        directory.published_has_rows = !view.ids.is_empty();
+        directory.published_has_directories = !view.directory_ids.is_empty();
         let previous = self.published.insert(id, view);
         self.publish_index(cache);
         if let Some(old) = previous {
@@ -1434,9 +1425,8 @@ mod tests {
     }
 
     #[test]
-    fn directory_only_preview_keeps_live_normal_order_and_hidden_policy() {
+    fn preview_keeps_live_normal_order_and_hidden_policy() {
         let mut state = State::new();
-        state.config.directories_only = true;
         state.config.show_hidden = false;
         let mut small = row(1, "small", 10);
         small.kind = NodeKind::Directory;
@@ -1445,9 +1435,13 @@ mod tests {
         let mut hidden = row(3, ".hidden", 1000);
         hidden.kind = NodeKind::Directory;
         put(&mut state, vec![small, large, hidden, row(4, "file", 2000)]);
-        assert_eq!(state.snapshot().ids, vec![2, 1]);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.ids, vec![4, 2, 1]);
+        assert_eq!(snapshot.directory_ids, vec![2, 1]);
         state.rows.remove(&2);
-        assert_eq!(state.snapshot().ids, vec![1]);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.ids, vec![4, 1]);
+        assert_eq!(snapshot.directory_ids, vec![1]);
     }
 
     fn epoch_row(

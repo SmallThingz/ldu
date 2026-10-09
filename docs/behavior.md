@@ -2,7 +2,7 @@
 
 ## Scanning and display
 
-The terminal opens before scanning starts. Directory scanning normally uses breadth-first depth barriers and parallel metadata batches. Hovering over or entering an unfinished directory gives that subtree scan priority; unrelated browsing does not restart the scan. Progress updates use bounded channels; keyboard actions repaint immediately. Incomplete terminal input does not block resizing, scan updates or signal-driven shutdown.
+The terminal opens before scanning starts. Available workers favor subtrees with fewer reported entry checks, with an allowance for directory reads already underway. Scheduling compares a bounded sample of competing siblings, so the balance is approximate. Deeper work can start while shallower directories are still being read. Hovering over or entering an unfinished directory gives its pending work priority; active reads continue. Metadata work runs in parallel batches, and browsing does not restart the scan. Progress updates use bounded channels; keyboard actions repaint immediately. Incomplete terminal input does not block resizing, scan updates or signal-driven shutdown.
 
 Scanning and completed entries share the same sort. Near-size groups retain their previous order to reduce movement. Each group spans at most 2%; nearby entries in different groups can still exchange places. Selection tracks the entry by its ID as live totals change.
 

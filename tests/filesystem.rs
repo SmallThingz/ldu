@@ -7,7 +7,7 @@ use ldu::{
     types::{NodeId, NodeKind, ROOT, ScanEvent, Sizes},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::OsString,
     fs::{self, File, Permissions},
     os::unix::{
@@ -65,8 +65,10 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
     );
     let mut model = Model::new(root.to_owned());
     let mut delivered = Sizes::default();
-    let mut directories = HashMap::from([(ROOT, 0usize)]);
+    let mut directories = HashSet::from([ROOT]);
     let mut done = HashSet::new();
+    let mut root_received = false;
+    let mut next_id = ROOT + 1;
     loop {
         let event = handle
             .receiver
@@ -75,42 +77,48 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
         let finished = matches!(event, ScanEvent::Finished { .. });
         match &event {
             ScanEvent::RootInfo { sizes, .. } => {
+                assert!(!root_received, "root metadata must be delivered once");
+                root_received = true;
                 delivered.apparent += sizes.apparent;
                 delivered.allocated += sizes.allocated;
             }
             ScanEvent::Entries { parent, entries } => {
-                let depth = directories[parent];
-                for (id, shallower) in &directories {
-                    if *shallower < depth {
-                        assert!(
-                            done.contains(id),
-                            "deeper directory scanned before shallow level ended"
-                        );
-                    }
-                }
+                assert!(root_received, "root metadata must precede entries");
+                assert!(
+                    directories.contains(parent),
+                    "entry parent must already exist"
+                );
+                assert!(
+                    !done.contains(parent),
+                    "entries cannot follow their directory's end"
+                );
                 for entry in entries {
+                    assert_eq!(entry.id, next_id, "entry IDs must be contiguous and unique");
+                    next_id += 1;
                     if !entry.hardlink_duplicate {
                         delivered.apparent += entry.sizes.apparent;
                         delivered.allocated += entry.sizes.allocated;
                     }
                     if entry.kind == NodeKind::Directory {
-                        directories.insert(entry.id, depth + 1);
+                        assert!(directories.insert(entry.id));
                     }
                 }
             }
             ScanEvent::DirectoryDone { id, .. } => {
-                let depth = directories[id];
-                for (other, shallower) in &directories {
-                    if *shallower < depth {
-                        assert!(
-                            done.contains(other),
-                            "empty directory crossed the BFS depth barrier"
-                        );
-                    }
-                }
-                done.insert(*id);
+                assert!(
+                    root_received,
+                    "root metadata must precede directory completion"
+                );
+                assert!(
+                    directories.contains(id),
+                    "completed directory must already exist"
+                );
+                assert!(done.insert(*id), "a directory must finish exactly once");
             }
-            ScanEvent::Finished { .. } => {}
+            ScanEvent::Finished { .. } => {
+                assert!(root_received);
+                assert_eq!(done, directories, "all discovered directories must finish");
+            }
         }
         let _ = model.apply(event);
         assert_eq!(
@@ -118,7 +126,9 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
             delivered,
             "live totals must conserve delivered bytes"
         );
-        for id in directories.keys().copied() {
+        assert_eq!(model.node(ROOT).items, u64::from(next_id - 1));
+        assert_eq!(model.len() as NodeId, next_id);
+        for id in directories.iter().copied() {
             if model.node(id).complete {
                 assert!(done.contains(&id));
                 assert!(model.children(id).all(|child| model.node(child).complete));
@@ -422,33 +432,41 @@ fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias()
     fs::write(root.join("owner"), b"hard link payload").unwrap();
     fs::create_dir_all(root.join("branch/deeper")).unwrap();
     fs::hard_link(root.join("owner"), root.join("branch/deeper/alias")).unwrap();
-    fs::create_dir(root.join("wide")).unwrap();
-    // The bounded event channel fills before this level can finish. Strict BFS
-    // keeps the deeper alias's metadata undiscovered until we resume receiving.
+    // With one worker, the active branch must finish before its deeper task can
+    // start. More single-entry batches than the bounded event channel can hold
+    // keep that branch active while intake stops at the root owner, regardless
+    // of enumeration order. The alias is checked only after deletion and intake.
     for n in 0..600 {
-        fs::write(root.join("wide").join(format!("padding-{n:04}")), b"p").unwrap();
+        fs::write(root.join("branch").join(format!("padding-{n:04}")), b"p").unwrap();
     }
     let handle = scan::spawn(
         root.to_owned(),
         ScanOptions {
-            threads: 2,
+            threads: 1,
             batch_size: 1,
             buffer_size: 4096,
             backend: Backend::Auto,
         },
     );
     let mut model = Model::new(root.to_owned());
-    let owner = loop {
+    let (owner, owner_group) = loop {
         let event = handle
             .receiver
             .recv_timeout(Duration::from_secs(15))
             .unwrap();
+        let owner = match &event {
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries,
+            } => entries
+                .iter()
+                .find(|entry| entry.name == "owner")
+                .map(|entry| (entry.id, entry.hardlink_group.unwrap())),
+            _ => None,
+        };
         let _ = model.apply(event);
-        if let Some(id) = model
-            .children(ROOT)
-            .find(|&id| model.node(id).name.as_ref() == "owner")
-        {
-            break id;
+        if let Some(owner) = owner {
+            break owner;
         }
     };
     assert!(!handle.is_finished() && !model.finished);
@@ -483,7 +501,7 @@ fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias()
         if let ScanEvent::Entries { entries, .. } = &event {
             for entry in entries {
                 if entry.name == "alias" {
-                    assert_eq!(entry.hardlink_group, Some(owner));
+                    assert_eq!(entry.hardlink_group, Some(owner_group));
                     late_alias = Some(entry.id);
                 }
             }

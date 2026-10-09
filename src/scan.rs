@@ -2,7 +2,7 @@ use crate::backend::{self, Backend, EntryMetadata, RootAnchor};
 use crate::types::{Entry, NodeId, NodeKind, ScanEvent, Sizes};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +12,10 @@ use std::time::Duration;
 
 const EVENT_CAPACITY: usize = 128;
 const SEND_INTERVAL: Duration = Duration::from_millis(20);
+// Approximate fairness only: bound selection work and amortize file-only reports.
+const EFFORT_SAMPLE: usize = 8;
+const EFFORT_REPORT_ENTRIES: usize = 1024;
+const ACTIVE_EFFORT_RESERVATION: u64 = 128;
 
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
@@ -63,7 +67,7 @@ impl ScanHandle {
         self.control.prioritize(relative);
     }
 
-    /// Restore breadth-first scheduling after leaving a focused directory.
+    /// Restore normal effort-based scheduling after leaving a focused directory.
     pub fn clear_priority(&self) {
         self.control.clear_priority();
     }
@@ -328,154 +332,209 @@ struct DirectoryTask {
     path: PathBuf,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum TaskState {
-    Pending,
-    Active,
-    Complete,
+struct ScheduledDirectory {
+    pending_path: Option<PathBuf>,
+    parent: Option<NodeId>,
+    pending_children: Vec<NodeId>,
+    // Index in the parent's pending_children, or usize::MAX when unavailable.
+    pending_slot: usize,
+    sample_cursor: usize,
+    checked: u64,
+    active: usize,
 }
 
-struct ScheduledDirectory {
-    task: Option<DirectoryTask>,
-    parent: Option<NodeId>,
-    depth: usize,
-    state: TaskState,
-    pending: usize,
-    pending_children: BTreeSet<NodeId>,
+impl ScheduledDirectory {
+    fn has_pending(&self) -> bool {
+        self.pending_path.is_some() || !self.pending_children.is_empty()
+    }
+
+    fn effort(&self) -> u64 {
+        self.checked
+            .saturating_add((self.active as u64).saturating_mul(ACTIVE_EFFORT_RESERVATION))
+    }
 }
 
 #[derive(Default)]
 struct Scheduler {
     directories: HashMap<NodeId, ScheduledDirectory>,
     paths: HashMap<PathBuf, NodeId>,
-    pending_depths: BTreeMap<usize, BTreeSet<NodeId>>,
-    active_depths: BTreeMap<usize, usize>,
+    root: Option<NodeId>,
     focus: Option<PathBuf>,
-    active: usize,
 }
 
 impl Scheduler {
     fn insert(&mut self, task: DirectoryTask, parent: Option<NodeId>) {
         let id = task.id;
-        let depth = parent.map_or(0, |parent| self.directories[&parent].depth + 1);
         self.paths.insert(task.path.clone(), id);
         self.directories.insert(
             id,
             ScheduledDirectory {
-                task: Some(task),
+                pending_path: Some(task.path),
                 parent,
-                depth,
-                state: TaskState::Pending,
-                pending: 0,
-                pending_children: BTreeSet::new(),
+                pending_children: Vec::new(),
+                pending_slot: usize::MAX,
+                sample_cursor: 0,
+                checked: 0,
+                active: 0,
             },
         );
-        self.pending_depths.entry(depth).or_default().insert(id);
+        if parent.is_none() {
+            self.root = Some(id);
+        }
+        // Most insertions stop at their immediate parent. Only a transition from
+        // no pending work to some pending work needs to travel up the tree.
         let mut current = id;
-        loop {
+        while let Some(parent) = self.directories[&current].parent {
             let directory = self
                 .directories
-                .get_mut(&current)
-                .expect("registered directory");
-            directory.pending += 1;
-            let Some(parent) = directory.parent else {
-                break;
-            };
-            self.directories
                 .get_mut(&parent)
-                .expect("registered parent")
-                .pending_children
-                .insert(current);
+                .expect("registered parent");
+            let was_pending = directory.has_pending();
+            let slot = directory.pending_children.len();
+            directory.pending_children.push(current);
+            self.directories
+                .get_mut(&current)
+                .expect("registered directory")
+                .pending_slot = slot;
+            if was_pending {
+                break;
+            }
             current = parent;
         }
     }
 
-    fn focused(&self) -> Option<NodeId> {
-        let mut current = *self.paths.get(self.focus.as_ref()?)?;
+    fn pending_from(&mut self, mut current: NodeId) -> Option<NodeId> {
         loop {
             let directory = &self.directories[&current];
-            if directory.pending == 0 {
-                return None;
-            }
-            if directory.state == TaskState::Pending {
+            if directory.pending_path.is_some() {
                 return Some(current);
             }
-            current = *directory.pending_children.first()?;
+            let children = &directory.pending_children;
+            if children.is_empty() {
+                return None;
+            }
+            let count = children.len().min(EFFORT_SAMPLE);
+            let start = directory.sample_cursor % children.len();
+            let mut selected = children[start];
+            let mut effort = self.directories[&selected].effort();
+            for offset in 1..count {
+                let candidate = children[(start + offset) % children.len()];
+                let candidate_effort = self.directories[&candidate].effort();
+                if candidate_effort < effort {
+                    selected = candidate;
+                    effort = candidate_effort;
+                }
+            }
+            // Rotate even when every sibling fits in the sample so equal-cost
+            // branches share dispatches before their first progress report.
+            let step = if count == children.len() { 1 } else { count };
+            let cursor = (start + step) % children.len();
+            self.directories
+                .get_mut(&current)
+                .expect("registered directory")
+                .sample_cursor = cursor;
+            current = selected;
         }
+    }
+
+    fn focused(&mut self) -> Option<NodeId> {
+        let root = *self.paths.get(self.focus.as_ref()?)?;
+        self.pending_from(root)
     }
 
     fn take(&mut self) -> Option<DirectoryTask> {
-        let id = if let Some(focused) = self.focused() {
-            focused
-        } else {
-            let (&depth, pending) = self.pending_depths.first_key_value()?;
-            if self
-                .active_depths
-                .first_key_value()
-                .is_some_and(|(&active_depth, _)| active_depth < depth)
-            {
-                return None;
-            }
-            *pending.first()?
-        };
-        let depth = self.directories[&id].depth;
-        let pending = self.pending_depths.get_mut(&depth).expect("pending depth");
-        pending.remove(&id);
-        if pending.is_empty() {
-            self.pending_depths.remove(&depth);
-        }
+        let id = self.focused().or_else(|| self.pending_from(self.root?))?;
+        let path = self.directories.get_mut(&id)?.pending_path.take()?;
         let mut current = id;
         loop {
             let directory = self
                 .directories
                 .get_mut(&current)
                 .expect("registered directory");
-            directory.pending -= 1;
-            let remaining = directory.pending;
+            directory.active += 1;
             let Some(parent) = directory.parent else {
                 break;
             };
-            if remaining == 0 {
+            current = parent;
+        }
+        // Remove empty branches with constant-time swap removal, stopping as
+        // soon as an ancestor still contains another pending task.
+        current = id;
+        while !self.directories[&current].has_pending() {
+            let Some(parent) = self.directories[&current].parent else {
+                break;
+            };
+            let slot = self.directories[&current].pending_slot;
+            let directory = self
+                .directories
+                .get_mut(&parent)
+                .expect("registered parent");
+            debug_assert_eq!(directory.pending_children[slot], current);
+            directory.pending_children.swap_remove(slot);
+            let moved = directory.pending_children.get(slot).copied();
+            self.directories
+                .get_mut(&current)
+                .expect("registered directory")
+                .pending_slot = usize::MAX;
+            if let Some(moved) = moved {
                 self.directories
-                    .get_mut(&parent)
-                    .expect("registered parent")
-                    .pending_children
-                    .remove(&current);
+                    .get_mut(&moved)
+                    .expect("registered sibling")
+                    .pending_slot = slot;
             }
             current = parent;
         }
-        let directory = self.directories.get_mut(&id).expect("registered directory");
-        directory.state = TaskState::Active;
-        *self.active_depths.entry(depth).or_default() += 1;
-        self.active += 1;
-        directory.task.take()
+        Some(DirectoryTask { id, path })
     }
 
-    fn complete(&mut self, id: NodeId) {
-        let directory = self.directories.get_mut(&id).expect("active directory");
-        directory.state = TaskState::Complete;
-        let active = self
-            .active_depths
-            .get_mut(&directory.depth)
-            .expect("active depth");
-        *active -= 1;
-        if *active == 0 {
-            self.active_depths.remove(&directory.depth);
+    fn checked(&mut self, mut id: NodeId, entries: usize) {
+        if entries == 0 {
+            return;
         }
-        self.active -= 1;
+        // Charge an entire report at once; never update tree ordering per file.
+        loop {
+            let directory = self.directories.get_mut(&id).expect("registered directory");
+            directory.checked = directory.checked.saturating_add(entries as u64);
+            let Some(parent) = directory.parent else {
+                break;
+            };
+            id = parent;
+        }
+    }
+
+    fn complete(&mut self, mut id: NodeId) {
+        loop {
+            let directory = self.directories.get_mut(&id).expect("active directory");
+            directory.active -= 1;
+            let Some(parent) = directory.parent else {
+                break;
+            };
+            id = parent;
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.root.map_or(0, |root| self.directories[&root].active)
     }
 
     fn is_empty(&self) -> bool {
-        self.active == 0 && self.pending_depths.is_empty()
+        self.root.is_none_or(|root| {
+            let root = &self.directories[&root];
+            root.active == 0 && !root.has_pending()
+        })
     }
 }
 
 enum WorkerMessage {
-    Discovered {
+    Progress {
         parent: NodeId,
         tasks: Vec<DirectoryTask>,
+        checked: usize,
     },
-    Complete(NodeId),
+    Complete {
+        id: NodeId,
+        checked: usize,
+    },
 }
 
 /// File identities are shared across scoped scans. Group IDs are opaque and
@@ -860,7 +919,7 @@ fn run_scheduler(
                 FocusRequest::Clear => None,
             };
         }
-        while scheduler.active < options.threads && !cancel.load(Ordering::Acquire) {
+        while scheduler.active() < options.threads && !cancel.load(Ordering::Acquire) {
             let Some(task) = scheduler.take() else { break };
             let worker_anchor = Arc::clone(&anchor);
             let worker_emitter = Arc::clone(&emitter);
@@ -870,6 +929,7 @@ fn run_scheduler(
             let worker_options = options.clone();
             pool.spawn(move || {
                 let id = task.id;
+                let mut pending_checked = 0;
                 scan_directory_emit(
                     &task,
                     &worker_anchor,
@@ -877,20 +937,28 @@ fn run_scheduler(
                     &worker_emitter,
                     &worker_cancel,
                     &worker_control,
-                    |tasks| {
-                        if tasks.is_empty() {
+                    |tasks, checked| {
+                        pending_checked += checked;
+                        if tasks.is_empty() && pending_checked < EFFORT_REPORT_ENTRIES {
                             return Ok(());
                         }
                         send_worker(
                             &worker_messages,
-                            WorkerMessage::Discovered { parent: id, tasks },
+                            WorkerMessage::Progress {
+                                parent: id,
+                                tasks,
+                                checked: std::mem::take(&mut pending_checked),
+                            },
                             &worker_cancel,
                         )
                     },
                 );
                 let _ = send_worker(
                     &worker_messages,
-                    WorkerMessage::Complete(id),
+                    WorkerMessage::Complete {
+                        id,
+                        checked: pending_checked,
+                    },
                     &worker_cancel,
                 );
             });
@@ -900,12 +968,16 @@ fn run_scheduler(
         }
         crossbeam_channel::select! {
             recv(receiver) -> message => match message {
-                Ok(WorkerMessage::Discovered { parent, tasks }) => {
+                Ok(WorkerMessage::Progress { parent, tasks, checked }) => {
+                    scheduler.checked(parent, checked);
                     for task in tasks {
                         scheduler.insert(task, Some(parent));
                     }
                 }
-                Ok(WorkerMessage::Complete(id)) => scheduler.complete(id),
+                Ok(WorkerMessage::Complete { id, checked }) => {
+                    scheduler.checked(id, checked);
+                    scheduler.complete(id);
+                }
                 Err(_) => break,
             },
             recv(wake_receiver) -> _ => {},
@@ -983,7 +1055,7 @@ fn scan_directory(
         emitter,
         cancel,
         control,
-        |directories| {
+        |directories, _checked| {
             next.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .extend(directories);
@@ -999,7 +1071,7 @@ fn scan_directory_emit(
     emitter: &Mutex<Emitter>,
     cancel: &AtomicBool,
     control: &ScanControl,
-    mut emit_directories: impl FnMut(Vec<DirectoryTask>) -> io::Result<()>,
+    mut emit_directories: impl FnMut(Vec<DirectoryTask>, usize) -> io::Result<()>,
 ) {
     if cancel.load(Ordering::Acquire) {
         return;
@@ -1019,6 +1091,8 @@ fn scan_directory_emit(
                 if cancel.load(Ordering::Acquire) || active.cancel.load(Ordering::Acquire) {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
                 }
+                // Include files and failed metadata checks in the batch's effort.
+                let checked = names.len();
                 // Nested Rayon jobs use the same bounded pool, including for a single wide directory.
                 let discovered = names
                     .into_par_iter()
@@ -1038,7 +1112,7 @@ fn scan_directory_emit(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .entries(task, discovered, cancel, control)?;
-                emit_directories(directories)
+                emit_directories(directories, checked)
             },
         )
     };
@@ -1128,57 +1202,135 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_preserves_default_breadth_barriers_for_streamed_discoveries() {
+    fn available_workers_take_deeper_work_while_shallower_directories_are_active() {
         let mut scheduler = Scheduler::default();
         scheduler.insert(task(0, ""), None);
         assert_eq!(scheduler.take().unwrap().id, 0);
         scheduler.insert(task(1, "first"), Some(0));
         scheduler.insert(task(2, "second"), Some(0));
-        assert!(
-            scheduler.take().is_none(),
-            "children wait for the root barrier"
-        );
-        scheduler.complete(0);
         assert_eq!(scheduler.take().unwrap().id, 1);
-        assert_eq!(scheduler.take().unwrap().id, 2);
         scheduler.insert(task(3, "first/deep"), Some(1));
-        assert!(scheduler.take().is_none());
-        scheduler.complete(1);
-        assert!(
-            scheduler.take().is_none(),
-            "all peers must finish the depth"
-        );
-        scheduler.complete(2);
+        assert_eq!(scheduler.take().unwrap().id, 2);
         assert_eq!(scheduler.take().unwrap().id, 3);
-        scheduler.complete(3);
+        assert_eq!(scheduler.active(), 4);
+        assert!(scheduler.take().is_none());
+        for id in [1, 3, 0, 2] {
+            scheduler.complete(id);
+        }
         assert!(scheduler.is_empty());
     }
 
     #[test]
-    fn focused_pending_directory_bypasses_an_active_shallower_barrier() {
+    fn checked_effort_follows_subtrees_across_depth_and_child_proliferation() {
         let mut scheduler = Scheduler::default();
         scheduler.insert(task(0, ""), None);
-        assert_eq!(scheduler.take().unwrap().id, 0);
-        scheduler.insert(task(1, "earlier"), Some(0));
-        scheduler.insert(task(2, "focused"), Some(0));
-        assert!(scheduler.take().is_none());
-        scheduler.focus = Some("focused".into());
-        assert_eq!(scheduler.take().unwrap().id, 2);
-        scheduler.insert(task(3, "focused/deep"), Some(2));
-        assert_eq!(scheduler.focused(), Some(3));
+        scheduler.take().unwrap();
+        scheduler.insert(task(1, "wide"), Some(0));
+        scheduler.insert(task(2, "small"), Some(0));
+        scheduler.take().unwrap();
+        scheduler.take().unwrap();
+        scheduler.checked(1, 20_000);
+        scheduler.checked(2, 3);
+        for id in 3..=34 {
+            scheduler.insert(task(id, &format!("wide/child-{id}")), Some(1));
+        }
+        scheduler.insert(task(35, "small/child"), Some(2));
+        scheduler.complete(1);
         scheduler.complete(2);
-        assert_eq!(scheduler.take().unwrap().id, 3);
-        assert_eq!(
-            scheduler.active, 2,
-            "focus can use a second fixed worker while root is active"
-        );
-        scheduler.complete(3);
-        assert!(
-            scheduler.take().is_none(),
-            "unrelated branch keeps its default barrier"
-        );
         scheduler.complete(0);
+        assert_eq!(scheduler.take().unwrap().id, 35);
+        scheduler.checked(35, 2);
+        scheduler.insert(task(36, "small/child/deep"), Some(35));
+        assert_eq!(scheduler.take().unwrap().id, 36);
+        assert_eq!(scheduler.directories[&2].checked, 5);
+        assert_eq!(scheduler.directories[&0].checked, 20_005);
+        assert_eq!(scheduler.directories[&1].checked, 20_000);
+    }
+
+    #[test]
+    fn active_reservations_spread_dispatches_before_progress_arrives() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, ""), None);
+        scheduler.take().unwrap();
+        scheduler.insert(task(1, "first"), Some(0));
+        scheduler.insert(task(2, "second"), Some(0));
+        scheduler.take().unwrap();
+        scheduler.take().unwrap();
+        scheduler.insert(task(3, "first/a"), Some(1));
+        scheduler.insert(task(4, "first/b"), Some(1));
+        scheduler.insert(task(5, "second/a"), Some(2));
+        scheduler.insert(task(6, "second/b"), Some(2));
+        scheduler.checked(2, (ACTIVE_EFFORT_RESERVATION / 2) as usize);
+        assert_eq!(scheduler.take().unwrap().id, 3);
+        assert_eq!(scheduler.take().unwrap().id, 5);
+        scheduler.complete(3);
+        assert_eq!(scheduler.take().unwrap().id, 4);
+    }
+
+    #[test]
+    fn rotating_samples_find_under_served_work_in_a_wide_frontier() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, ""), None);
+        scheduler.take().unwrap();
+        for id in 1..=32 {
+            scheduler.insert(task(id, &format!("child-{id}")), Some(0));
+            if id != 21 {
+                scheduler.checked(id, 10_000);
+            }
+        }
+        let early: Vec<_> = (0..4).map(|_| scheduler.take().unwrap().id).collect();
+        assert!(
+            early.contains(&21),
+            "rotating samples must reach later siblings"
+        );
+        let mut seen: std::collections::HashSet<_> = early.into_iter().collect();
+        while let Some(task) = scheduler.take() {
+            assert!(
+                seen.insert(task.id),
+                "a pending slot must be removed exactly once"
+            );
+        }
+        assert_eq!(seen.len(), 32);
+        for id in 0..=32 {
+            scheduler.complete(id);
+        }
+        assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn emptied_branch_becomes_available_again_when_active_reader_discovers_more() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, ""), None);
+        scheduler.take().unwrap();
+        scheduler.insert(task(1, "streamed"), Some(0));
+        scheduler.take().unwrap();
+        for id in 2..10 {
+            scheduler.insert(task(id, &format!("streamed/child-{id}")), Some(1));
+            assert_eq!(scheduler.take().unwrap().id, id);
+            scheduler.complete(id);
+            assert!(scheduler.take().is_none());
+        }
+        scheduler.complete(0);
+        scheduler.complete(1);
+        assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn focused_pending_work_overrides_effort_and_falls_back_when_unavailable() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, "scope"), None);
+        scheduler.take().unwrap();
+        scheduler.insert(task(1, "scope/earlier"), Some(0));
+        scheduler.insert(task(2, "scope/focused"), Some(0));
+        scheduler.checked(2, 10_000);
+        scheduler.focus = Some("scope/focused".into());
+        assert_eq!(scheduler.take().unwrap().id, 2);
+        scheduler.insert(task(3, "scope/focused/deep"), Some(2));
+        assert_eq!(scheduler.take().unwrap().id, 3);
         assert_eq!(scheduler.take().unwrap().id, 1);
+        scheduler.insert(task(4, "scope/later"), Some(0));
+        scheduler.focus = Some("scope/not-discovered".into());
+        assert_eq!(scheduler.take().unwrap().id, 4);
     }
 
     #[test]
@@ -1188,20 +1340,14 @@ mod tests {
         scheduler.take().unwrap();
         scheduler.insert(task(1, "old"), Some(0));
         scheduler.insert(task(2, "new"), Some(0));
-        scheduler.complete(0);
         scheduler.focus = Some("old".into());
         scheduler.focus = Some("new".into());
         assert_eq!(scheduler.take().unwrap().id, 2);
         scheduler.insert(task(3, "new/deep"), Some(2));
         scheduler.focus = Some("old".into());
         assert_eq!(scheduler.take().unwrap().id, 1);
-        assert!(
-            scheduler.take().is_none(),
-            "old focus descendants no longer bypass barriers"
-        );
-        scheduler.complete(1);
-        assert!(scheduler.take().is_none());
-        scheduler.complete(2);
+        scheduler.insert(task(4, "old/deep"), Some(1));
+        scheduler.focus = Some("new".into());
         assert_eq!(scheduler.take().unwrap().id, 3);
 
         let control = ScanControl::default();
@@ -1216,11 +1362,13 @@ mod tests {
     }
 
     #[test]
-    fn clearing_latest_focus_restores_the_breadth_first_barrier() {
+    fn clearing_latest_focus_restores_effort_scheduling() {
         let mut scheduler = Scheduler::default();
         scheduler.insert(task(0, ""), None);
         scheduler.take().unwrap();
         scheduler.insert(task(1, "focused"), Some(0));
+        scheduler.insert(task(2, "under-served"), Some(0));
+        scheduler.checked(1, 10_000);
         scheduler.focus = Some("focused".into());
         assert_eq!(scheduler.focused(), Some(1));
 
@@ -1233,8 +1381,7 @@ mod tests {
         receiver.try_recv().unwrap();
         assert_eq!(control.take_focus(), Some(FocusRequest::Clear));
         scheduler.focus = None;
-        assert!(scheduler.take().is_none());
-        scheduler.complete(0);
+        assert_eq!(scheduler.take().unwrap().id, 2);
         assert_eq!(scheduler.take().unwrap().id, 1);
 
         control.clear_priority();
@@ -1244,6 +1391,70 @@ mod tests {
             Some(FocusRequest::Prioritize(PathBuf::from("focused")))
         );
         assert_eq!(control.take_focus(), None);
+    }
+
+    #[test]
+    fn file_only_batches_report_checked_entries_without_directory_discoveries() {
+        let fixture = Fixture::new();
+        for index in 0..13 {
+            fs::write(fixture.0.join(format!("file-{index}")), b"payload").unwrap();
+        }
+        let anchor = RootAnchor::open(&fixture.0).unwrap();
+        let (sender, receiver) = bounded(8);
+        let emitter = Mutex::new(Emitter {
+            sender,
+            next_id: 1,
+            hardlinks: Arc::new(HardlinkRegistry::default()),
+        });
+        let mut checked = Vec::new();
+        scan_directory_emit(
+            &task(0, ""),
+            &anchor,
+            &options(),
+            &emitter,
+            &AtomicBool::new(false),
+            &ScanControl::default(),
+            |directories, entries| {
+                assert!(directories.is_empty());
+                checked.push(entries);
+                Ok(())
+            },
+        );
+        assert_eq!(checked, vec![4, 4, 4, 1]);
+        assert!(matches!(
+            receiver.try_iter().last(),
+            Some(ScanEvent::DirectoryDone { id: 0, error: None })
+        ));
+    }
+
+    #[test]
+    fn cancellation_releases_a_full_scheduler_progress_channel() {
+        let (sender, _receiver) = bounded(1);
+        sender
+            .send(WorkerMessage::Complete { id: 0, checked: 0 })
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (result_sender, result_receiver) = bounded(1);
+        let worker = thread::spawn(move || {
+            let result = send_worker(
+                &sender,
+                WorkerMessage::Progress {
+                    parent: 0,
+                    tasks: Vec::new(),
+                    checked: 1024,
+                },
+                &worker_cancel,
+            );
+            result_sender.send(result).unwrap();
+        });
+        cancel.store(true, Ordering::Release);
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1741,7 +1952,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_have_contiguous_ids_and_strict_breadth_first_depths() {
+    fn concurrent_batches_keep_contiguous_ids_and_already_discovered_parents() {
         let fixture = Fixture::new();
         for branch in 0..8 {
             let top = fixture.0.join(format!("branch-{branch}"));
@@ -1763,27 +1974,32 @@ mod tests {
         let events = collect(&handle);
         let mut depths = HashMap::from([(0, 0)]);
         let mut expected_id = 1;
-        let mut last_parent_depth = 0;
+        let mut completed = std::collections::HashSet::new();
+        let mut directories = 1;
         let mut saw_deep = false;
         for event in events {
             match event {
                 ScanEvent::RootInfo { error, .. } => assert!(error.is_none()),
                 ScanEvent::Entries { parent, entries } => {
                     let parent_depth = depths[&parent];
-                    assert!(parent_depth >= last_parent_depth);
-                    last_parent_depth = parent_depth;
                     saw_deep |= parent_depth >= 10;
                     for entry in entries {
                         assert_eq!(entry.id, expected_id);
                         expected_id += 1;
                         assert!(entry.error.is_none());
+                        directories += usize::from(entry.kind == NodeKind::Directory);
                         depths.insert(entry.id, parent_depth + 1);
                     }
                 }
-                ScanEvent::DirectoryDone { error, .. } => assert!(error.is_none()),
+                ScanEvent::DirectoryDone { id, error } => {
+                    assert!(error.is_none());
+                    assert!(depths.contains_key(&id));
+                    assert!(completed.insert(id), "directories finish exactly once");
+                }
                 ScanEvent::Finished { cancelled } => assert!(!cancelled),
             }
         }
+        assert_eq!(completed.len(), directories);
         assert!(saw_deep);
         assert!(expected_id > 70);
     }

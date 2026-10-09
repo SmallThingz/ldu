@@ -4690,7 +4690,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_directory_auto_selection_requests_native_priority_without_initial_bfs_focus() {
+    fn refreshed_directory_auto_selection_requests_native_priority_without_initial_scan_focus() {
         let mut app = browser_fixture();
         assert!(!app.prioritize_requested);
         app.directory = 1;

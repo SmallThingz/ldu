@@ -1,6 +1,6 @@
 # ldu
 
-- Pure Rust; preserve default breadth-first depth barriers and parallel metadata batches. Explicit hover/navigation focus may prioritize an unfinished subtree without restarting the scan or blocking input.
+- Safe Rust only; application code must forbid unsafe code. Prefer throughput over exact scheduling fairness. Schedule approximately by entries checked per competing subtree, without global breadth-first depth barriers. Hover/navigation focus takes priority without restarting scans or blocking input; preserve parallel metadata batches and bounded work.
 - Draw the first terminal frame before filesystem scanning. Keep progress channels bounded and repaint immediately after keyboard actions.
 - Sort scanning and completed entries together by size. Mark scanning entries with a gray, one-cell animated Braille spinner; preserve order within bounded near-size groups and keep selection by stable node ID. Keep sorted directory views warm; hover and navigation must not rebuild or destroy whole-directory collections on the input thread. Never paint unsorted provisional rows on entry.
 - Keep the browser minimal: one path header, compact `v select` and `? help` hints, and the entry list. Show the selection count and controls while visual mode is active. At widths of at least 120 columns, preview only the selected directory's subdirectories. Use the same row rendering in both panes, including spinners and fractional block size bars without brackets or approximation inequalities.

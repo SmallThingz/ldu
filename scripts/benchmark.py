@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Measure release ldu on one synthetic, warm-cache corpus under host-quiet."""
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -78,43 +79,79 @@ def reference_total(root, apparent):
     return int(result.stdout.split()[0])
 
 
+def binary_identity(label, binary):
+    digest = hashlib.sha256()
+    size = 0
+    with binary.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return {"variant": label, "path": str(binary), "sha256": digest.hexdigest(), "bytes": size}
+
+
+def reference_entries(root):
+    # os.walk does not descend through symlinks, but counts each directory entry.
+    def failed(error):
+        raise error
+
+    return sum(len(directories) + len(files)
+               for _, directories, files in os.walk(root, onerror=failed, followlinks=False))
+
+
+def validate_output(output, expected, entries):
+    assert output["errors"] == 0 and not output["cancelled"], output
+    assert all(output[key] == expected[key] for key in expected), (expected, output)
+    assert output["entries"] == entries, (entries, output)
+    assert all(row["complete"] and row["errors"] == 0 for row in output["directories"]), output
+    assert sorted(row["name"] for row in output["directories"]) == ["deep", "flat", "wide"], output
+    assert math.isfinite(output["seconds"]) and output["seconds"] > 0, output
+
+
 def measure(args):
     if os.environ.get("LDU_BENCH_GUARDED") != "1":
         raise SystemExit("internal measurement mode requires the host-quiet/guarded-run launcher")
     root = args.measure
     expected = {"apparent": reference_total(root, True), "allocated": reference_total(root, False)}
+    entries = reference_entries(root)
+    variants = [("current", args.binary)]
+    if args.baseline_binary is not None:
+        variants.insert(0, ("baseline", args.baseline_binary))
+    binaries = [binary_identity(label, binary) for label, binary in variants]
     reports = []
-    baseline_entries = None
     backends = args.backends.split(",")
     for backend in backends:
         for threads in args.threads:
             # The standard-library backend has no configurable readdir buffer.
             buffers = args.buffers if backend != "std" else [262144]
             for buffer_size in buffers:
-                command = [local_executable(args.binary), "--json", "--backend", backend,
-                           "--threads", str(threads), "--buffer-size", str(buffer_size), str(root)]
-                # Warm process and metadata caches before collecting this case.
-                _, initial = run_json(command)
-                samples, scan_samples = [], []
-                outputs = [initial]
-                for _ in range(args.repeats):
-                    elapsed, output = run_json(command)
-                    outputs.append(output)
-                    samples.append(elapsed)
-                    scan_samples.append(output["seconds"])
-                for output in outputs:
-                    assert output["errors"] == 0 and not output["cancelled"], output
-                    assert all(output[key] == expected[key] for key in expected), (expected, output)
-                    assert all(row["complete"] for row in output["directories"]), output
-                    if baseline_entries is None:
-                        baseline_entries = output["entries"]
-                    assert output["entries"] == baseline_entries, output
-                reports.append({
-                    "backend": backend, "threads": threads, "buffer_bytes": buffer_size,
-                    "wall_median_seconds": statistics.median(samples),
-                    "scan_median_seconds": statistics.median(scan_samples),
-                    "wall_samples_seconds": samples,
-                })
+                commands = {
+                    label: [local_executable(binary), "--json", "--backend", backend,
+                            "--threads", str(threads), "--buffer-size", str(buffer_size), str(root)]
+                    for label, binary in variants
+                }
+                samples = {label: [] for label, _ in variants}
+                scan_samples = {label: [] for label, _ in variants}
+                # Warm each executable on the same corpus before collecting this case.
+                for command in commands.values():
+                    _, initial = run_json(command)
+                    validate_output(initial, expected, entries)
+                for repetition in range(args.repeats):
+                    # Pair samples closely and alternate which executable runs first.
+                    order = variants if repetition % 2 == 0 else list(reversed(variants))
+                    for label, _ in order:
+                        elapsed, output = run_json(commands[label])
+                        validate_output(output, expected, entries)
+                        samples[label].append(elapsed)
+                        scan_samples[label].append(output["seconds"])
+                for label, _ in variants:
+                    reports.append({
+                        "variant": label,
+                        "backend": backend, "threads": threads, "buffer_bytes": buffer_size,
+                        "wall_median_seconds": statistics.median(samples[label]),
+                        "scan_median_seconds": statistics.median(scan_samples[label]),
+                        "wall_samples_seconds": samples[label],
+                        "scan_samples_seconds": scan_samples[label],
+                    })
     references = []
     for name, command in (
         ("du allocated", ["du", "--block-size=1", "--summarize", "--", str(root)]),
@@ -137,11 +174,15 @@ def measure(args):
                    "--max-input-ms", str(args.max_input_ms)]
         result = subprocess.run(command, text=True, capture_output=True, check=True)
         latencies = json.loads(result.stdout)
+    assert binaries == [binary_identity(label, binary) for label, binary in variants], (
+        "Executable changed during measurement; discard all samples")
     print(json.dumps({
         "qualification": "Synthetic corpus; warm metadata cache; samples accepted only when guarded-run exits zero.",
         "platform": platform.platform(), "logical_cpus": os.cpu_count(),
-        "source_head": source_head(),
-        "primary_files": args.files, "flat_rows": args.files // 2 + 1, "entries": baseline_entries,
+        "source_head": source_head(), "binaries": binaries,
+        "sample_order": "baseline/current then current/baseline on alternating repetitions"
+                        if args.baseline_binary is not None else "current only",
+        "primary_files": args.files, "flat_rows": args.files // 2 + 1, "entries": entries,
         "apparent": expected["apparent"], "allocated": expected["allocated"],
         "repeats": args.repeats, "cases": reports, "references": references,
         "interactive_latencies": latencies,
@@ -153,6 +194,10 @@ def main():
         raise SystemExit("Benchmark qualification requires assertions; rerun without -O or PYTHONOPTIMIZE")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/ldu"))
+    parser.add_argument("--baseline-binary", type=Path,
+                        help="interleave baseline and current samples on the same corpus")
+    parser.add_argument("--quiet-timeout", type=float, default=45,
+                        help="maximum seconds waiting for a quiet host (default: 45)")
     parser.add_argument("--files", type=int, default=25000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--threads", type=positive_list, default=[1, 4, 16])
@@ -165,8 +210,11 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.max_input_ms) or args.max_input_ms <= 0:
         parser.error("max-input-ms must be a finite positive number")
-    if not args.binary.is_file():
-        parser.error(f"release binary does not exist: {args.binary}")
+    if not math.isfinite(args.quiet_timeout) or args.quiet_timeout <= 0:
+        parser.error("quiet-timeout must be a finite positive number")
+    for binary in (args.binary, args.baseline_binary):
+        if binary is not None and not binary.is_file():
+            parser.error(f"release binary does not exist: {binary}")
     if args.repeats < 1 or args.files < 1:
         parser.error("files and repeats must be positive")
     if any(n > 128 for n in args.threads) or any(not 4096 <= n <= 4194304 for n in args.buffers):
@@ -185,7 +233,13 @@ def main():
         root.mkdir()
         create_corpus(root, args.files)
         print("Waiting for host-quiet before collecting timings...", file=sys.stderr, flush=True)
-        quiet = subprocess.run(["host-quiet", "--wait"], stdout=sys.stderr)
+        try:
+            quiet = subprocess.run(["host-quiet", "--wait"], stdout=sys.stderr,
+                                   timeout=args.quiet_timeout)
+        except subprocess.TimeoutExpired:
+            print("No timings collected: the host did not become quiet before the timeout.",
+                  file=sys.stderr)
+            raise SystemExit(75)
         if quiet.returncode:
             raise SystemExit(quiet.returncode)
         child = ["python3", os.path.relpath(__file__), "--measure", str(root),
@@ -193,6 +247,8 @@ def main():
                  "--repeats", str(args.repeats), "--threads", ",".join(map(str, args.threads)),
                  "--buffers", ",".join(map(str, args.buffers)), "--backends", args.backends,
                  "--max-input-ms", str(args.max_input_ms)]
+        if args.baseline_binary is not None:
+            child += ["--baseline-binary", str(args.baseline_binary)]
         if args.ncdu:
             child.append("--ncdu")
         if args.pty:

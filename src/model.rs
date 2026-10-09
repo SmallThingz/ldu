@@ -86,9 +86,7 @@ pub struct Node {
     last_child: NodeId,
     next_sibling: NodeId,
     previous_sibling: NodeId,
-    removed: bool,
-    read_done: bool,
-    overflow_reported: bool,
+    flags: u8,
     pending_dirs: u32,
     pub child_epoch: u64,
     pub parent_epoch: u64,
@@ -98,6 +96,10 @@ pub struct Node {
 }
 
 impl Node {
+    const REMOVED: u8 = 1;
+    const READ_DONE: u8 = 2;
+    const OVERFLOW_REPORTED: u8 = 4;
+
     fn new(name: Arc<OsStr>, parent: Option<NodeId>, kind: NodeKind, sizes: Sizes) -> Self {
         let complete = kind != NodeKind::Directory;
         Self {
@@ -113,9 +115,7 @@ impl Node {
             last_child: NO_NODE,
             next_sibling: NO_NODE,
             previous_sibling: NO_NODE,
-            removed: false,
-            read_done: complete,
-            overflow_reported: false,
+            flags: if complete { Self::READ_DONE } else { 0 },
             pending_dirs: 0,
             child_epoch: 0,
             parent_epoch: 0,
@@ -125,14 +125,34 @@ impl Node {
         }
     }
 
+    fn removed(&self) -> bool {
+        self.flags & Self::REMOVED != 0
+    }
+
+    fn read_done(&self) -> bool {
+        self.flags & Self::READ_DONE != 0
+    }
+
+    fn overflow_reported(&self) -> bool {
+        self.flags & Self::OVERFLOW_REPORTED != 0
+    }
+
+    fn set_read_done(&mut self, done: bool) {
+        if done {
+            self.flags |= Self::READ_DONE;
+        } else {
+            self.flags &= !Self::READ_DONE;
+        }
+    }
+
     /// Keep this node's warning after inherited subtree errors are removed.
     fn mark_overflow(&mut self, overflow: bool, inherited: &mut u64) -> bool {
         if !overflow {
             return false;
         }
-        let newly_reported = !self.overflow_reported;
+        let newly_reported = !self.overflow_reported();
         if newly_reported {
-            self.overflow_reported = true;
+            self.flags |= Self::OVERFLOW_REPORTED;
             *inherited += 1;
         }
         self.error_count = self.error_count.saturating_add(*inherited);
@@ -272,7 +292,7 @@ impl Model {
             let Some(node) = self.nodes.get(id as usize) else {
                 return true;
             };
-            if node.removed {
+            if node.removed() {
                 return true;
             }
             if let Some(parent) = node.parent {
@@ -366,7 +386,7 @@ impl Model {
             node.error_count = node
                 .error_count
                 .saturating_sub(errors)
-                .max(u64::from(node.overflow_reported));
+                .max(u64::from(node.overflow_reported()));
             node.suppressed_subtrees = node.suppressed_subtrees.saturating_sub(suppressed);
             changed.push(ancestor);
             current = node.parent;
@@ -376,8 +396,7 @@ impl Model {
         node.items = 0;
         node.error_count = 0;
         node.complete = false;
-        node.read_done = false;
-        node.overflow_reported = false;
+        node.flags &= !(Node::READ_DONE | Node::OVERFLOW_REPORTED);
         node.pending_dirs = 0;
         node.first_child = NO_NODE;
         node.last_child = NO_NODE;
@@ -406,7 +425,7 @@ impl Model {
         self.has_removals = true;
         self.finished = false;
         self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
-        self.schedule_cleanup();
+        self.schedule_cleanup(id);
         if self
             .last_error_id
             .is_some_and(|error_id| error_id == id || self.is_removed(error_id))
@@ -420,21 +439,31 @@ impl Model {
     }
 
     fn accepts_scan(&self, id: NodeId, generation: u64) -> bool {
-        if !self.is_live(id) || self.nodes[id as usize].scan_generation != generation {
+        let Some(mut node) = self.nodes.get(id as usize) else {
+            return false;
+        };
+        if node.scan_generation != generation {
             return false;
         }
-        let mut current = Some(id);
-        while let Some(id) = current {
-            let node = &self.nodes[id as usize];
-            if node
-                .suppression_cutoff
-                .is_some_and(|cutoff| generation <= cutoff)
+        loop {
+            if node.removed()
+                || node
+                    .suppression_cutoff
+                    .is_some_and(|cutoff| generation <= cutoff)
             {
                 return false;
             }
-            current = node.parent;
+            let Some(parent) = node.parent else {
+                return true;
+            };
+            let Some(parent) = self.nodes.get(parent as usize) else {
+                return false;
+            };
+            if node.parent_epoch != parent.child_epoch {
+                return false;
+            }
+            node = parent;
         }
-        true
     }
 
     /// Unlink a subtree without walking or freeing it on the input thread.
@@ -462,7 +491,7 @@ impl Model {
         counts.directories -= u32::from(directory);
         counts.hidden_directories -= u32::from(directory && hidden);
         self.has_removals = true;
-        self.nodes[id as usize].removed = true;
+        self.nodes[id as usize].flags |= Node::REMOVED;
         if previous == NO_NODE {
             self.nodes[parent as usize].first_child = next;
         } else {
@@ -485,7 +514,7 @@ impl Model {
             node.error_count = node
                 .error_count
                 .saturating_sub(errors)
-                .max(u64::from(node.overflow_reported));
+                .max(u64::from(node.overflow_reported()));
             changed.push(ancestor);
             current = node.parent;
         }
@@ -497,7 +526,7 @@ impl Model {
             }
             self.complete_ready(parent);
         }
-        self.schedule_cleanup();
+        self.schedule_cleanup(id);
         if self.last_error_id.is_some_and(|id| self.is_removed(id))
             || self.nodes[ROOT as usize].error_count == 0
         {
@@ -563,12 +592,19 @@ impl Model {
         self.removal_cursor.is_some() || self.cleanup_cursor.is_some()
     }
 
-    fn schedule_cleanup(&mut self) {
+    fn schedule_cleanup(&mut self, start: NodeId) {
         if !self.hardlink_groups.is_empty() {
             self.removal_cursor = Some(RemovalCursor::default());
         }
+        // Parents precede their descendants in the append-only arena. Earlier
+        // IDs need cleanup only if an existing cursor has not reached them yet.
+        let start = (start as usize).max(1);
+        let next = self
+            .cleanup_cursor
+            .as_ref()
+            .map_or(start, |cursor| cursor.next.min(start));
         self.cleanup_cursor = Some(CleanupCursor {
-            next: 1,
+            next,
             end: self.nodes.len(),
         });
     }
@@ -587,7 +623,7 @@ impl Model {
             checks += 1;
             if self.is_removed(id) {
                 let node = &mut self.nodes[id as usize];
-                node.removed = true;
+                node.flags |= Node::REMOVED;
                 node.name = Arc::clone(&self.tombstone_name);
                 self.directories.remove(&id);
             }
@@ -607,33 +643,7 @@ impl Model {
             return Vec::new();
         }
         let mut changed = Vec::new();
-        let mut overflow = false;
-        let mut inherited_overflows = 0;
-        let mut reported = None;
-        let mut current = Some(id);
-        while let Some(id) = current {
-            let node = &mut self.nodes[id as usize];
-            node.sizes.apparent = replace_charge(
-                node.sizes.apparent,
-                old.apparent,
-                sizes.apparent,
-                &mut overflow,
-            );
-            node.sizes.allocated = replace_charge(
-                node.sizes.allocated,
-                old.allocated,
-                sizes.allocated,
-                &mut overflow,
-            );
-            if node.mark_overflow(overflow, &mut inherited_overflows) && reported.is_none() {
-                reported = Some(id);
-            }
-            changed.push(id);
-            current = node.parent;
-        }
-        if let Some(id) = reported {
-            self.report_overflow(id);
-        }
+        self.replace_node_charge(id, old, sizes, &mut changed);
         self.revision = self.revision.wrapping_add(1);
         changed
     }
@@ -691,7 +701,7 @@ impl Model {
 
     /// Enumeration can finish before descendants finish contributing their sizes.
     pub fn listing_complete(&self, id: NodeId) -> bool {
-        self.is_live(id) && self.node(id).read_done
+        self.is_live(id) && self.node(id).read_done()
     }
 
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
@@ -827,7 +837,7 @@ impl Model {
                     let parent = node.parent;
                     let hidden = node.name.as_encoded_bytes().starts_with(b".");
                     node.kind = kind;
-                    node.read_done = kind != NodeKind::Directory;
+                    node.set_read_done(kind != NodeKind::Directory);
                     // complete_ready releases a retained directory's old parent token
                     // if replacement metadata now describes a file or symlink.
                     node.complete = false;
@@ -876,47 +886,51 @@ impl Model {
                     changed.push(scope);
                 }
             }
-            ScanEvent::Entries { parent, entries } => {
+            ScanEvent::Entries {
+                parent,
+                mut entries,
+            } => {
                 let mapped_parent = self.scans[&generation].get(parent);
                 let parent_live =
                     mapped_parent.map_or(scope_live, |id| self.accepts_scan(id, generation));
-                let mut mapped = Vec::with_capacity(entries.len());
-                for mut entry in entries {
-                    if entry.id == NO_NODE || entry.id as usize != self.scans[&generation].len {
-                        if parent_live {
-                            self.record_error(scope, format!("out-of-order entry id {}", entry.id));
-                        }
-                        continue;
+                let scan = self.scans.get_mut(&generation).unwrap();
+                let mut next_id = self.nodes.len();
+                let mut exhausted = false;
+                let mut errors = Vec::new();
+                // Reuse the incoming batch and borrow its scope map only once.
+                entries.retain_mut(|entry| {
+                    if exhausted {
+                        return false;
                     }
-                    let Some(index) = self.nodes.len().checked_add(mapped.len()) else {
+                    if entry.id == NO_NODE || entry.id as usize != scan.len {
                         if parent_live {
-                            self.record_error(scope, "node identifier overflow".into());
+                            errors.push(format!("out-of-order entry id {}", entry.id));
                         }
-                        break;
-                    };
-                    let Ok(id) = NodeId::try_from(index) else {
-                        if parent_live {
-                            self.record_error(scope, "node identifier overflow".into());
-                        }
-                        break;
-                    };
-                    if id == NO_NODE {
-                        if parent_live {
-                            self.record_error(scope, "node identifier overflow".into());
-                        }
-                        break;
+                        return false;
                     }
-                    self.scans.get_mut(&generation).unwrap().push(id);
+                    let Some(id) = NodeId::try_from(next_id).ok().filter(|&id| id != NO_NODE)
+                    else {
+                        if parent_live {
+                            errors.push("node identifier overflow".into());
+                        }
+                        exhausted = true;
+                        return false;
+                    };
+                    scan.push(id);
                     entry.id = id;
-                    mapped.push(entry);
+                    next_id += 1;
+                    true
+                });
+                for error in errors {
+                    self.record_error(scope, error);
                 }
                 if let Some(parent) = mapped_parent {
-                    self.add_entries(parent, generation, mapped, &mut changed);
+                    self.add_entries(parent, generation, entries, &mut changed);
                 } else {
                     if parent_live {
                         self.record_error(scope, format!("entries have unknown parent {parent}"));
                     }
-                    for entry in mapped {
+                    for entry in entries {
                         self.append_tombstone(scope, generation, entry);
                     }
                 }
@@ -928,13 +942,13 @@ impl Model {
                     }
                     return changed;
                 };
-                if !self.accepts_scan(id, generation) || self.nodes[id as usize].read_done {
+                if !self.accepts_scan(id, generation) || self.nodes[id as usize].read_done() {
                     return changed;
                 }
                 if let Some(error) = error {
                     self.record_error(id, error);
                 }
-                self.nodes[id as usize].read_done = true;
+                self.nodes[id as usize].flags |= Node::READ_DONE;
                 self.complete_ready(id);
             }
             ScanEvent::Finished { cancelled } => {
@@ -980,7 +994,7 @@ impl Model {
             NodeKind::Unknown,
             Sizes::default(),
         );
-        node.removed = true;
+        node.flags |= Node::REMOVED;
         node.parent_epoch = self.nodes[parent as usize].child_epoch;
         node.scan_generation = generation;
         self.has_removals = true;
@@ -1001,7 +1015,7 @@ impl Model {
             return;
         }
         if self.nodes[parent as usize].kind != NodeKind::Directory
-            || self.nodes[parent as usize].read_done
+            || self.nodes[parent as usize].read_done()
         {
             self.record_error(
                 parent,
@@ -1018,6 +1032,7 @@ impl Model {
         let mut items = 0u64;
         let mut errors = 0u64;
         let mut overflow = false;
+        let mut counts = ChildCounts::default();
         for entry in entries {
             if entry.id as usize != self.nodes.len() || entry.id == NO_NODE {
                 self.record_error(parent, format!("out-of-order entry id {}", entry.id));
@@ -1110,7 +1125,6 @@ impl Model {
             sizes.allocated = sum(sizes.allocated, charged.allocated, &mut overflow);
             items = sum(items, 1, &mut overflow);
             errors = sum(errors, node.error_count, &mut overflow);
-            let counts = &mut self.directories.entry(parent).or_default().children;
             let hidden = node.name.as_encoded_bytes().starts_with(b".");
             let directory = node.kind == NodeKind::Directory;
             counts.all += 1;
@@ -1119,6 +1133,13 @@ impl Model {
             counts.hidden_directories += u32::from(directory && hidden);
             changed.push(entry.id);
             self.nodes.push(node);
+        }
+        if counts.all != 0 {
+            let children = &mut self.directories.entry(parent).or_default().children;
+            children.all += counts.all;
+            children.hidden += counts.hidden;
+            children.directories += counts.directories;
+            children.hidden_directories += counts.hidden_directories;
         }
         // A wide directory batch traverses the ancestor chain only once.
         self.add_totals(parent, sizes, items, errors, overflow, changed);
@@ -1265,7 +1286,7 @@ impl Model {
         let mut current = start;
         loop {
             let node = &mut self.nodes[current as usize];
-            if node.complete || !node.read_done || node.pending_dirs != 0 {
+            if node.complete || !node.read_done() || node.pending_dirs != 0 {
                 break;
             }
             node.complete = true;
@@ -1734,6 +1755,61 @@ mod tests {
     }
 
     #[test]
+    fn malformed_scoped_batches_preserve_following_ids_and_child_counts() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "scope", NodeKind::Directory, 0, 0),
+                entry(2, "sibling", NodeKind::File, 1, 4),
+            ],
+        });
+        model.begin_rescan(1, 1);
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(2, "out-of-order", NodeKind::File, 100, 100),
+                    entry(1, ".hidden", NodeKind::File, 2, 4),
+                    entry(1, "repeated", NodeKind::File, 100, 100),
+                    entry(2, "invalid/name", NodeKind::File, 100, 100),
+                    entry(NO_NODE, "sentinel", NodeKind::File, 100, 100),
+                    entry(3, "directory", NodeKind::Directory, 3, 4),
+                ],
+            },
+        );
+        assert_eq!(model.len(), 6);
+        assert_eq!(model.children(1).collect::<Vec<_>>(), vec![3, 5]);
+        assert!(model.is_removed(4));
+        assert_eq!(model.node(1).sizes.apparent, 5);
+        assert_eq!(model.node(1).items, 2);
+        assert_eq!(model.node(1).error_count, 4);
+        assert_eq!(model.node(ROOT).error_count, 4);
+        assert_eq!(model.node(ROOT).items, 4);
+        assert!(model.has_children(1, true, false));
+        model.remove(5);
+        assert!(model.has_children(1, false, true));
+        assert!(!model.has_children(1, false, false));
+        assert!(!model.has_children(1, true, true));
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(4, "following", NodeKind::File, 7, 8)],
+            },
+        );
+        assert_eq!(model.children(1).collect::<Vec<_>>(), vec![3, 6]);
+        assert_eq!(model.path(6), PathBuf::from("fixture/scope/following"));
+        assert_eq!(model.node(1).sizes.apparent, 9);
+        assert_eq!(model.node(1).items, 2);
+        assert_eq!(model.node(1).error_count, 4);
+        assert!(model.has_children(1, false, false));
+    }
+
+    #[test]
     fn removing_an_inflight_subtree_preserves_ids_and_live_sibling_completion() {
         let mut model = model();
         model.apply(ScanEvent::Entries {
@@ -1827,6 +1903,42 @@ mod tests {
         assert_eq!(model.node(ROOT).items, 3);
         assert_eq!(model.node(ROOT).error_count, 0);
         assert_eq!(model.path(9), PathBuf::from("fixture/live/survivor"));
+    }
+
+    #[test]
+    fn overlapping_refresh_and_removal_cleanup_keeps_the_unfinished_prefix() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "refresh", NodeKind::Directory, 0, 0)],
+        });
+        let later = (REMOVAL_CHECKS * 2 + 2) as NodeId;
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: (2..later)
+                .map(|id| entry(id, "stale", NodeKind::File, 1, 4))
+                .collect(),
+        });
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(later, "remove", NodeKind::Directory, 0, 0)],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: later,
+            entries: vec![entry(later + 1, "removed-child", NodeKind::File, 1, 4)],
+        });
+        model.begin_rescan(1, 1);
+        model.pump_removals();
+        assert!(model.has_pending_removals());
+        model.remove(later);
+        finish_removals(&mut model);
+        for id in 2..=later + 1 {
+            assert!(model.is_removed(id));
+            assert!(model.node(id).name.is_empty(), "uncleaned node {id}");
+        }
+        assert_eq!(model.children(ROOT).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(model.node(1).name.as_ref(), OsStr::new("refresh"));
+        assert_eq!(model.node(ROOT).items, 1);
     }
 
     #[test]
