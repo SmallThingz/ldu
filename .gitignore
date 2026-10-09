@@ -1,0 +1,6 @@
+/target/
+/.tmp/
+/upstream/ncdu/
+/upstream/dua/
+__pycache__/
+*.py[cod]

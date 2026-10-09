@@ -1,0 +1,1324 @@
+//! Shared background directory ordering. Exact size order is split into
+//! groups whose largest value is at most 2% above their smallest. Previous ranks
+//! are retained inside each group, so growing near-ties do not churn.
+use crate::model::Node;
+use crate::types::{NodeId, NodeKind, SizeMode, Sizes, SortMode};
+use arc_swap::ArcSwap;
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    ffi::OsStr,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+const COMMAND_CAPACITY: usize = 8;
+const SORT_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_DRAIN: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderConfig {
+    pub size_mode: SizeMode,
+    pub sort_mode: SortMode,
+    pub descending: bool,
+    pub show_hidden: bool,
+    pub directories_first: bool,
+    pub directories_only: bool,
+}
+
+impl Default for OrderConfig {
+    fn default() -> Self {
+        Self {
+            size_mode: SizeMode::Allocated,
+            sort_mode: SortMode::Size,
+            descending: true,
+            show_hidden: true,
+            directories_first: false,
+            directories_only: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderRow {
+    pub id: NodeId,
+    pub name: Arc<OsStr>,
+    pub kind: NodeKind,
+    pub size: u64,
+    pub sizes: Sizes,
+    pub items: u64,
+}
+
+impl OrderRow {
+    pub fn from_node(id: NodeId, node: &Node, mode: SizeMode) -> Self {
+        Self {
+            id,
+            name: Arc::clone(&node.name),
+            kind: node.kind,
+            size: match mode {
+                SizeMode::Allocated => node.sizes.allocated,
+                SizeMode::Apparent => node.sizes.apparent,
+            },
+            sizes: node.sizes,
+            items: node.items,
+        }
+    }
+}
+
+struct SortedRows {
+    ids: Vec<NodeId>,
+    positions: HashMap<NodeId, usize>,
+}
+
+struct RowState {
+    row: OrderRow,
+    rank: Option<usize>,
+}
+
+struct State {
+    config: OrderConfig,
+    rows: HashMap<NodeId, RowState>,
+    dirty: bool,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            config: OrderConfig::default(),
+            rows: HashMap::new(),
+            dirty: false,
+        }
+    }
+
+    fn snapshot(&mut self) -> SortedRows {
+        let mut ranked: Vec<_> = self
+            .rows
+            .values()
+            .filter(|state| {
+                (!self.config.directories_only || state.row.kind == NodeKind::Directory)
+                    && (self.config.show_hidden
+                        || state.row.name.as_encoded_bytes().first() != Some(&b'.'))
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| compare_rows(a, b, self.config));
+        if self.config.sort_mode == SortMode::Size {
+            stabilize_size_groups(&mut ranked, self.config);
+        }
+        let ids: Vec<_> = ranked.iter().map(|state| state.row.id).collect();
+        let positions: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| (id, index))
+            .collect();
+        drop(ranked);
+        for (&id, &rank) in &positions {
+            if let Some(state) = self.rows.get_mut(&id) {
+                state.rank = Some(rank);
+            }
+        }
+        self.dirty = false;
+        SortedRows { ids, positions }
+    }
+}
+
+fn compare_rows(a: &RowState, b: &RowState, config: OrderConfig) -> Ordering {
+    if config.directories_first {
+        let directories =
+            (a.row.kind != NodeKind::Directory).cmp(&(b.row.kind != NodeKind::Directory));
+        if directories != Ordering::Equal {
+            return directories;
+        }
+    }
+    let metric = match config.sort_mode {
+        SortMode::Size => a.row.size.cmp(&b.row.size),
+        SortMode::Name => a.row.name.cmp(&b.row.name),
+        SortMode::Items => a.row.items.cmp(&b.row.items),
+    };
+    let metric = if config.descending {
+        metric.reverse()
+    } else {
+        metric
+    };
+    metric.then_with(|| compare_previous_rank(a, b))
+}
+
+fn compare_previous_rank(a: &RowState, b: &RowState) -> Ordering {
+    match (a.rank, b.rank) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| a.row.name.cmp(&b.row.name))
+    .then_with(|| a.row.id.cmp(&b.row.id))
+}
+
+fn compare_group_rows(a: &RowState, b: &RowState, config: OrderConfig) -> Ordering {
+    match (a.rank, b.rank) {
+        (Some(a_rank), Some(b_rank)) => {
+            a_rank.cmp(&b_rank).then_with(|| compare_rows(a, b, config))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => compare_rows(a, b, config),
+    }
+}
+
+fn stabilize_size_groups(rows: &mut [&RowState], config: OrderConfig) {
+    let mut start = 0;
+    while start < rows.len() {
+        let anchor = rows[start].row.size;
+        let directory = rows[start].row.kind == NodeKind::Directory;
+        let mut end = start + 1;
+        while end < rows.len()
+            && (!config.directories_first
+                || (rows[end].row.kind == NodeKind::Directory) == directory)
+            && near_sizes(anchor, rows[end].row.size)
+        {
+            end += 1;
+        }
+        // Compare against the group's endpoint, never its previous neighbor:
+        // pairwise tolerance chaining could put arbitrarily distant sizes together.
+        rows[start..end].sort_unstable_by(|a, b| compare_group_rows(a, b, config));
+        start = end;
+    }
+}
+
+fn near_sizes(a: u64, b: u64) -> bool {
+    u128::from(a.max(b)) * 100 <= u128::from(a.min(b)) * 102
+}
+
+/// One shared index serves navigation and previews. Rows are submitted as scan
+/// events arrive, so changing the selected directory only clones an Arc.
+#[derive(Clone, Debug)]
+pub struct CachedRow {
+    pub parent: Option<NodeId>,
+    pub row: OrderRow,
+}
+
+pub struct CachedSnapshot {
+    pub generation: u64,
+    pub ids: Vec<NodeId>,
+    pub directory_ids: Vec<NodeId>,
+    pub positions: HashMap<NodeId, usize>,
+}
+
+enum CacheCommand {
+    Configure {
+        generation: u64,
+        config: OrderConfig,
+        clear: bool,
+    },
+    Upsert {
+        generation: u64,
+        rows: Vec<CachedRow>,
+    },
+    Remove {
+        generation: u64,
+        ids: Vec<NodeId>,
+    },
+}
+
+type PublishedCache = im::HashMap<NodeId, Arc<CachedSnapshot>>;
+type SharedCache = Arc<ArcSwap<PublishedCache>>;
+
+pub struct CachedOrderWorker {
+    sender: Sender<CacheCommand>,
+    cache: SharedCache,
+    priorities: Arc<[AtomicU32; 2]>,
+    stop: Arc<AtomicBool>,
+    generation: u64,
+    pending_config: Option<(OrderConfig, bool)>,
+}
+
+impl CachedOrderWorker {
+    pub fn new() -> io::Result<Self> {
+        let (sender, commands) = bounded(COMMAND_CAPACITY);
+        let cache = Arc::new(ArcSwap::from_pointee(PublishedCache::new()));
+        let priorities = Arc::new([AtomicU32::new(0), AtomicU32::new(NodeId::MAX)]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_cache = Arc::clone(&cache);
+        let worker_priorities = Arc::clone(&priorities);
+        let worker_stop = Arc::clone(&stop);
+        let _ = thread::Builder::new()
+            .name("ldu-order-cache".into())
+            .spawn(move || {
+                run_cache(commands, worker_cache, worker_priorities, worker_stop);
+            })?;
+        Ok(Self {
+            sender,
+            cache,
+            priorities,
+            stop,
+            generation: 0,
+            pending_config: None,
+        })
+    }
+
+    /// Discard the old scan on the worker, including its cached views.
+    pub fn reset(&mut self, config: OrderConfig) -> u64 {
+        self.set_config(config, true)
+    }
+
+    /// Keep indexed rows when only the display sort or size mode changes.
+    pub fn configure(&mut self, config: OrderConfig) -> u64 {
+        self.set_config(config, false)
+    }
+
+    fn set_config(&mut self, config: OrderConfig, clear: bool) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        let clear = clear || self.pending_config.is_some_and(|(_, pending)| pending);
+        self.pending_config = Some((
+            OrderConfig {
+                directories_only: false,
+                ..config
+            },
+            clear,
+        ));
+        self.flush_config();
+        self.generation
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn prioritize(&self, directory: NodeId, preview: Option<NodeId>) {
+        self.priorities[0].store(directory, AtomicOrdering::Relaxed);
+        self.priorities[1].store(preview.unwrap_or(NodeId::MAX), AtomicOrdering::Relaxed);
+    }
+
+    /// Read an immutable index without waiting for sorting or publication.
+    pub fn snapshot(&self, directory: NodeId) -> Option<Arc<CachedSnapshot>> {
+        let cache = self.cache.load_full();
+        cache
+            .get(&directory)
+            .filter(|view| view.generation == self.generation)
+            .cloned()
+    }
+
+    pub fn try_upsert(&mut self, rows: Vec<CachedRow>) -> Result<(), Vec<CachedRow>> {
+        if !self.flush_config() {
+            return Err(rows);
+        }
+        match self.sender.try_send(CacheCommand::Upsert {
+            generation: self.generation,
+            rows,
+        }) {
+            Ok(()) => Ok(()),
+            Err(
+                TrySendError::Full(CacheCommand::Upsert { rows, .. })
+                | TrySendError::Disconnected(CacheCommand::Upsert { rows, .. }),
+            ) => Err(rows),
+            Err(_) => unreachable!("only an Upsert was submitted"),
+        }
+    }
+
+    pub fn try_remove(&mut self, ids: Vec<NodeId>) -> Result<(), Vec<NodeId>> {
+        if !self.flush_config() {
+            return Err(ids);
+        }
+        match self.sender.try_send(CacheCommand::Remove {
+            generation: self.generation,
+            ids,
+        }) {
+            Ok(()) => Ok(()),
+            Err(
+                TrySendError::Full(CacheCommand::Remove { ids, .. })
+                | TrySendError::Disconnected(CacheCommand::Remove { ids, .. }),
+            ) => Err(ids),
+            Err(_) => unreachable!("only a Remove was submitted"),
+        }
+    }
+
+    /// Retry a queued display change even when the scan has no further rows.
+    pub fn pump_config(&mut self) -> bool {
+        self.flush_config()
+    }
+
+    fn flush_config(&mut self) -> bool {
+        let Some((config, clear)) = self.pending_config else {
+            return true;
+        };
+        if self
+            .sender
+            .try_send(CacheCommand::Configure {
+                generation: self.generation,
+                config,
+                clear,
+            })
+            .is_ok()
+        {
+            self.pending_config = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for CachedOrderWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::Release);
+    }
+}
+
+struct CachedDirectory {
+    order: State,
+    published: Option<Instant>,
+    published_rows: usize,
+    directory_count: usize,
+    visible_count: usize,
+    published_directories: usize,
+}
+
+impl CachedDirectory {
+    fn new(config: OrderConfig) -> Self {
+        let mut order = State::new();
+        order.config = config;
+        order.dirty = true;
+        Self {
+            order,
+            published: None,
+            published_rows: 0,
+            directory_count: 0,
+            visible_count: 0,
+            published_directories: 0,
+        }
+    }
+}
+
+struct CacheState {
+    generation: u64,
+    config: OrderConfig,
+    directories: HashMap<NodeId, CachedDirectory>,
+    parents: HashMap<NodeId, Option<NodeId>>,
+    removed: HashSet<NodeId>,
+    dirty: VecDeque<NodeId>,
+    dirty_set: HashSet<NodeId>,
+    published: PublishedCache,
+    retired: VecDeque<Arc<CachedSnapshot>>,
+    retired_indices: VecDeque<Arc<PublishedCache>>,
+    cleanup: VecDeque<NodeId>,
+}
+
+impl CacheState {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            config: OrderConfig::default(),
+            directories: HashMap::new(),
+            parents: HashMap::new(),
+            removed: HashSet::new(),
+            dirty: VecDeque::new(),
+            dirty_set: HashSet::new(),
+            published: PublishedCache::new(),
+            retired: VecDeque::new(),
+            retired_indices: VecDeque::new(),
+            cleanup: VecDeque::new(),
+        }
+    }
+
+    fn is_removed(&self, mut id: NodeId) -> bool {
+        if self.removed.is_empty() {
+            return false;
+        }
+        loop {
+            if self.removed.contains(&id) {
+                return true;
+            }
+            let Some(Some(parent)) = self.parents.get(&id) else {
+                return false;
+            };
+            id = *parent;
+        }
+    }
+
+    fn retire(&mut self, view: Arc<CachedSnapshot>) {
+        if Arc::strong_count(&view) != 1 {
+            self.retired.push_back(view);
+        }
+    }
+
+    fn publish_index(&mut self, cache: &SharedCache) {
+        let previous = cache.swap(Arc::new(self.published.clone()));
+        if Arc::strong_count(&previous) != 1 {
+            self.retired_indices.push_back(previous);
+        }
+    }
+
+    fn remove_view(&mut self, id: NodeId, cache: &SharedCache) {
+        if let Some(previous) = self.published.remove(&id) {
+            self.publish_index(cache);
+            self.retire(previous);
+        }
+    }
+
+    fn mark_dirty(&mut self, id: NodeId) {
+        if let Some(directory) = self.directories.get_mut(&id) {
+            directory.order.dirty = true;
+            if self.dirty_set.insert(id) {
+                self.dirty.push_back(id);
+            }
+        }
+    }
+
+    fn apply(&mut self, command: CacheCommand, cache: &SharedCache) {
+        match command {
+            CacheCommand::Configure {
+                generation,
+                config,
+                clear,
+            } => {
+                self.generation = generation;
+                self.config = config;
+                // The worker keeps the removed cache references until the UI releases them.
+                let previous = std::mem::take(&mut self.published);
+                let views: Vec<_> = previous.values().cloned().collect();
+                self.publish_index(cache);
+                drop(previous);
+                for view in views {
+                    self.retire(view);
+                }
+                self.dirty.clear();
+                self.dirty_set.clear();
+                if clear {
+                    self.directories.clear();
+                    self.parents.clear();
+                    self.removed.clear();
+                    self.cleanup.clear();
+                } else {
+                    for (&id, directory) in &mut self.directories {
+                        directory.order.config = config;
+                        directory.published = None;
+                        directory.published_rows = 0;
+                        directory.published_directories = 0;
+                        directory.directory_count = 0;
+                        directory.visible_count = 0;
+                        for state in directory.order.rows.values_mut() {
+                            let visible = config.show_hidden
+                                || !state.row.name.as_encoded_bytes().starts_with(b".");
+                            directory.visible_count += usize::from(visible);
+                            directory.directory_count +=
+                                usize::from(visible && state.row.kind == NodeKind::Directory);
+                            state.row.size = match config.size_mode {
+                                SizeMode::Allocated => state.row.sizes.allocated,
+                                SizeMode::Apparent => state.row.sizes.apparent,
+                            };
+                            state.rank = None;
+                        }
+                        directory.order.dirty = true;
+                        self.dirty.push_back(id);
+                        self.dirty_set.insert(id);
+                    }
+                }
+            }
+            CacheCommand::Upsert { generation, rows } if generation == self.generation => {
+                for CachedRow { parent, mut row } in rows {
+                    self.parents.insert(row.id, parent);
+                    if self.is_removed(row.id) {
+                        // A late parent can connect an earlier orphan view to a tombstone.
+                        if self.directories.contains_key(&row.id) {
+                            self.cleanup.push_back(row.id);
+                        }
+                        self.remove_view(row.id, cache);
+                        continue;
+                    }
+                    row.size = match self.config.size_mode {
+                        SizeMode::Allocated => row.sizes.allocated,
+                        SizeMode::Apparent => row.sizes.apparent,
+                    };
+                    if (row.kind == NodeKind::Directory || parent.is_none())
+                        && !self.directories.contains_key(&row.id)
+                    {
+                        self.directories
+                            .insert(row.id, CachedDirectory::new(self.config));
+                        self.mark_dirty(row.id);
+                    }
+                    if let Some(parent) = parent {
+                        if self.is_removed(parent) {
+                            continue;
+                        }
+                        let directory = self
+                            .directories
+                            .entry(parent)
+                            .or_insert_with(|| CachedDirectory::new(self.config));
+                        let visible = self.config.show_hidden
+                            || !row.name.as_encoded_bytes().starts_with(b".");
+                        match directory.order.rows.entry(row.id) {
+                            Entry::Occupied(mut entry) => {
+                                let previous_visible = self.config.show_hidden
+                                    || !entry.get().row.name.as_encoded_bytes().starts_with(b".");
+                                directory.visible_count -= usize::from(previous_visible);
+                                directory.visible_count += usize::from(visible);
+                                directory.directory_count -= usize::from(
+                                    previous_visible && entry.get().row.kind == NodeKind::Directory,
+                                );
+                                directory.directory_count +=
+                                    usize::from(visible && row.kind == NodeKind::Directory);
+                                entry.get_mut().row = row;
+                            }
+                            Entry::Vacant(entry) => {
+                                directory.visible_count += usize::from(visible);
+                                directory.directory_count +=
+                                    usize::from(visible && row.kind == NodeKind::Directory);
+                                entry.insert(RowState { row, rank: None });
+                            }
+                        }
+                        self.mark_dirty(parent);
+                    }
+                }
+            }
+            CacheCommand::Remove { generation, ids } if generation == self.generation => {
+                for id in ids {
+                    self.removed.insert(id);
+                    if let Some(Some(parent)) = self.parents.get(&id).copied() {
+                        if let Some(directory) = self.directories.get_mut(&parent) {
+                            if let Some(removed) = directory.order.rows.remove(&id) {
+                                let visible = self.config.show_hidden
+                                    || !removed.row.name.as_encoded_bytes().starts_with(b".");
+                                directory.visible_count -= usize::from(visible);
+                                directory.directory_count -=
+                                    usize::from(visible && removed.row.kind == NodeKind::Directory);
+                            }
+                            self.mark_dirty(parent);
+                        }
+                    }
+                    self.cleanup.push_back(id);
+                    self.remove_view(id, cache);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn due(&self, id: NodeId) -> bool {
+        self.directories.get(&id).is_some_and(|directory| {
+            directory.order.dirty
+                && (directory
+                    .published
+                    .is_none_or(|last| last.elapsed() >= SORT_INTERVAL)
+                    || (directory.published_rows == 0 && directory.visible_count != 0)
+                    || (directory.published_directories == 0 && directory.directory_count != 0))
+        }) && !self.is_removed(id)
+    }
+
+    fn next_dirty(&mut self, priorities: &[AtomicU32; 2]) -> Option<NodeId> {
+        for priority in priorities.iter().rev() {
+            let id = priority.load(AtomicOrdering::Relaxed);
+            if self.due(id) {
+                self.dirty_set.remove(&id);
+                return Some(id);
+            }
+        }
+        for _ in 0..self.dirty.len().min(MAX_DRAIN) {
+            let id = self.dirty.pop_front()?;
+            if !self.dirty_set.contains(&id) {
+                continue;
+            }
+            if self.is_removed(id) {
+                self.dirty_set.remove(&id);
+            } else if self.due(id) {
+                self.dirty_set.remove(&id);
+                return Some(id);
+            } else {
+                self.dirty.push_back(id);
+            }
+        }
+        None
+    }
+
+    fn publish(&mut self, id: NodeId, cache: &SharedCache) {
+        let directory = self.directories.get_mut(&id).unwrap();
+        let snapshot = directory.order.snapshot();
+        let directory_ids = snapshot
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| directory.order.rows[id].row.kind == NodeKind::Directory)
+            .collect();
+        let view = Arc::new(CachedSnapshot {
+            generation: self.generation,
+            ids: snapshot.ids,
+            directory_ids,
+            positions: snapshot.positions,
+        });
+        directory.published = Some(Instant::now());
+        directory.published_rows = view.ids.len();
+        directory.published_directories = view.directory_ids.len();
+        let previous = self.published.insert(id, view);
+        self.publish_index(cache);
+        if let Some(old) = previous {
+            self.retire(old);
+        }
+    }
+
+    fn cleanup(&mut self, cache: &SharedCache) {
+        // A lookup briefly owns an index Arc; callers then keep only the view.
+        // Retain both kinds until the worker becomes their last owner.
+        let deadline = Instant::now() + Duration::from_millis(4);
+        for _ in 0..self.retired_indices.len() {
+            let index = self.retired_indices.pop_front().unwrap();
+            if Arc::strong_count(&index) != 1 {
+                self.retired_indices.push_back(index);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(4);
+        for _ in 0..self.retired.len() {
+            let view = self.retired.pop_front().unwrap();
+            if Arc::strong_count(&view) != 1 {
+                self.retired.push_back(view);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(4);
+        for _ in 0..MAX_DRAIN {
+            let Some(id) = self.cleanup.pop_front() else {
+                break;
+            };
+            self.dirty_set.remove(&id);
+            if let Some(directory) = self.directories.remove(&id) {
+                self.cleanup
+                    .extend(directory.order.rows.values().filter_map(|state| {
+                        (state.row.kind == NodeKind::Directory).then_some(state.row.id)
+                    }));
+            }
+            self.remove_view(id, cache);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+}
+
+fn run_cache(
+    commands: Receiver<CacheCommand>,
+    cache: SharedCache,
+    priorities: Arc<[AtomicU32; 2]>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut state = CacheState::new();
+    while !stop.load(AtomicOrdering::Acquire) {
+        let timeout = if state.dirty.is_empty()
+            && state.cleanup.is_empty()
+            && state.retired.len() <= MAX_DRAIN
+            && state.retired_indices.len() <= MAX_DRAIN
+        {
+            SORT_INTERVAL
+        } else {
+            Duration::from_millis(2)
+        };
+        match commands.recv_timeout(timeout) {
+            Ok(command) => {
+                state.apply(command, &cache);
+                for _ in 0..MAX_DRAIN {
+                    match commands.try_recv() {
+                        Ok(command) => state.apply(command, &cache),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        }
+        let deadline = Instant::now() + Duration::from_millis(4);
+        while let Some(id) = state.next_dirty(&priorities) {
+            state.publish(id, &cache);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        state.cleanup(&cache);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::Model,
+        types::{ROOT, ScanEvent, Sizes},
+    };
+    use std::path::PathBuf;
+
+    fn row(id: NodeId, name: &str, size: u64) -> OrderRow {
+        OrderRow {
+            id,
+            name: Arc::from(OsStr::new(name)),
+            kind: NodeKind::File,
+            size,
+            sizes: Sizes {
+                apparent: size,
+                allocated: size,
+            },
+            items: 0,
+        }
+    }
+
+    fn put(state: &mut State, rows: Vec<OrderRow>) {
+        for row in rows {
+            match state.rows.entry(row.id) {
+                Entry::Occupied(mut entry) => entry.get_mut().row = row,
+                Entry::Vacant(entry) => {
+                    entry.insert(RowState { row, rank: None });
+                }
+            }
+        }
+    }
+
+    fn cache_row(
+        parent: Option<NodeId>,
+        id: NodeId,
+        name: &str,
+        size: u64,
+        kind: NodeKind,
+    ) -> CachedRow {
+        let mut row = row(id, name, size);
+        row.kind = kind;
+        CachedRow { parent, row }
+    }
+
+    fn cache_state() -> (CacheState, SharedCache) {
+        let cache = Arc::new(ArcSwap::from_pointee(PublishedCache::new()));
+        let mut state = CacheState::new();
+        state.apply(
+            CacheCommand::Configure {
+                generation: 1,
+                config: OrderConfig::default(),
+                clear: true,
+            },
+            &cache,
+        );
+        (state, cache)
+    }
+
+    #[test]
+    fn cached_views_are_prewarmed_sorted_and_share_directory_order() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(None, 0, "root", 0, NodeKind::Directory),
+                    cache_row(Some(0), 1, "small", 10, NodeKind::Directory),
+                    cache_row(Some(0), 2, "large", 100, NodeKind::Directory),
+                    cache_row(Some(0), 3, "file", 50, NodeKind::File),
+                    cache_row(Some(1), 4, "nested", 20, NodeKind::Directory),
+                ],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        state.publish(1, &cache);
+        state.publish(2, &cache);
+        let views = cache.load_full();
+        assert_eq!(views[&0].ids, vec![2, 3, 1]);
+        assert_eq!(views[&0].directory_ids, vec![2, 1]);
+        assert_eq!(views[&0].positions[&1], 2);
+        assert_eq!(views[&1].ids, vec![4]);
+        assert!(views[&2].ids.is_empty());
+    }
+
+    #[test]
+    fn completed_file_symlink_and_failed_roots_have_an_empty_cached_view() {
+        for kind in [NodeKind::File, NodeKind::Symlink, NodeKind::Unknown] {
+            let (mut state, cache) = cache_state();
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![cache_row(None, 0, "root", 0, kind)],
+                },
+                &cache,
+            );
+            assert!(state.due(0));
+            state.publish(0, &cache);
+            assert!(cache.load_full()[&0].ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn first_children_and_hovered_directories_do_not_wait_for_size_churn_throttle() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(None, 0, "root", 0, NodeKind::Directory),
+                    cache_row(Some(0), 1, "hovered", 100, NodeKind::Directory),
+                ],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        state.publish(1, &cache);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(1), 2, "file", 10, NodeKind::File)],
+            },
+            &cache,
+        );
+        assert!(
+            state.due(1),
+            "first known child must bypass the 100ms interval"
+        );
+        state.publish(1, &cache);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(1), 3, "nested", 20, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        assert!(
+            state.due(1),
+            "first preview subdirectory must bypass the interval"
+        );
+        state.directories.get_mut(&0).unwrap().published = None;
+        state.mark_dirty(0);
+        let priorities = [AtomicU32::new(0), AtomicU32::new(1)];
+        assert_eq!(state.next_dirty(&priorities), Some(1));
+    }
+
+    #[test]
+    fn cached_config_changes_use_both_sizes_and_retain_snapshots_for_background_drop() {
+        let (mut state, cache) = cache_state();
+        let mut apparent = cache_row(Some(0), 1, "apparent", 10, NodeKind::File);
+        apparent.row.sizes.apparent = 1000;
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    apparent,
+                    cache_row(Some(0), 2, "allocated", 100, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        let previous = Arc::clone(&cache.load_full()[&0]);
+        let retired = Arc::downgrade(&previous);
+        let config = OrderConfig {
+            size_mode: SizeMode::Apparent,
+            ..OrderConfig::default()
+        };
+        state.apply(
+            CacheCommand::Configure {
+                generation: 2,
+                config,
+                clear: false,
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        assert_eq!(cache.load_full()[&0].ids, vec![1, 2]);
+        state.cleanup(&cache);
+        assert_eq!(
+            Arc::strong_count(&previous),
+            2,
+            "worker retains the UI's replaced view"
+        );
+        drop(previous);
+        assert!(
+            retired.upgrade().is_some(),
+            "UI drop must leave a background owner"
+        );
+        state.cleanup(&cache);
+        assert!(
+            retired.upgrade().is_none(),
+            "worker reclaims the unreferenced view"
+        );
+    }
+
+    #[test]
+    fn cached_deletion_rejects_stale_subtree_rows_and_stale_scan_generations() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(0), 1, "deleted", 100, NodeKind::Directory),
+                    cache_row(Some(1), 2, "nested", 80, NodeKind::Directory),
+                    cache_row(Some(2), 3, "file", 60, NodeKind::File),
+                    cache_row(Some(0), 4, "survivor", 10, NodeKind::Directory),
+                ],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        state.publish(1, &cache);
+        state.publish(2, &cache);
+        state.apply(
+            CacheCommand::Remove {
+                generation: 1,
+                ids: vec![1],
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(0), 1, "late", 999, NodeKind::Directory),
+                    cache_row(Some(2), 5, "late-descendant", 999, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        assert_eq!(cache.load_full()[&0].ids, vec![4]);
+        assert!(!state.directories[&2].order.rows.contains_key(&5));
+        while !state.cleanup.is_empty() {
+            state.cleanup(&cache);
+        }
+        assert!(!cache.load_full().contains_key(&2));
+        state.apply(
+            CacheCommand::Configure {
+                generation: 2,
+                config: OrderConfig::default(),
+                clear: true,
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(0), 8, "old-scan", 10, NodeKind::File)],
+            },
+            &cache,
+        );
+        assert!(state.directories.is_empty());
+    }
+
+    #[test]
+    fn pending_config_is_retried_after_a_full_queue_without_further_rows() {
+        let (sender, commands) = bounded(COMMAND_CAPACITY);
+        for _ in 0..COMMAND_CAPACITY {
+            sender
+                .try_send(CacheCommand::Upsert {
+                    generation: 0,
+                    rows: Vec::new(),
+                })
+                .ok()
+                .unwrap();
+        }
+        let mut worker = CachedOrderWorker {
+            sender,
+            cache: Arc::new(ArcSwap::from_pointee(PublishedCache::new())),
+            priorities: Arc::new([AtomicU32::new(0), AtomicU32::new(NodeId::MAX)]),
+            stop: Arc::new(AtomicBool::new(false)),
+            generation: 0,
+            pending_config: None,
+        };
+        let config = OrderConfig {
+            sort_mode: SortMode::Name,
+            ..OrderConfig::default()
+        };
+        assert_eq!(worker.configure(config), 1);
+        assert!(worker.pending_config.is_some());
+        assert!(!worker.pump_config());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(CacheCommand::Upsert { .. })
+        ));
+        assert!(worker.pump_config());
+        assert!(worker.pending_config.is_none());
+        for _ in 1..COMMAND_CAPACITY {
+            let _ = commands.try_recv().unwrap();
+        }
+        match commands.try_recv().unwrap() {
+            CacheCommand::Configure {
+                generation,
+                config: queued,
+                clear,
+            } => {
+                assert_eq!(generation, 1);
+                assert_eq!(queued, config);
+                assert!(!clear);
+            }
+            _ => panic!("display change was not retried"),
+        }
+    }
+
+    #[test]
+    fn warm_cache_lookup_never_misses_during_concurrent_publication() {
+        let worker = CachedOrderWorker::new().unwrap();
+        let view = Arc::new(CachedSnapshot {
+            generation: 0,
+            ids: vec![9],
+            directory_ids: Vec::new(),
+            positions: HashMap::from([(9, 0)]),
+        });
+        let mut index = PublishedCache::new();
+        index.insert(0, view);
+        worker.cache.store(Arc::new(index.clone()));
+        let cache = Arc::clone(&worker.cache);
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_gate = Arc::clone(&gate);
+        let writer_done = Arc::clone(&done);
+        let writer = thread::spawn(move || {
+            writer_gate.wait();
+            for id in 1..4096 {
+                index.insert(
+                    id,
+                    Arc::new(CachedSnapshot {
+                        generation: 0,
+                        ids: Vec::new(),
+                        directory_ids: Vec::new(),
+                        positions: HashMap::new(),
+                    }),
+                );
+                cache.store(Arc::new(index.clone()));
+            }
+            writer_done.store(true, AtomicOrdering::Release);
+        });
+        gate.wait();
+        let mut reads = 0;
+        loop {
+            let view = worker
+                .snapshot(0)
+                .expect("publication must not hide a warmed directory");
+            assert_eq!(view.ids, vec![9]);
+            reads += 1;
+            if done.load(AtomicOrdering::Acquire) {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        assert!(reads > 0);
+        assert!(worker.snapshot(4095).is_some());
+    }
+
+    #[test]
+    fn replaced_index_and_view_remain_worker_owned_after_ui_releases_them() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(0), 1, "file", 10, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(0, &cache);
+        let index = cache.load_full();
+        let view = Arc::clone(&index[&0]);
+        let old_index = Arc::downgrade(&index);
+        let old_view = Arc::downgrade(&view);
+        state.publish(0, &cache);
+        drop(index);
+        assert!(
+            old_index.upgrade().is_some(),
+            "UI index release leaves background ownership"
+        );
+        state.cleanup(&cache);
+        assert!(old_index.upgrade().is_none());
+        drop(view);
+        assert!(
+            old_view.upgrade().is_some(),
+            "UI view release leaves background ownership"
+        );
+        state.cleanup(&cache);
+        assert!(old_view.upgrade().is_none());
+    }
+
+    #[test]
+    fn late_parent_links_reclaim_an_already_cached_removed_orphan() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(6), 7, "nested", 10, NodeKind::Directory),
+                    cache_row(Some(7), 8, "file", 10, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(6, &cache);
+        state.publish(7, &cache);
+        state.apply(
+            CacheCommand::Remove {
+                generation: 1,
+                ids: vec![5],
+            },
+            &cache,
+        );
+        state.cleanup(&cache);
+        assert!(cache.load_full().contains_key(&6));
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(
+                    Some(5),
+                    6,
+                    "late-parent",
+                    10,
+                    NodeKind::Directory,
+                )],
+            },
+            &cache,
+        );
+        while !state.cleanup.is_empty() {
+            state.cleanup(&cache);
+        }
+        assert!(!cache.load_full().contains_key(&6));
+        assert!(!cache.load_full().contains_key(&7));
+        assert!(!state.directories.contains_key(&7));
+    }
+
+    #[test]
+    fn live_near_ties_retain_order_and_large_changes_reorder() {
+        let mut state = State::new();
+        assert!(near_sizes(1000, 1001));
+        put(&mut state, vec![row(1, "a", 1000), row(2, "b", 1001)]);
+        assert_eq!(state.snapshot().ids, vec![2, 1]);
+        put(&mut state, vec![row(1, "a", 1001), row(2, "b", 1000)]);
+        assert_eq!(state.snapshot().ids, vec![2, 1]);
+        put(&mut state, vec![row(1, "a", 1100)]);
+        assert_eq!(state.snapshot().ids, vec![1, 2]);
+        state.config.descending = false;
+        assert_eq!(state.snapshot().ids, vec![2, 1]);
+    }
+
+    #[test]
+    fn monotonically_growing_close_rows_do_not_swap_at_absolute_boundaries() {
+        let sequence = [
+            (1003, 1004),
+            (1024, 1023),
+            (1043, 1044),
+            (1065, 1064),
+            (1086, 1087),
+            (1108, 1107),
+        ];
+        for descending in [false, true] {
+            let mut state = State::new();
+            state.config.descending = descending;
+            let mut previous_sizes = (0, 0);
+            for (a, b) in sequence {
+                assert!(a >= previous_sizes.0 && b >= previous_sizes.1);
+                assert!(near_sizes(a, b));
+                put(&mut state, vec![row(1, "a", a), row(2, "b", b)]);
+                assert_eq!(
+                    state.snapshot().ids,
+                    if descending { vec![2, 1] } else { vec![1, 2] },
+                );
+                previous_sizes = (a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn new_close_rows_use_exact_metric_order_while_existing_rows_keep_rank() {
+        for descending in [false, true] {
+            let mut state = State::new();
+            state.config.descending = descending;
+            put(&mut state, vec![row(1, "a", 1000), row(2, "b", 1001)]);
+            assert_eq!(
+                state.snapshot().ids,
+                if descending { vec![2, 1] } else { vec![1, 2] },
+            );
+            put(
+                &mut state,
+                vec![row(3, "z-new", 1010), row(4, "a-new", 1005)],
+            );
+            assert_eq!(
+                state.snapshot().ids,
+                if descending {
+                    vec![2, 1, 3, 4]
+                } else {
+                    vec![1, 2, 4, 3]
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn near_tie_groups_do_not_chain_beyond_two_percent() {
+        assert!(near_sizes(1000, 1010));
+        assert!(near_sizes(1010, 1021));
+        assert!(!near_sizes(1000, 1021));
+        assert!(!near_sizes(0, 1));
+        assert!(near_sizes(u64::MAX, u64::MAX - 1));
+        for descending in [false, true] {
+            let mut state = State::new();
+            state.config.sort_mode = SortMode::Name;
+            state.config.descending = !descending;
+            put(
+                &mut state,
+                vec![row(1, "a", 1000), row(2, "b", 1010), row(3, "c", 1021)],
+            );
+            state.snapshot();
+            state.config.sort_mode = SortMode::Size;
+            state.config.descending = descending;
+            let snapshot = state.snapshot();
+            let low = snapshot.positions[&1];
+            let high = snapshot.positions[&3];
+            assert_eq!(
+                high < low,
+                descending,
+                "distant endpoints must remain in exact order"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_name_item_sorts_and_hidden_filter_do_not_use_completion() {
+        let mut state = State::new();
+        let mut directory = row(1, "z", 100);
+        directory.kind = NodeKind::Directory;
+        directory.items = 3;
+        put(
+            &mut state,
+            vec![directory, row(2, "a", 1), row(3, ".hidden", 1000)],
+        );
+        state.config.show_hidden = false;
+        assert_eq!(state.snapshot().ids, vec![1, 2]);
+        state.config.sort_mode = SortMode::Name;
+        state.config.descending = false;
+        assert_eq!(state.snapshot().ids, vec![2, 1]);
+        state.config.sort_mode = SortMode::Items;
+        state.config.descending = true;
+        assert_eq!(state.snapshot().ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn worker_keys_share_the_models_basename_allocation() {
+        let mut model = Model::new(PathBuf::from("fixture"));
+        model.apply(ScanEvent::RootInfo {
+            kind: NodeKind::Directory,
+            sizes: Sizes::default(),
+            error: None,
+        });
+        let key = OrderRow::from_node(ROOT, model.node(ROOT), SizeMode::Allocated);
+        assert!(Arc::ptr_eq(&key.name, &model.node(ROOT).name));
+    }
+
+    #[test]
+    fn directory_only_preview_keeps_live_normal_order_and_hidden_policy() {
+        let mut state = State::new();
+        state.config.directories_only = true;
+        state.config.show_hidden = false;
+        let mut small = row(1, "small", 10);
+        small.kind = NodeKind::Directory;
+        let mut large = row(2, "large", 100);
+        large.kind = NodeKind::Directory;
+        let mut hidden = row(3, ".hidden", 1000);
+        hidden.kind = NodeKind::Directory;
+        put(&mut state, vec![small, large, hidden, row(4, "file", 2000)]);
+        assert_eq!(state.snapshot().ids, vec![2, 1]);
+        state.rows.remove(&2);
+        assert_eq!(state.snapshot().ids, vec![1]);
+    }
+}
