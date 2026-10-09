@@ -1,7 +1,7 @@
 //! Shared background directory ordering. Exact size order is split into
 //! groups whose largest value is at most 2% above their smallest. Previous ranks
 //! are retained inside each group, so growing near-ties do not churn.
-use crate::model::Node;
+use crate::model::{Model, Node};
 use crate::types::{NodeId, NodeKind, SizeMode, Sizes, SortMode};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -199,11 +199,28 @@ fn near_sizes(a: u64, b: u64) -> bool {
 #[derive(Clone, Debug)]
 pub struct CachedRow {
     pub parent: Option<NodeId>,
+    pub parent_epoch: u64,
+    pub child_epoch: u64,
+    pub removed: bool,
     pub row: OrderRow,
+}
+
+impl CachedRow {
+    pub fn from_model(id: NodeId, model: &Model, mode: SizeMode) -> Self {
+        let node = model.node(id);
+        Self {
+            parent: node.parent,
+            parent_epoch: node.parent_epoch,
+            child_epoch: node.child_epoch,
+            removed: !model.is_live(id),
+            row: OrderRow::from_node(id, node, mode),
+        }
+    }
 }
 
 pub struct CachedSnapshot {
     pub generation: u64,
+    pub child_epoch: u64,
     pub ids: Vec<NodeId>,
     pub directory_ids: Vec<NodeId>,
     pub positions: HashMap<NodeId, usize>,
@@ -394,18 +411,31 @@ impl CachedDirectory {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CachedParent {
+    parent: Option<NodeId>,
+    parent_epoch: u64,
+    child_epoch: u64,
+}
+
+struct RetiredRows {
+    rows: std::collections::hash_map::IntoValues<NodeId, RowState>,
+}
+
 struct CacheState {
     generation: u64,
     config: OrderConfig,
     directories: HashMap<NodeId, CachedDirectory>,
-    parents: HashMap<NodeId, Option<NodeId>>,
+    parents: HashMap<NodeId, CachedParent>,
     removed: HashSet<NodeId>,
+    has_epochs: bool,
     dirty: VecDeque<NodeId>,
     dirty_set: HashSet<NodeId>,
     published: PublishedCache,
     retired: VecDeque<Arc<CachedSnapshot>>,
     retired_indices: VecDeque<Arc<PublishedCache>>,
     cleanup: VecDeque<NodeId>,
+    retired_rows: VecDeque<RetiredRows>,
 }
 
 impl CacheState {
@@ -416,28 +446,57 @@ impl CacheState {
             directories: HashMap::new(),
             parents: HashMap::new(),
             removed: HashSet::new(),
+            has_epochs: false,
             dirty: VecDeque::new(),
             dirty_set: HashSet::new(),
             published: PublishedCache::new(),
             retired: VecDeque::new(),
             retired_indices: VecDeque::new(),
             cleanup: VecDeque::new(),
+            retired_rows: VecDeque::new(),
         }
     }
 
     fn is_removed(&self, mut id: NodeId) -> bool {
-        if self.removed.is_empty() {
+        if self.removed.is_empty() && !self.has_epochs {
             return false;
         }
         loop {
             if self.removed.contains(&id) {
                 return true;
             }
-            let Some(Some(parent)) = self.parents.get(&id) else {
+            let Some(link) = self.parents.get(&id) else {
                 return false;
             };
-            id = *parent;
+            let Some(parent) = link.parent else {
+                return false;
+            };
+            if self
+                .parents
+                .get(&parent)
+                .is_some_and(|parent| link.parent_epoch != parent.child_epoch)
+            {
+                return true;
+            }
+            id = parent;
         }
+    }
+
+    fn retire_directory(&mut self, directory: CachedDirectory) {
+        self.retired_rows.push_back(RetiredRows {
+            rows: directory.order.rows.into_values(),
+        });
+    }
+
+    fn reset_children(&mut self, id: NodeId, cache: &SharedCache) {
+        if let Some(previous) = self
+            .directories
+            .insert(id, CachedDirectory::new(self.config))
+        {
+            self.retire_directory(previous);
+        }
+        self.remove_view(id, cache);
+        self.mark_dirty(id);
     }
 
     fn retire(&mut self, view: Arc<CachedSnapshot>) {
@@ -492,7 +551,9 @@ impl CacheState {
                     self.directories.clear();
                     self.parents.clear();
                     self.removed.clear();
+                    self.has_epochs = false;
                     self.cleanup.clear();
+                    self.retired_rows.clear();
                 } else {
                     for (&id, directory) in &mut self.directories {
                         directory.order.config = config;
@@ -520,8 +581,48 @@ impl CacheState {
                 }
             }
             CacheCommand::Upsert { generation, rows } if generation == self.generation => {
-                for CachedRow { parent, mut row } in rows {
-                    self.parents.insert(row.id, parent);
+                for CachedRow {
+                    parent,
+                    parent_epoch,
+                    child_epoch,
+                    removed,
+                    mut row,
+                } in rows
+                {
+                    self.has_epochs |= parent_epoch != 0 || child_epoch != 0;
+                    let previous_epoch = self.parents.get(&row.id).map(|parent| parent.child_epoch);
+                    if previous_epoch.is_some_and(|previous| previous > child_epoch) {
+                        continue;
+                    }
+                    // A fresh child can be submitted before its retained parent
+                    // reaches the pending-update queue. Its witness advances that
+                    // parent's epoch first, so the later parent update keeps it.
+                    if let Some(parent) = parent {
+                        let known_epoch =
+                            self.parents.get(&parent).map_or(0, |link| link.child_epoch);
+                        if parent_epoch > known_epoch {
+                            self.parents
+                                .entry(parent)
+                                .or_insert(CachedParent {
+                                    parent: None,
+                                    parent_epoch: 0,
+                                    child_epoch: 0,
+                                })
+                                .child_epoch = parent_epoch;
+                            self.reset_children(parent, cache);
+                        }
+                    }
+                    self.parents.insert(
+                        row.id,
+                        CachedParent {
+                            parent,
+                            parent_epoch,
+                            child_epoch,
+                        },
+                    );
+                    if removed {
+                        self.removed.insert(row.id);
+                    }
                     if self.is_removed(row.id) {
                         // A late parent can connect an earlier orphan view to a tombstone.
                         if self.directories.contains_key(&row.id) {
@@ -529,6 +630,9 @@ impl CacheState {
                         }
                         self.remove_view(row.id, cache);
                         continue;
+                    }
+                    if previous_epoch.unwrap_or(0) != child_epoch {
+                        self.reset_children(row.id, cache);
                     }
                     row.size = match self.config.size_mode {
                         SizeMode::Allocated => row.sizes.allocated,
@@ -578,7 +682,7 @@ impl CacheState {
             CacheCommand::Remove { generation, ids } if generation == self.generation => {
                 for id in ids {
                     self.removed.insert(id);
-                    if let Some(Some(parent)) = self.parents.get(&id).copied() {
+                    if let Some(parent) = self.parents.get(&id).and_then(|link| link.parent) {
                         if let Some(directory) = self.directories.get_mut(&parent) {
                             if let Some(removed) = directory.order.rows.remove(&id) {
                                 let visible = self.config.show_hidden
@@ -645,6 +749,7 @@ impl CacheState {
             .collect();
         let view = Arc::new(CachedSnapshot {
             generation: self.generation,
+            child_epoch: self.parents.get(&id).map_or(0, |link| link.child_epoch),
             ids: snapshot.ids,
             directory_ids,
             positions: snapshot.positions,
@@ -689,12 +794,25 @@ impl CacheState {
             };
             self.dirty_set.remove(&id);
             if let Some(directory) = self.directories.remove(&id) {
-                self.cleanup
-                    .extend(directory.order.rows.values().filter_map(|state| {
-                        (state.row.kind == NodeKind::Directory).then_some(state.row.id)
-                    }));
+                self.retire_directory(directory);
             }
             self.remove_view(id, cache);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(4);
+        for _ in 0..MAX_DRAIN {
+            let Some(retired) = self.retired_rows.front_mut() else {
+                break;
+            };
+            if let Some(state) = retired.rows.next() {
+                if state.row.kind == NodeKind::Directory {
+                    self.cleanup.push_back(state.row.id);
+                }
+            } else {
+                self.retired_rows.pop_front();
+            }
             if Instant::now() >= deadline {
                 break;
             }
@@ -712,6 +830,7 @@ fn run_cache(
     while !stop.load(AtomicOrdering::Acquire) {
         let timeout = if state.dirty.is_empty()
             && state.cleanup.is_empty()
+            && state.retired_rows.is_empty()
             && state.retired.len() <= MAX_DRAIN
             && state.retired_indices.len() <= MAX_DRAIN
         {
@@ -786,7 +905,13 @@ mod tests {
     ) -> CachedRow {
         let mut row = row(id, name, size);
         row.kind = kind;
-        CachedRow { parent, row }
+        CachedRow {
+            parent,
+            parent_epoch: 0,
+            child_epoch: 0,
+            removed: false,
+            row,
+        }
     }
 
     fn cache_state() -> (CacheState, SharedCache) {
@@ -979,7 +1104,7 @@ mod tests {
         state.publish(0, &cache);
         assert_eq!(cache.load_full()[&0].ids, vec![4]);
         assert!(!state.directories[&2].order.rows.contains_key(&5));
-        while !state.cleanup.is_empty() {
+        while !state.cleanup.is_empty() || !state.retired_rows.is_empty() {
             state.cleanup(&cache);
         }
         assert!(!cache.load_full().contains_key(&2));
@@ -1056,6 +1181,7 @@ mod tests {
         let worker = CachedOrderWorker::new().unwrap();
         let view = Arc::new(CachedSnapshot {
             generation: 0,
+            child_epoch: 0,
             ids: vec![9],
             directory_ids: Vec::new(),
             positions: HashMap::from([(9, 0)]),
@@ -1075,6 +1201,7 @@ mod tests {
                     id,
                     Arc::new(CachedSnapshot {
                         generation: 0,
+                        child_epoch: 0,
                         ids: Vec::new(),
                         directory_ids: Vec::new(),
                         positions: HashMap::new(),
@@ -1170,7 +1297,7 @@ mod tests {
             },
             &cache,
         );
-        while !state.cleanup.is_empty() {
+        while !state.cleanup.is_empty() || !state.retired_rows.is_empty() {
             state.cleanup(&cache);
         }
         assert!(!cache.load_full().contains_key(&6));
@@ -1297,6 +1424,7 @@ mod tests {
     fn worker_keys_share_the_models_basename_allocation() {
         let mut model = Model::new(PathBuf::from("fixture"));
         model.apply(ScanEvent::RootInfo {
+            file_identity: None,
             kind: NodeKind::Directory,
             sizes: Sizes::default(),
             error: None,
@@ -1320,5 +1448,190 @@ mod tests {
         assert_eq!(state.snapshot().ids, vec![2, 1]);
         state.rows.remove(&2);
         assert_eq!(state.snapshot().ids, vec![1]);
+    }
+
+    fn epoch_row(
+        parent: Option<NodeId>,
+        id: NodeId,
+        parent_epoch: u64,
+        child_epoch: u64,
+        kind: NodeKind,
+    ) -> CachedRow {
+        let mut row = cache_row(parent, id, &format!("node-{id}"), 10, kind);
+        row.parent_epoch = parent_epoch;
+        row.child_epoch = child_epoch;
+        row
+    }
+
+    fn upsert_epoch(state: &mut CacheState, cache: &SharedCache, rows: Vec<CachedRow>) {
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows,
+            },
+            cache,
+        );
+    }
+
+    fn finish_cache_cleanup(state: &mut CacheState, cache: &SharedCache) {
+        for _ in 0..1000 {
+            if state.cleanup.is_empty() && state.retired_rows.is_empty() {
+                return;
+            }
+            state.cleanup(cache);
+        }
+        panic!("bounded cached-row cleanup did not finish");
+    }
+
+    #[test]
+    fn refreshed_directory_keeps_its_id_and_rejects_old_descendant_views() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 0, NodeKind::Directory),
+                epoch_row(Some(0), 1, 0, 0, NodeKind::Directory),
+                epoch_row(Some(1), 2, 0, 0, NodeKind::Directory),
+                epoch_row(Some(2), 3, 0, 0, NodeKind::File),
+            ],
+        );
+        state.publish(1, &cache);
+        state.publish(2, &cache);
+        let held = Arc::clone(&cache.load_full()[&1]);
+        let weak = Arc::downgrade(&held);
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(Some(0), 1, 0, 1, NodeKind::Directory)],
+        );
+        assert!(!state.is_removed(1));
+        assert!(state.is_removed(2) && state.is_removed(3));
+        assert!(!state.removed.contains(&1));
+        assert!(!cache.load_full().contains_key(&1));
+        drop(held);
+        assert!(
+            weak.upgrade().is_some(),
+            "releasing old UI view must leave worker ownership"
+        );
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(1), 4, 1, 0, NodeKind::File),
+                epoch_row(Some(1), 2, 0, 0, NodeKind::Directory),
+            ],
+        );
+        state.publish(1, &cache);
+        assert_eq!(cache.load_full()[&1].ids, vec![4]);
+        assert_eq!(cache.load_full()[&1].child_epoch, 1);
+        finish_cache_cleanup(&mut state, &cache);
+        assert!(!state.directories.contains_key(&2));
+        assert!(!cache.load_full().contains_key(&2));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn fresh_children_before_parent_update_preserve_epoch_and_sorted_rows() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 0, NodeKind::Directory),
+                epoch_row(Some(0), 1, 0, 0, NodeKind::Directory),
+                epoch_row(Some(1), 2, 0, 0, NodeKind::File),
+            ],
+        );
+        state.publish(1, &cache);
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(1), 3, 1, 0, NodeKind::File),
+                epoch_row(Some(0), 1, 0, 1, NodeKind::Directory),
+                epoch_row(Some(0), 1, 0, 0, NodeKind::Directory),
+            ],
+        );
+        state.publish(1, &cache);
+        assert_eq!(cache.load_full()[&1].ids, vec![3]);
+        assert_eq!(cache.load_full()[&1].child_epoch, 1);
+        assert!(!state.is_removed(1));
+        assert!(state.is_removed(2));
+    }
+
+    #[test]
+    fn repeated_nested_refresh_never_tombstones_surviving_scope_ids() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 0, NodeKind::Directory),
+                epoch_row(Some(0), 1, 0, 0, NodeKind::Directory),
+                epoch_row(Some(1), 2, 0, 0, NodeKind::Directory),
+            ],
+        );
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(0), 1, 0, 1, NodeKind::Directory),
+                epoch_row(Some(1), 3, 1, 0, NodeKind::Directory),
+                epoch_row(Some(3), 4, 0, 0, NodeKind::File),
+            ],
+        );
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(1), 3, 1, 1, NodeKind::Directory),
+                epoch_row(Some(3), 5, 1, 0, NodeKind::File),
+            ],
+        );
+        state.publish(3, &cache);
+        assert_eq!(cache.load_full()[&3].ids, vec![5]);
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(0), 1, 0, 2, NodeKind::Directory),
+                epoch_row(Some(1), 6, 2, 0, NodeKind::Directory),
+                epoch_row(Some(6), 7, 0, 0, NodeKind::File),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        state.publish(1, &cache);
+        state.publish(6, &cache);
+        assert_eq!(cache.load_full()[&1].ids, vec![6]);
+        assert_eq!(cache.load_full()[&6].ids, vec![7]);
+        assert!(!state.is_removed(1) && !state.is_removed(6));
+        assert!(
+            state.is_removed(2)
+                && state.is_removed(3)
+                && state.is_removed(4)
+                && state.is_removed(5)
+        );
+        assert!(!state.directories.contains_key(&2) && !state.directories.contains_key(&3));
+    }
+
+    #[test]
+    fn old_directory_rows_are_destroyed_in_bounded_background_batches() {
+        let (mut state, cache) = cache_state();
+        let mut rows = vec![epoch_row(None, 0, 0, 0, NodeKind::Directory)];
+        rows.extend((1..1000).map(|id| epoch_row(Some(0), id, 0, 0, NodeKind::File)));
+        upsert_epoch(&mut state, &cache, rows);
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(None, 0, 0, 1, NodeKind::Directory)],
+        );
+        assert_eq!(state.retired_rows.len(), 1);
+        state.cleanup(&cache);
+        assert_eq!(state.retired_rows.len(), 1);
+        assert!(state.retired_rows.front().unwrap().rows.len() >= 999 - MAX_DRAIN);
+        finish_cache_cleanup(&mut state, &cache);
+        assert!(state.retired_rows.is_empty());
+        assert!(!state.is_removed(0));
     }
 }

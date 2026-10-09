@@ -18,6 +18,7 @@ const REMOVAL_BUDGET: Duration = Duration::from_millis(4);
 #[derive(Debug)]
 struct HardlinkGroup {
     sizes: Sizes,
+    metadata_generation: u64,
     owner: Option<NodeId>,
     members: Vec<NodeId>,
 }
@@ -26,6 +27,48 @@ struct HardlinkGroup {
 struct RemovalCursor {
     group: usize,
     member: usize,
+}
+
+#[derive(Debug)]
+struct CleanupCursor {
+    next: usize,
+    end: usize,
+}
+
+/// A scanner's local IDs stay contiguous even when several scopes interleave.
+/// Retaining these small chunked maps avoids destroying a whole scan on input.
+#[derive(Debug)]
+struct ScopeScan {
+    scope: NodeId,
+    ids: Vec<Vec<NodeId>>,
+    len: usize,
+    metadata_received: bool,
+    finished: bool,
+}
+
+impl ScopeScan {
+    fn new(scope: NodeId) -> Self {
+        Self {
+            scope,
+            ids: vec![vec![scope]],
+            len: 1,
+            metadata_received: false,
+            finished: false,
+        }
+    }
+
+    fn get(&self, local: NodeId) -> Option<NodeId> {
+        ((local as usize) < self.len)
+            .then(|| self.ids[local as usize / NODE_CHUNK][local as usize % NODE_CHUNK])
+    }
+
+    fn push(&mut self, id: NodeId) {
+        if self.len % NODE_CHUNK == 0 {
+            self.ids.push(Vec::with_capacity(NODE_CHUNK));
+        }
+        self.ids.last_mut().unwrap().push(id);
+        self.len += 1;
+    }
 }
 
 #[derive(Debug)]
@@ -47,6 +90,11 @@ pub struct Node {
     read_done: bool,
     overflow_reported: bool,
     pending_dirs: u32,
+    pub child_epoch: u64,
+    pub parent_epoch: u64,
+    scan_generation: u64,
+    suppression_cutoff: Option<u64>,
+    suppressed_subtrees: u64,
 }
 
 impl Node {
@@ -69,6 +117,11 @@ impl Node {
             read_done: complete,
             overflow_reported: false,
             pending_dirs: 0,
+            child_epoch: 0,
+            parent_epoch: 0,
+            scan_generation: 0,
+            suppression_cutoff: None,
+            suppressed_subtrees: 0,
         }
     }
 
@@ -150,12 +203,15 @@ pub struct Model {
     hardlink_indices: HashMap<NodeId, usize>,
     hardlink_groups: Vec<HardlinkGroup>,
     removal_cursor: Option<RemovalCursor>,
+    cleanup_cursor: Option<CleanupCursor>,
+    scans: HashMap<u64, ScopeScan>,
+    active_scopes: HashMap<NodeId, u64>,
+    generation: u64,
     last_error_id: Option<NodeId>,
     pub revision: u64,
     pub finished: bool,
     pub cancelled: bool,
     pub last_error: Option<String>,
-    root_info_received: bool,
 }
 
 impl Model {
@@ -175,12 +231,15 @@ impl Model {
             hardlink_indices: HashMap::new(),
             hardlink_groups: Vec::new(),
             removal_cursor: None,
+            cleanup_cursor: None,
+            scans: HashMap::from([(0, ScopeScan::new(ROOT))]),
+            active_scopes: HashMap::from([(ROOT, 0)]),
+            generation: 0,
             last_error_id: None,
             revision: 0,
             finished: false,
             cancelled: false,
             last_error: None,
-            root_info_received: false,
         }
     }
 
@@ -216,6 +275,14 @@ impl Model {
             if node.removed {
                 return true;
             }
+            if let Some(parent) = node.parent {
+                let Some(parent_node) = self.nodes.get(parent as usize) else {
+                    return true;
+                };
+                if node.parent_epoch != parent_node.child_epoch {
+                    return true;
+                }
+            }
             current = node.parent;
         }
         false
@@ -223,6 +290,151 @@ impl Model {
 
     pub fn is_live(&self, id: NodeId) -> bool {
         !self.is_removed(id)
+    }
+
+    /// Freeze scanner contributions without hiding or subtracting known data.
+    /// A cancelled confirmation therefore retains the exact partial view.
+    pub fn suppress_scan(&mut self, id: NodeId) -> Vec<NodeId> {
+        if !self.is_live(id) {
+            return Vec::new();
+        }
+        let already_suppressed = self.nodes[id as usize].suppression_cutoff.is_some();
+        self.nodes[id as usize].suppression_cutoff = Some(self.generation);
+        let mut changed = Vec::new();
+        let mut current = Some(id);
+        while let Some(ancestor) = current {
+            let node = &mut self.nodes[ancestor as usize];
+            if !already_suppressed {
+                node.suppressed_subtrees = node.suppressed_subtrees.saturating_add(1);
+            }
+            changed.push(ancestor);
+            current = node.parent;
+        }
+        if !self.nodes[id as usize].complete {
+            self.cancelled = true;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        changed
+    }
+
+    /// Interrupted deletion can invalidate previously complete totals. Keep
+    /// their known values and completion tokens until reconciliation can run.
+    pub fn mark_partial(&mut self, id: NodeId) -> Vec<NodeId> {
+        let changed = self.suppress_scan(id);
+        if !changed.is_empty() {
+            self.cancelled = true;
+        }
+        changed
+    }
+
+    /// Completion describes scanner work; partial totals also include later
+    /// deletions whose filesystem changes have not yet been reconciled.
+    pub fn has_partial_totals(&self, id: NodeId) -> bool {
+        if !self.is_live(id) {
+            return false;
+        }
+        let node = &self.nodes[id as usize];
+        !node.complete || node.error_count != 0 || node.suppressed_subtrees != 0
+    }
+
+    /// Refresh one directory while retaining its identity and surrounding tree.
+    /// Changing a child epoch hides all previous descendants in O(ancestor depth).
+    pub fn begin_rescan(&mut self, id: NodeId, generation: u64) -> Vec<NodeId> {
+        if !self.is_live(id)
+            || self.nodes[id as usize].kind != NodeKind::Directory
+            || generation <= self.generation
+        {
+            return Vec::new();
+        }
+        let node = &self.nodes[id as usize];
+        let Some(epoch) = node.child_epoch.checked_add(1) else {
+            return self.note_error(id, "directory refresh generation overflow".into());
+        };
+        let sizes = node.sizes;
+        let items = node.items;
+        let errors = node.error_count;
+        let suppressed = node.suppressed_subtrees;
+        let was_complete = node.complete;
+        let parent = node.parent;
+        let mut changed = vec![id];
+        let mut current = parent;
+        while let Some(ancestor) = current {
+            let node = &mut self.nodes[ancestor as usize];
+            node.sizes.apparent = node.sizes.apparent.saturating_sub(sizes.apparent);
+            node.sizes.allocated = node.sizes.allocated.saturating_sub(sizes.allocated);
+            node.items = node.items.saturating_sub(items);
+            node.error_count = node
+                .error_count
+                .saturating_sub(errors)
+                .max(u64::from(node.overflow_reported));
+            node.suppressed_subtrees = node.suppressed_subtrees.saturating_sub(suppressed);
+            changed.push(ancestor);
+            current = node.parent;
+        }
+        let node = &mut self.nodes[id as usize];
+        node.sizes = Sizes::default();
+        node.items = 0;
+        node.error_count = 0;
+        node.complete = false;
+        node.read_done = false;
+        node.overflow_reported = false;
+        node.pending_dirs = 0;
+        node.first_child = NO_NODE;
+        node.last_child = NO_NODE;
+        node.child_epoch = epoch;
+        node.scan_generation = generation;
+        node.suppression_cutoff = None;
+        node.suppressed_subtrees = 0;
+        self.directories.insert(id, DirectoryInfo::default());
+        // Reopen only the completed part of the ancestor chain. An incomplete
+        // ancestor already holds its parent's unique pending-directory token.
+        if was_complete {
+            let mut current = parent;
+            while let Some(ancestor) = current {
+                let node = &mut self.nodes[ancestor as usize];
+                node.pending_dirs = node.pending_dirs.saturating_add(1);
+                if !node.complete {
+                    break;
+                }
+                node.complete = false;
+                current = node.parent;
+            }
+        }
+        self.generation = generation;
+        self.scans.insert(generation, ScopeScan::new(id));
+        self.active_scopes.insert(id, generation);
+        self.has_removals = true;
+        self.finished = false;
+        self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
+        self.schedule_cleanup();
+        if self
+            .last_error_id
+            .is_some_and(|error_id| error_id == id || self.is_removed(error_id))
+            || self.nodes[ROOT as usize].error_count == 0
+        {
+            self.last_error = None;
+            self.last_error_id = None;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        changed
+    }
+
+    fn accepts_scan(&self, id: NodeId, generation: u64) -> bool {
+        if !self.is_live(id) || self.nodes[id as usize].scan_generation != generation {
+            return false;
+        }
+        let mut current = Some(id);
+        while let Some(id) = current {
+            let node = &self.nodes[id as usize];
+            if node
+                .suppression_cutoff
+                .is_some_and(|cutoff| generation <= cutoff)
+            {
+                return false;
+            }
+            current = node.parent;
+        }
+        true
     }
 
     /// Unlink a subtree without walking or freeing it on the input thread.
@@ -243,6 +455,7 @@ impl Model {
         let directory = node.kind == NodeKind::Directory;
         let hidden = node.name.as_encoded_bytes().starts_with(b".");
         let pending = directory && !node.complete;
+        let suppressed = node.suppressed_subtrees;
         let counts = &mut self.directories.get_mut(&parent).unwrap().children;
         counts.all -= 1;
         counts.hidden -= u32::from(hidden);
@@ -268,6 +481,7 @@ impl Model {
             node.sizes.apparent = node.sizes.apparent.saturating_sub(sizes.apparent);
             node.sizes.allocated = node.sizes.allocated.saturating_sub(sizes.allocated);
             node.items = node.items.saturating_sub(items);
+            node.suppressed_subtrees = node.suppressed_subtrees.saturating_sub(suppressed);
             node.error_count = node
                 .error_count
                 .saturating_sub(errors)
@@ -283,14 +497,15 @@ impl Model {
             }
             self.complete_ready(parent);
         }
-        if !self.hardlink_groups.is_empty() {
-            self.removal_cursor = Some(RemovalCursor::default());
-        }
+        self.schedule_cleanup();
         if self.last_error_id.is_some_and(|id| self.is_removed(id))
             || self.nodes[ROOT as usize].error_count == 0
         {
             self.last_error = None;
             self.last_error_id = None;
+        }
+        if self.nodes[ROOT as usize].complete {
+            self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
         }
         self.revision = self.revision.wrapping_add(1);
         changed
@@ -299,10 +514,11 @@ impl Model {
     /// Repair hardlink ownership in small batches after subtree tombstoning.
     /// Only aliases with live ancestors may receive the group's byte charge.
     pub fn pump_removals(&mut self) -> Vec<NodeId> {
+        let started = Instant::now();
         let Some(mut cursor) = self.removal_cursor.take() else {
+            self.pump_cleanup(started);
             return Vec::new();
         };
-        let started = Instant::now();
         let mut checks = 0;
         let mut changed = Vec::new();
         while cursor.group < self.hardlink_groups.len()
@@ -336,6 +552,7 @@ impl Model {
         if cursor.group < self.hardlink_groups.len() {
             self.removal_cursor = Some(cursor);
         }
+        self.pump_cleanup(started);
         if !changed.is_empty() {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -343,7 +560,41 @@ impl Model {
     }
 
     pub fn has_pending_removals(&self) -> bool {
-        self.removal_cursor.is_some()
+        self.removal_cursor.is_some() || self.cleanup_cursor.is_some()
+    }
+
+    fn schedule_cleanup(&mut self) {
+        if !self.hardlink_groups.is_empty() {
+            self.removal_cursor = Some(RemovalCursor::default());
+        }
+        self.cleanup_cursor = Some(CleanupCursor {
+            next: 1,
+            end: self.nodes.len(),
+        });
+    }
+
+    fn pump_cleanup(&mut self, started: Instant) {
+        let Some(mut cursor) = self.cleanup_cursor.take() else {
+            return;
+        };
+        let mut checks = 0;
+        while cursor.next < cursor.end
+            && checks < REMOVAL_CHECKS
+            && started.elapsed() < REMOVAL_BUDGET
+        {
+            let id = cursor.next as NodeId;
+            cursor.next += 1;
+            checks += 1;
+            if self.is_removed(id) {
+                let node = &mut self.nodes[id as usize];
+                node.removed = true;
+                node.name = Arc::clone(&self.tombstone_name);
+                self.directories.remove(&id);
+            }
+        }
+        if cursor.next < cursor.end {
+            self.cleanup_cursor = Some(cursor);
+        }
     }
 
     /// Refresh one surviving directory's own inode bytes after a deletion.
@@ -385,6 +636,24 @@ impl Model {
         }
         self.revision = self.revision.wrapping_add(1);
         changed
+    }
+
+    /// Transport failures belong to the originating scanner, not merely its path.
+    pub fn note_scan_error(
+        &mut self,
+        scope: NodeId,
+        generation: u64,
+        error: String,
+    ) -> Vec<NodeId> {
+        if self
+            .scans
+            .get(&generation)
+            .is_none_or(|scan| scan.scope != scope || scan.finished)
+            || !self.accepts_scan(scope, generation)
+        {
+            return Vec::new();
+        }
+        self.note_error(scope, error)
     }
 
     /// A failed recursive deletion leaves a partial view until explicit refresh.
@@ -496,51 +765,170 @@ impl Model {
     }
 
     pub fn apply(&mut self, event: ScanEvent) -> Vec<NodeId> {
+        self.apply_scoped(ROOT, 0, event)
+    }
+
+    /// Apply scanner-local IDs within one retained directory and scan generation.
+    /// Late messages still consume local IDs, but cannot resurrect old descendants.
+    pub fn apply_scoped(
+        &mut self,
+        scope: NodeId,
+        generation: u64,
+        event: ScanEvent,
+    ) -> Vec<NodeId> {
         let mut changed = Vec::new();
-        self.revision = self.revision.wrapping_add(1);
-        if self.finished {
-            if !matches!(event, ScanEvent::Finished { .. }) {
-                self.record_error(ROOT, "received scan data after completion".into());
+        let Some(scan) = self.scans.get(&generation) else {
+            return changed;
+        };
+        if scan.scope != scope {
+            return changed;
+        }
+        let scope_live = self.accepts_scan(scope, generation);
+        if scan.finished {
+            let event_live = match &event {
+                ScanEvent::RootInfo { .. } => scope_live,
+                ScanEvent::Entries { parent, .. } => scan
+                    .get(*parent)
+                    .map_or(scope_live, |id| self.accepts_scan(id, generation)),
+                ScanEvent::DirectoryDone { id, .. } => scan
+                    .get(*id)
+                    .map_or(scope_live, |id| self.accepts_scan(id, generation)),
+                ScanEvent::Finished { .. } => false,
+            };
+            if event_live {
+                self.record_error(scope, "received scan data after completion".into());
+                self.revision = self.revision.wrapping_add(1);
             }
             return changed;
         }
+        self.revision = self.revision.wrapping_add(1);
         match event {
-            ScanEvent::RootInfo { kind, sizes, error } => {
-                if self.root_info_received {
-                    self.record_error(ROOT, "received root metadata twice".into());
+            ScanEvent::RootInfo {
+                file_identity,
+                kind,
+                sizes,
+                error,
+            } => {
+                if !scope_live {
                     return changed;
                 }
-                self.root_info_received = true;
-                if self.nodes[ROOT as usize].first_child != NO_NODE && kind != NodeKind::Directory {
-                    self.record_error(ROOT, "non-directory root already has children".into());
-                } else {
-                    let root = &mut self.nodes[ROOT as usize];
-                    root.kind = kind;
-                    root.complete = kind != NodeKind::Directory;
-                    root.read_done = root.complete;
+                let scan = self.scans.get_mut(&generation).unwrap();
+                if scan.metadata_received {
+                    self.record_error(scope, "received root metadata twice".into());
+                    return changed;
                 }
+                scan.metadata_received = true;
+                if self.nodes[scope as usize].first_child != NO_NODE && kind != NodeKind::Directory
+                {
+                    self.record_error(scope, "non-directory root already has children".into());
+                } else {
+                    let node = &mut self.nodes[scope as usize];
+                    let was_directory = node.kind == NodeKind::Directory;
+                    let parent = node.parent;
+                    let hidden = node.name.as_encoded_bytes().starts_with(b".");
+                    node.kind = kind;
+                    node.read_done = kind != NodeKind::Directory;
+                    // complete_ready releases a retained directory's old parent token
+                    // if replacement metadata now describes a file or symlink.
+                    node.complete = false;
+                    if was_directory && kind != NodeKind::Directory {
+                        if let Some(parent) = parent {
+                            let counts = &mut self.directories.get_mut(&parent).unwrap().children;
+                            counts.directories -= 1;
+                            counts.hidden_directories -= u32::from(hidden);
+                        }
+                    }
+                }
+                let charged = if kind == NodeKind::File {
+                    if let Some(group) = file_identity {
+                        let charged = self.remember_hardlink(
+                            group,
+                            scope,
+                            sizes,
+                            generation,
+                            true,
+                            &mut changed,
+                        );
+                        self.nodes[scope as usize].hardlink_duplicate =
+                            self.hardlink_groups[self.hardlink_indices[&group]].owner
+                                != Some(scope);
+                        charged
+                    } else {
+                        sizes
+                    }
+                } else {
+                    self.nodes[scope as usize].hardlink_duplicate = false;
+                    sizes
+                };
                 if kind == NodeKind::Directory {
-                    self.directories.entry(ROOT).or_default().sizes = sizes;
+                    self.directories.entry(scope).or_default().sizes = sizes;
                 }
                 let errors = u64::from(error.is_some());
                 if let Some(error) = error {
                     self.last_error = Some(error);
-                    self.last_error_id = Some(ROOT);
+                    self.last_error_id = Some(scope);
                 }
-                self.add_totals(ROOT, sizes, 0, errors, false, &mut changed);
+                self.add_totals(scope, charged, 0, errors, false, &mut changed);
+                self.complete_ready(scope);
+                // Metadata can change kind and directory-only ordering even
+                // when a zero-byte file or duplicate contributes no charge.
+                if !changed.contains(&scope) {
+                    changed.push(scope);
+                }
             }
             ScanEvent::Entries { parent, entries } => {
-                self.add_entries(parent, entries, &mut changed)
+                let mapped_parent = self.scans[&generation].get(parent);
+                let parent_live =
+                    mapped_parent.map_or(scope_live, |id| self.accepts_scan(id, generation));
+                let mut mapped = Vec::with_capacity(entries.len());
+                for mut entry in entries {
+                    if entry.id == NO_NODE || entry.id as usize != self.scans[&generation].len {
+                        if parent_live {
+                            self.record_error(scope, format!("out-of-order entry id {}", entry.id));
+                        }
+                        continue;
+                    }
+                    let Some(index) = self.nodes.len().checked_add(mapped.len()) else {
+                        if parent_live {
+                            self.record_error(scope, "node identifier overflow".into());
+                        }
+                        break;
+                    };
+                    let Ok(id) = NodeId::try_from(index) else {
+                        if parent_live {
+                            self.record_error(scope, "node identifier overflow".into());
+                        }
+                        break;
+                    };
+                    if id == NO_NODE {
+                        if parent_live {
+                            self.record_error(scope, "node identifier overflow".into());
+                        }
+                        break;
+                    }
+                    self.scans.get_mut(&generation).unwrap().push(id);
+                    entry.id = id;
+                    mapped.push(entry);
+                }
+                if let Some(parent) = mapped_parent {
+                    self.add_entries(parent, generation, mapped, &mut changed);
+                } else {
+                    if parent_live {
+                        self.record_error(scope, format!("entries have unknown parent {parent}"));
+                    }
+                    for entry in mapped {
+                        self.append_tombstone(scope, generation, entry);
+                    }
+                }
             }
             ScanEvent::DirectoryDone { id, error } => {
-                if self.is_removed(id) && (id as usize) < self.nodes.len() {
-                    return changed;
-                }
-                let Some(node) = self.nodes.get(id as usize) else {
-                    self.record_error(ROOT, format!("finished unknown directory {id}"));
+                let Some(id) = self.scans[&generation].get(id) else {
+                    if scope_live {
+                        self.record_error(scope, format!("finished unknown directory {id}"));
+                    }
                     return changed;
                 };
-                if node.read_done {
+                if !self.accepts_scan(id, generation) || self.nodes[id as usize].read_done {
                     return changed;
                 }
                 if let Some(error) = error {
@@ -550,51 +938,82 @@ impl Model {
                 self.complete_ready(id);
             }
             ScanEvent::Finished { cancelled } => {
-                self.cancelled = cancelled;
-                self.finished = true;
-                if !cancelled && !self.nodes[ROOT as usize].complete {
-                    self.record_error(ROOT, "scan ended with unfinished directories".into());
+                self.scans.get_mut(&generation).unwrap().finished = true;
+                if self.active_scopes.get(&scope) == Some(&generation) {
+                    self.active_scopes.remove(&scope);
+                }
+                if scope_live {
+                    self.cancelled |= cancelled;
+                }
+                self.finished = self.active_scopes.is_empty();
+                if self.finished {
+                    if self.nodes[ROOT as usize].suppressed_subtrees != 0 {
+                        self.cancelled = true;
+                    } else if self.nodes[ROOT as usize].complete {
+                        self.cancelled = false;
+                    } else if scope_live && !self.cancelled {
+                        self.record_error(ROOT, "scan ended with unfinished directories".into());
+                    }
                 }
             }
         }
         changed
     }
 
-    fn add_entries(&mut self, parent: NodeId, entries: Vec<Entry>, changed: &mut Vec<NodeId>) {
-        if (parent as usize) < self.nodes.len() && self.is_removed(parent) {
-            // The scanner owns append-only IDs. Consume its queued IDs even though
-            // the corresponding subtree has disappeared; no basename allocation,
-            // sibling links, totals, metadata errors, or completion tokens are needed.
+    fn append_tombstone(&mut self, parent: NodeId, generation: u64, entry: Entry) {
+        if entry.id as usize != self.nodes.len() || entry.id == NO_NODE {
+            return;
+        }
+        if let Some(group_id) = entry.hardlink_group {
+            self.remember_hardlink(
+                group_id,
+                entry.id,
+                entry.sizes,
+                generation,
+                false,
+                &mut Vec::new(),
+            );
+        }
+        let mut node = Node::new(
+            Arc::clone(&self.tombstone_name),
+            Some(parent),
+            NodeKind::Unknown,
+            Sizes::default(),
+        );
+        node.removed = true;
+        node.parent_epoch = self.nodes[parent as usize].child_epoch;
+        node.scan_generation = generation;
+        self.has_removals = true;
+        self.nodes.push(node);
+    }
+
+    fn add_entries(
+        &mut self,
+        parent: NodeId,
+        generation: u64,
+        entries: Vec<Entry>,
+        changed: &mut Vec<NodeId>,
+    ) {
+        if !self.accepts_scan(parent, generation) {
             for entry in entries {
-                if entry.id as usize != self.nodes.len() || entry.id == NO_NODE {
-                    continue;
-                }
-                if let Some(group_id) = entry.hardlink_group {
-                    self.remember_hardlink(group_id, entry.id, entry.sizes, false);
-                }
-                let mut node = Node::new(
-                    Arc::clone(&self.tombstone_name),
-                    Some(parent),
-                    NodeKind::Unknown,
-                    Sizes::default(),
-                );
-                node.removed = true;
-                self.nodes.push(node);
+                self.append_tombstone(parent, generation, entry);
             }
             return;
         }
-        let Some(parent_node) = self.nodes.get(parent as usize) else {
-            self.record_error(ROOT, format!("entries have unknown parent {parent}"));
-            return;
-        };
-        if parent_node.kind != NodeKind::Directory || parent_node.read_done {
+        if self.nodes[parent as usize].kind != NodeKind::Directory
+            || self.nodes[parent as usize].read_done
+        {
             self.record_error(
                 parent,
                 "entries arrived after directory enumeration ended".into(),
             );
+            for entry in entries {
+                self.append_tombstone(parent, generation, entry);
+            }
             return;
         }
 
+        let batch_start = self.nodes.len() as NodeId;
         let mut sizes = Sizes::default();
         let mut items = 0u64;
         let mut errors = 0u64;
@@ -608,10 +1027,40 @@ impl Model {
                 || Path::new(&entry.name).file_name() != Some(entry.name.as_os_str())
             {
                 self.record_error(parent, "entry has an invalid basename".into());
+                self.append_tombstone(parent, generation, entry);
                 continue;
             }
             let charged = if let Some(group_id) = entry.hardlink_group {
-                self.remember_hardlink(group_id, entry.id, entry.sizes, true)
+                // The charge for an earlier owner in this same batch has not yet
+                // reached the parent. Correct that local sum before updating it.
+                if let Some(&index) = self.hardlink_indices.get(&group_id) {
+                    if let Some(owner) = self.hardlink_groups[index].owner {
+                        if owner >= batch_start
+                            && self.is_live(owner)
+                            && generation >= self.hardlink_groups[index].metadata_generation
+                        {
+                            let old = self.hardlink_groups[index].sizes;
+                            if old != entry.sizes {
+                                self.nodes[owner as usize].sizes = entry.sizes;
+                                sizes.apparent = replace_charge(
+                                    sizes.apparent,
+                                    old.apparent,
+                                    entry.sizes.apparent,
+                                    &mut overflow,
+                                );
+                                sizes.allocated = replace_charge(
+                                    sizes.allocated,
+                                    old.allocated,
+                                    entry.sizes.allocated,
+                                    &mut overflow,
+                                );
+                                self.hardlink_groups[index].sizes = entry.sizes;
+                                changed.push(owner);
+                            }
+                        }
+                    }
+                }
+                self.remember_hardlink(group_id, entry.id, entry.sizes, generation, true, changed)
             } else if entry.hardlink_duplicate {
                 Sizes::default()
             } else {
@@ -623,6 +1072,8 @@ impl Model {
                 entry.kind,
                 charged,
             );
+            node.parent_epoch = self.nodes[parent as usize].child_epoch;
+            node.scan_generation = generation;
             node.hardlink_duplicate = if let Some(group_id) = entry.hardlink_group {
                 self.hardlink_groups[self.hardlink_indices[&group_id]].owner != Some(entry.id)
             } else {
@@ -678,30 +1129,85 @@ impl Model {
         group_id: NodeId,
         id: NodeId,
         sizes: Sizes,
+        generation: u64,
         live: bool,
+        changed: &mut Vec<NodeId>,
     ) -> Sizes {
-        let index = if let Some(&index) = self.hardlink_indices.get(&group_id) {
-            index
+        let (index, new_group) = if let Some(&index) = self.hardlink_indices.get(&group_id) {
+            (index, false)
         } else {
             let index = self.hardlink_groups.len();
             self.hardlink_indices.insert(group_id, index);
             self.hardlink_groups.push(HardlinkGroup {
                 sizes,
+                metadata_generation: 0,
                 owner: None,
                 members: Vec::new(),
             });
-            index
+            (index, true)
         };
         let owner_live = self.hardlink_groups[index]
             .owner
             .is_some_and(|owner| self.is_live(owner));
+        // A delayed alias in an untouched older scan remains a valid row,
+        // but cannot replace metadata already observed by a newer refresh.
+        if live && generation >= self.hardlink_groups[index].metadata_generation {
+            let old = self.hardlink_groups[index].sizes;
+            if owner_live && old != sizes {
+                let owner = self.hardlink_groups[index].owner.unwrap();
+                self.replace_node_charge(owner, old, sizes, changed);
+            }
+            self.hardlink_groups[index].sizes = sizes;
+            self.hardlink_groups[index].metadata_generation = generation;
+        }
         let group = &mut self.hardlink_groups[index];
-        group.members.push(id);
+        // The initial member is already stored as owner. Once tombstoned it
+        // can never return, so repair only needs later aliases. Ordinary files
+        // therefore do not allocate a singleton members vector.
+        if !new_group {
+            group.members.push(id);
+        }
         if live && !owner_live {
             group.owner = Some(id);
             group.sizes
         } else {
             Sizes::default()
+        }
+    }
+
+    fn replace_node_charge(
+        &mut self,
+        start: NodeId,
+        old: Sizes,
+        sizes: Sizes,
+        changed: &mut Vec<NodeId>,
+    ) {
+        let mut overflow = false;
+        let mut inherited_overflows = 0;
+        let mut reported = None;
+        let mut current = Some(start);
+        while let Some(id) = current {
+            let node = &mut self.nodes[id as usize];
+            node.sizes.apparent = replace_charge(
+                node.sizes.apparent,
+                old.apparent,
+                sizes.apparent,
+                &mut overflow,
+            );
+            node.sizes.allocated = replace_charge(
+                node.sizes.allocated,
+                old.allocated,
+                sizes.allocated,
+                &mut overflow,
+            );
+            if node.mark_overflow(overflow, &mut inherited_overflows) && reported.is_none() {
+                reported = Some(id);
+            }
+            changed.push(id);
+            current = node.parent;
+        }
+        if let Some(id) = reported {
+            self.report_overflow(id);
         }
     }
 
@@ -832,6 +1338,7 @@ mod tests {
     fn model() -> Model {
         let mut model = Model::new(PathBuf::from("fixture"));
         model.apply(ScanEvent::RootInfo {
+            file_identity: None,
             kind: NodeKind::Directory,
             sizes: Sizes {
                 apparent: 2,
@@ -930,6 +1437,7 @@ mod tests {
             entries: vec![entry(1, "known", NodeKind::File, 1, 4)],
         });
         early.apply(ScanEvent::RootInfo {
+            file_identity: None,
             kind: NodeKind::Directory,
             sizes: Sizes {
                 apparent: 2,
@@ -951,6 +1459,7 @@ mod tests {
         for kind in [NodeKind::File, NodeKind::Symlink, NodeKind::Unknown] {
             let mut leaf = Model::new(PathBuf::from("leaf"));
             leaf.apply(ScanEvent::RootInfo {
+                file_identity: None,
                 kind,
                 sizes: Sizes::default(),
                 error: (kind == NodeKind::Unknown).then(|| "missing".into()),
@@ -1108,6 +1617,7 @@ mod tests {
 
         let mut nested = Model::new(PathBuf::from("overflow"));
         nested.apply(ScanEvent::RootInfo {
+            file_identity: None,
             kind: NodeKind::Directory,
             sizes: Sizes::default(),
             error: None,
@@ -1188,6 +1698,7 @@ mod tests {
 
         let mut boundary = Model::new(PathBuf::from("exact-max"));
         boundary.apply(ScanEvent::RootInfo {
+            file_identity: None,
             kind: NodeKind::Directory,
             sizes: Sizes::default(),
             error: None,
@@ -1575,5 +2086,723 @@ mod tests {
         assert!(model.note_error(1, "late error".into()).is_empty());
         assert_eq!(model.node(ROOT).error_count, 0);
         assert!(model.last_error.is_none());
+    }
+
+    fn done(model: &mut Model, scope: NodeId, generation: u64, local: NodeId) {
+        model.apply_scoped(
+            scope,
+            generation,
+            ScanEvent::DirectoryDone {
+                id: local,
+                error: None,
+            },
+        );
+    }
+
+    fn finish(model: &mut Model, scope: NodeId, generation: u64) {
+        model.apply_scoped(scope, generation, ScanEvent::Finished { cancelled: false });
+    }
+
+    fn scoped_root(model: &mut Model, scope: NodeId, generation: u64, apparent: u64) {
+        model.apply_scoped(
+            scope,
+            generation,
+            ScanEvent::RootInfo {
+                file_identity: None,
+                kind: NodeKind::Directory,
+                sizes: Sizes {
+                    apparent,
+                    allocated: apparent,
+                },
+                error: None,
+            },
+        );
+    }
+
+    #[test]
+    fn scoped_refresh_retains_directory_and_siblings_and_reopens_complete_ancestors() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 3, 4),
+                entry(2, "untouched", NodeKind::File, 40, 40),
+            ],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![entry(3, "old", NodeKind::File, 10, 10)],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        let root_address = model.node(ROOT) as *const Node;
+        let branch_address = model.node(1) as *const Node;
+        assert_eq!(model.begin_rescan(1, 1), vec![1, ROOT]);
+        assert_eq!(model.node(ROOT) as *const Node, root_address);
+        assert_eq!(model.node(1) as *const Node, branch_address);
+        assert_eq!(model.path(1), PathBuf::from("fixture/refresh"));
+        assert_eq!(model.children(ROOT).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(model.is_removed(3));
+        assert!(!model.has_children(1, false, true));
+        assert!(!model.listing_complete(1));
+        assert_eq!(model.node(ROOT).items, 2);
+        assert_eq!(model.node(ROOT).sizes.apparent, 42);
+        assert!(!model.node(ROOT).complete);
+        assert!(!model.finished);
+        scoped_root(&mut model, 1, 1, 5);
+        let changed = model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "new", NodeKind::File, 20, 20)],
+            },
+        );
+        assert_eq!(changed, vec![4, 1, ROOT]);
+        assert_eq!(model.children(1).collect::<Vec<_>>(), vec![4]);
+        done(&mut model, 1, 1, ROOT);
+        finish(&mut model, 1, 1);
+        assert!(model.node(ROOT).complete && model.finished);
+        assert!(!model.cancelled);
+        assert_eq!(model.node(ROOT).sizes.apparent, 67);
+        assert_eq!(model.node(ROOT).items, 3);
+        assert_eq!(model.node(2).sizes.apparent, 40);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn interleaved_scopes_remap_local_ids_and_ignore_baseline_late_branch_events() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 3, 4),
+                entry(2, "live", NodeKind::Directory, 7, 8),
+            ],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![entry(3, "old-nested", NodeKind::Directory, 10, 10)],
+        });
+        done(&mut model, ROOT, 0, ROOT);
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 5);
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "new", NodeKind::File, 20, 20)],
+            },
+        );
+        let mut stale = entry(4, "stale", NodeKind::File, 900, 900);
+        stale.error = Some("stale metadata denied".into());
+        assert!(
+            model
+                .apply(ScanEvent::Entries {
+                    parent: 3,
+                    entries: vec![stale]
+                })
+                .is_empty()
+        );
+        model.apply(ScanEvent::DirectoryDone {
+            id: 1,
+            error: Some("stale enumeration error".into()),
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 2,
+            entries: vec![entry(5, "sibling-data", NodeKind::File, 30, 30)],
+        });
+        assert!(model.is_removed(5));
+        assert_eq!(model.children(2).collect::<Vec<_>>(), vec![6]);
+        done(&mut model, ROOT, 0, 2);
+        finish(&mut model, ROOT, 0);
+        assert!(!model.finished);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        done(&mut model, 1, 1, ROOT);
+        finish(&mut model, 1, 1);
+        assert!(model.finished && model.node(ROOT).complete);
+        assert_eq!(model.node(ROOT).sizes.apparent, 64);
+        assert_eq!(model.node(ROOT).items, 4);
+        assert!(model.last_error.is_none());
+    }
+
+    #[test]
+    fn suppression_preserves_partial_totals_and_errors_until_explicit_refresh() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "partial", NodeKind::Directory, 3, 4)],
+        });
+        let mut known = entry(2, "known-error", NodeKind::Unknown, 10, 10);
+        known.error = Some("known metadata error".into());
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![known],
+        });
+        done(&mut model, ROOT, 0, ROOT);
+        let sizes = model.node(ROOT).sizes;
+        let errors = model.node(ROOT).error_count;
+        model.suppress_scan(1);
+        let mut late = entry(3, "late", NodeKind::File, 1000, 1000);
+        late.error = Some("late metadata error".into());
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![late],
+        });
+        model.apply(ScanEvent::DirectoryDone {
+            id: 1,
+            error: Some("late done error".into()),
+        });
+        finish(&mut model, ROOT, 0);
+        assert_eq!(model.node(ROOT).sizes, sizes);
+        assert_eq!(model.node(ROOT).error_count, errors);
+        assert_eq!(model.node(1).items, 1);
+        assert_eq!(model.children(1).collect::<Vec<_>>(), vec![2]);
+        assert!(model.is_live(1) && model.is_live(2) && model.is_removed(3));
+        assert!(!model.node(ROOT).complete && model.finished && model.cancelled);
+        assert_eq!(model.last_error.as_deref(), Some("known metadata error"));
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 6);
+        done(&mut model, 1, 1, ROOT);
+        finish(&mut model, 1, 1);
+        assert!(model.node(ROOT).complete && !model.cancelled);
+        assert_eq!(model.node(ROOT).sizes.apparent, 8);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        assert!(model.last_error.is_none());
+    }
+
+    #[test]
+    fn completed_nested_partial_branch_stays_approximate_while_reconciliation_waits() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "paused-ancestor", NodeKind::Directory, 3, 4),
+                entry(2, "unrelated", NodeKind::Directory, 5, 8),
+            ],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![entry(3, "interrupted", NodeKind::Directory, 7, 8)],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 3,
+            entries: vec![entry(4, "previously-known", NodeKind::File, 100, 128)],
+        });
+        done(&mut model, ROOT, 0, 3);
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, 2);
+        done(&mut model, ROOT, 0, ROOT);
+        let known = model.node(ROOT).sizes;
+        let items = model.node(ROOT).items;
+        assert!(model.node(ROOT).complete);
+        assert!(!model.has_partial_totals(ROOT));
+        assert_eq!(model.mark_partial(3), vec![3, 1, ROOT]);
+        model.mark_partial(3);
+        assert_eq!(model.node(ROOT).sizes, known);
+        assert_eq!(model.node(ROOT).items, items);
+        for id in [ROOT, 1, 3] {
+            assert!(model.node(id).complete);
+            assert_eq!(model.node(id).pending_dirs, 0);
+            assert_eq!(model.node(id).suppressed_subtrees, 1);
+            assert!(model.has_partial_totals(id));
+        }
+        assert!(!model.has_partial_totals(2));
+        finish(&mut model, ROOT, 0);
+        assert!(model.finished && model.cancelled);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        // An unrelated refresh must not erase the pending ancestor's accuracy marker.
+        model.begin_rescan(2, 1);
+        scoped_root(&mut model, 2, 1, 5);
+        done(&mut model, 2, 1, ROOT);
+        finish(&mut model, 2, 1);
+        assert!(model.node(ROOT).complete && model.cancelled);
+        assert!(model.has_partial_totals(ROOT));
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+        // Once the paused ancestor permits reconciliation, its refresh clears once.
+        model.begin_rescan(1, 2);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 0);
+        assert_eq!(model.node(ROOT).pending_dirs, 1);
+        assert!(model.is_removed(3) && model.is_removed(4));
+        scoped_root(&mut model, 1, 2, 3);
+        done(&mut model, 1, 2, ROOT);
+        finish(&mut model, 1, 2);
+        assert!(model.node(ROOT).complete && !model.cancelled);
+        assert!(!model.has_partial_totals(ROOT));
+        assert!(!model.has_partial_totals(3));
+        assert_eq!(model.node(ROOT).pending_dirs, 0);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn removing_completed_partial_branches_clears_only_their_accuracy_witnesses() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "ancestor", NodeKind::Directory, 3, 4)],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![
+                entry(2, "partial-a", NodeKind::Directory, 5, 8),
+                entry(3, "partial-b", NodeKind::Directory, 7, 8),
+            ],
+        });
+        done(&mut model, ROOT, 0, 2);
+        done(&mut model, ROOT, 0, 3);
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.mark_partial(2);
+        model.mark_partial(3);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 2);
+        model.remove(2);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+        assert!(model.node(ROOT).complete && model.cancelled);
+        assert!(model.has_partial_totals(ROOT));
+        assert_eq!(model.node(ROOT).pending_dirs, 0);
+        assert!(model.remove(2).is_empty());
+        model.remove(3);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 0);
+        assert!(model.node(ROOT).complete && !model.cancelled);
+        assert!(!model.has_partial_totals(ROOT));
+        assert_eq!(model.node(ROOT).pending_dirs, 0);
+        assert_eq!(model.node(ROOT).sizes.apparent, 5);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn deleting_suppressed_partial_branch_releases_its_token_once() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "partial", NodeKind::Directory, 3, 4)],
+        });
+        done(&mut model, ROOT, 0, ROOT);
+        model.suppress_scan(1);
+        finish(&mut model, ROOT, 0);
+        assert!(model.cancelled);
+        model.remove(1);
+        assert!(model.node(ROOT).complete && !model.cancelled);
+        assert_eq!(model.node(ROOT).pending_dirs, 0);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 0);
+        assert!(model.remove(1).is_empty());
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn refreshed_hardlink_updates_live_owner_outside_scope_and_stale_metadata_cannot() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 3, 4),
+                linked(2, "outside-owner", 77),
+            ],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![linked(3, "old-alias", 77)],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 5);
+        let mut alias = linked(1, "fresh-alias", 77);
+        alias.sizes = Sizes {
+            apparent: 60,
+            allocated: 256,
+        };
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![alias],
+            },
+        );
+        assert_eq!(model.node(2).sizes.apparent, 60);
+        assert_eq!(model.node(ROOT).sizes.apparent, 67);
+        assert_eq!(model.node(4).sizes, Sizes::default());
+        model.suppress_scan(1);
+        let mut stale = linked(2, "late-alias", 77);
+        stale.sizes = Sizes {
+            apparent: 2000,
+            allocated: 2000,
+        };
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![stale],
+            },
+        );
+        assert_eq!(model.node(2).sizes.apparent, 60);
+        assert_eq!(model.node(ROOT).sizes.apparent, 67);
+        model.remove(2);
+        finish_removals(&mut model);
+        assert_eq!(model.node(4).sizes.apparent, 60);
+        assert!(!model.node(4).hardlink_duplicate);
+        assert_eq!(model.node(ROOT).sizes.apparent, 67);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn delayed_live_baseline_alias_keeps_newer_refresh_metadata_and_transfer_charge() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 3, 4),
+                entry(2, "baseline-sibling", NodeKind::Directory, 5, 8),
+            ],
+        });
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 7);
+        let mut fresh = linked(1, "fresh-owner", 77);
+        fresh.sizes = Sizes {
+            apparent: 200,
+            allocated: 1024,
+        };
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![fresh],
+            },
+        );
+        let before = model.node(ROOT).sizes;
+        let errors = model.node(ROOT).error_count;
+        model.apply(ScanEvent::Entries {
+            parent: 2,
+            entries: vec![linked(3, "delayed-alias", 77)],
+        });
+        assert!(model.is_live(4));
+        assert!(model.node(4).hardlink_duplicate);
+        assert_eq!(model.node(4).sizes, Sizes::default());
+        assert_eq!(model.node(3).sizes.apparent, 200);
+        assert_eq!(model.node(3).sizes.allocated, 1024);
+        assert_eq!(model.node(ROOT).sizes, before);
+        assert_eq!(model.node(ROOT).error_count, errors);
+        assert_eq!(model.hardlink_groups[0].metadata_generation, 1);
+        model.remove(1);
+        finish_removals(&mut model);
+        assert_eq!(model.node(4).sizes.apparent, 200);
+        assert_eq!(model.node(4).sizes.allocated, 1024);
+        assert!(!model.node(4).hardlink_duplicate);
+        assert_eq!(model.node(ROOT).sizes.apparent, 207);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn changing_duplicate_metadata_in_one_batch_corrects_pending_parent_sum() {
+        let mut model = model();
+        let mut owner = linked(1, "owner", 77);
+        owner.sizes = Sizes {
+            apparent: 200,
+            allocated: 512,
+        };
+        let mut alias = linked(2, "alias", 77);
+        alias.sizes = Sizes {
+            apparent: 100,
+            allocated: 256,
+        };
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![owner, alias],
+        });
+        assert_eq!(model.node(1).sizes.apparent, 100);
+        assert_eq!(model.node(ROOT).sizes.apparent, 102);
+        assert_eq!(model.node(ROOT).sizes.allocated, 260);
+    }
+
+    #[test]
+    fn root_refresh_hides_old_tree_and_bounds_cleanup_without_replacing_arena() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: (1..700)
+                .map(|id| entry(id, &format!("old-{id}"), NodeKind::File, 1, 4))
+                .collect(),
+        });
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        let address = model.node(ROOT) as *const Node;
+        model.begin_rescan(ROOT, 1);
+        assert_eq!(model.node(ROOT) as *const Node, address);
+        assert!(model.is_removed(1) && model.is_removed(699));
+        assert_eq!(model.children(ROOT).count(), 0);
+        assert_eq!(model.node(ROOT).sizes, Sizes::default());
+        model.pump_removals();
+        assert!(model.has_pending_removals());
+        assert!(model.node(1).name.is_empty());
+        assert!(!model.node(699).name.is_empty());
+        model.apply(ScanEvent::RootInfo {
+            file_identity: None,
+            kind: NodeKind::Unknown,
+            sizes: Sizes::default(),
+            error: Some("late root error".into()),
+        });
+        assert_eq!(model.node(ROOT).error_count, 0);
+        scoped_root(&mut model, ROOT, 1, 7);
+        model.apply_scoped(
+            ROOT,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "fresh", NodeKind::File, 9, 9)],
+            },
+        );
+        assert_eq!(model.children(ROOT).collect::<Vec<_>>(), vec![700]);
+        assert_eq!(model.node(ROOT).sizes.apparent, 16);
+        done(&mut model, ROOT, 1, ROOT);
+        finish(&mut model, ROOT, 1);
+        finish_removals(&mut model);
+        assert!(model.finished && model.node(ROOT).complete);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn replacement_symlink_finishes_retained_target_and_updates_directory_witness() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "replaced", NodeKind::Directory, 3, 4)],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.begin_rescan(1, 1);
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::RootInfo {
+                file_identity: None,
+                kind: NodeKind::Symlink,
+                sizes: Sizes {
+                    apparent: 5,
+                    allocated: 5,
+                },
+                error: None,
+            },
+        );
+        finish(&mut model, 1, 1);
+        assert_eq!(model.node(1).kind, NodeKind::Symlink);
+        assert!(model.node(ROOT).complete);
+        assert!(model.has_children(ROOT, false, false));
+        assert!(!model.has_children(ROOT, true, true));
+        assert_eq!(model.node(ROOT).sizes.apparent, 7);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn refreshed_directory_replaced_by_hardlinked_file_retains_id_and_deduplicates() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "replacement", NodeKind::Directory, 3, 4),
+                linked(2, "outside-owner", 77),
+            ],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.begin_rescan(1, 1);
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::RootInfo {
+                file_identity: Some(77),
+                kind: NodeKind::File,
+                sizes: Sizes {
+                    apparent: 200,
+                    allocated: 1024,
+                },
+                error: None,
+            },
+        );
+        finish(&mut model, 1, 1);
+        assert!(model.is_live(1));
+        assert_eq!(model.node(1).parent, Some(ROOT));
+        assert_eq!(model.node(1).kind, NodeKind::File);
+        assert!(model.node(1).hardlink_duplicate);
+        assert_eq!(model.node(1).sizes, Sizes::default());
+        assert_eq!(model.node(2).sizes.apparent, 200);
+        assert_eq!(model.node(ROOT).sizes.apparent, 202);
+        assert_eq!(model.node(ROOT).items, 2);
+        assert!(!model.has_children(ROOT, true, true));
+        assert!(model.node(ROOT).complete);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        model.remove(2);
+        finish_removals(&mut model);
+        assert_eq!(model.node(1).sizes.apparent, 200);
+        assert!(!model.node(1).hardlink_duplicate);
+        assert_eq!(model.node(ROOT).sizes.apparent, 202);
+    }
+
+    #[test]
+    fn zero_charge_replacement_metadata_notifies_retained_row_and_directory_witnesses() {
+        for (file_identity, sizes) in [
+            (None, Sizes::default()),
+            (
+                Some(77),
+                Sizes {
+                    apparent: 100,
+                    allocated: 512,
+                },
+            ),
+        ] {
+            let mut model = model();
+            model.apply(ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(1, ".replacement", NodeKind::Directory, 3, 4),
+                    linked(2, "outside-owner", 77),
+                ],
+            });
+            done(&mut model, ROOT, 0, 1);
+            done(&mut model, ROOT, 0, ROOT);
+            finish(&mut model, ROOT, 0);
+            model.begin_rescan(1, 1);
+            let before = model.node(ROOT).sizes;
+            let changed = model.apply_scoped(
+                1,
+                1,
+                ScanEvent::RootInfo {
+                    file_identity,
+                    kind: NodeKind::File,
+                    sizes,
+                    error: None,
+                },
+            );
+            assert_eq!(changed, vec![1]);
+            assert_eq!(model.node(1).kind, NodeKind::File);
+            assert_eq!(model.node(1).sizes, Sizes::default());
+            assert_eq!(model.node(1).hardlink_duplicate, file_identity.is_some());
+            assert_eq!(model.node(ROOT).sizes, before);
+            assert_eq!(model.node(2).sizes.apparent, 100);
+            assert_eq!(model.node(2).sizes.allocated, 512);
+            assert_eq!(model.node(ROOT).items, 2);
+            assert!(model.has_children(ROOT, false, true));
+            assert!(!model.has_children(ROOT, true, true));
+            let counts = &model.directories[&ROOT].children;
+            assert_eq!(counts.all, 2);
+            assert_eq!(counts.hidden, 1);
+            assert_eq!(counts.directories, 0);
+            assert_eq!(counts.hidden_directories, 0);
+            assert!(model.node(ROOT).complete);
+            assert_eq!(model.node(ROOT).pending_dirs, 0);
+            assert_eq!(model.node(ROOT).error_count, 0);
+        }
+    }
+
+    #[test]
+    fn initial_regular_file_root_with_canonical_identity_keeps_its_full_charge() {
+        let mut model = Model::new(PathBuf::from("fixture-file"));
+        model.apply(ScanEvent::RootInfo {
+            file_identity: Some(77),
+            kind: NodeKind::File,
+            sizes: Sizes {
+                apparent: 200,
+                allocated: 1024,
+            },
+            error: None,
+        });
+        finish(&mut model, ROOT, 0);
+        assert_eq!(model.node(ROOT).kind, NodeKind::File);
+        assert_eq!(model.node(ROOT).sizes.apparent, 200);
+        assert_eq!(model.node(ROOT).sizes.allocated, 1024);
+        assert!(!model.node(ROOT).hardlink_duplicate);
+        assert!(model.node(ROOT).complete && model.finished);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn late_removed_branch_events_after_scan_completion_leave_known_errors_unchanged() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "removed", NodeKind::Directory, 3, 4)],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.remove(1);
+        let sizes = model.node(ROOT).sizes;
+        model.apply(ScanEvent::DirectoryDone {
+            id: 1,
+            error: Some("late scan error".into()),
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: vec![entry(2, "late", NodeKind::File, 999, 999)],
+        });
+        assert_eq!(model.node(ROOT).sizes, sizes);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        assert!(model.last_error.is_none());
+    }
+
+    #[test]
+    fn singleton_hardlink_groups_allocate_members_only_for_later_aliases() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![linked(1, "single", 77)],
+        });
+        let index = model.hardlink_indices[&77];
+        assert!(model.hardlink_groups[index].members.is_empty());
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![linked(2, "alias", 77)],
+        });
+        assert_eq!(model.hardlink_groups[index].members, vec![2]);
+        model.remove(1);
+        finish_removals(&mut model);
+        assert_eq!(model.node(2).sizes.apparent, 100);
+        assert!(!model.node(2).hardlink_duplicate);
+        assert_eq!(model.node(ROOT).sizes.apparent, 102);
+    }
+
+    #[test]
+    fn transport_failures_respect_current_generation_and_scan_suppression() {
+        let mut model = model();
+        model.begin_rescan(ROOT, 1);
+        let revision = model.revision();
+        assert!(
+            model
+                .note_scan_error(ROOT, 0, "stale baseline transport failure".into())
+                .is_empty()
+        );
+        assert_eq!(model.revision(), revision);
+        assert_eq!(model.node(ROOT).error_count, 0);
+        assert_eq!(
+            model.note_scan_error(ROOT, 1, "current scanner stopped".into()),
+            vec![ROOT]
+        );
+        assert_eq!(model.node(ROOT).error_count, 1);
+        assert_eq!(model.last_error.as_deref(), Some("current scanner stopped"));
+        model.suppress_scan(ROOT);
+        let revision = model.revision();
+        assert!(
+            model
+                .note_scan_error(ROOT, 1, "suppressed transport failure".into())
+                .is_empty()
+        );
+        assert_eq!(model.revision(), revision);
+        assert_eq!(model.node(ROOT).error_count, 1);
+        assert_eq!(model.last_error.as_deref(), Some("current scanner stopped"));
+        finish(&mut model, ROOT, 1);
+        assert!(
+            model
+                .note_scan_error(ROOT, 1, "completed transport failure".into())
+                .is_empty()
+        );
+        assert_eq!(model.node(ROOT).error_count, 1);
     }
 }

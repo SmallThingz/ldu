@@ -2,7 +2,7 @@
 
 ## Scanning and display
 
-The terminal opens before scanning starts. Directory scanning uses breadth-first depth barriers and parallel metadata batches. Progress updates use bounded channels; keyboard actions repaint immediately.
+The terminal opens before scanning starts. Directory scanning normally uses breadth-first depth barriers and parallel metadata batches. Hovering over or entering an unfinished directory gives that subtree scan priority; unrelated browsing does not restart the scan. Progress updates use bounded channels; keyboard actions repaint immediately. Incomplete terminal input does not block resizing, scan updates or signal-driven shutdown.
 
 Scanning and completed entries share the same sort. Near-size groups retain their previous order to reduce movement. Each group spans at most 2%; nearby entries in different groups can still exchange places. Selection tracks the entry by its ID as live totals change.
 
@@ -38,22 +38,33 @@ JSON includes both apparent and allocated sizes. Exit status is 0 for a complete
 | `c` | Toggle item counts |
 | `e` | Toggle hidden entries |
 | `i` | Open selected entry information |
-| `r` | Rescan and return to the scan root |
-| `d` | Confirm deletion of the selected entry |
+| `r` | Refresh the selected folder |
+| `R` | Refresh the current directory |
+| `d` | Confirm and queue deletion of the selected entry |
+| `V` | Toggle visual selection |
+| `D` | Open the queue, or confirm batch deletion in visual mode |
 | `?` | Open help |
 | `q`, Ctrl-C | Quit |
 
-Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. Ctrl-C quits immediately.
+Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. With deletions queued or active, `q` and Ctrl-C open a quit confirmation: `q`, Enter or a second Ctrl-C cancels the queue and active worker, then waits for active removal to stop before restoring the terminal. Cancelled metadata capture retires in the background and does not delay terminal restoration. `n` or Escape keeps browsing. Confirmation stays disabled until the quit choices fit on screen.
 
-Manual refresh requests are coalesced and wait for scanning and any pending deletion to stop. Shell spawning is unavailable.
+`r` refreshes only a selected directory; selecting a file has no effect. `R` refreshes the directory currently being browsed. Both preserve the current path, retain unrelated entries and update ancestor totals. Requests are coalesced and wait while a queued deletion overlaps their scope. Hardlink accounting remains shared across the original scan and refreshed subtrees. Fresh hardlink metadata updates its global owner even when that owner lies outside the refreshed folder. Shell spawning is unavailable.
+
+`V` starts visual selection by marking the current row. Arrows and Shift-arrows add a range; Enter toggles the current row and starts a new range from it. Shift-click adds a range, while Shift-drag reverses selected membership across the drag range. Blue backgrounds mark selected entries, including the current cursor. Selection tracks stable entry IDs as sorting changes; each range retains the ordering from when it began. `V` or Escape clears selection and leaves visual mode. Navigating to another directory also clears it.
+
+In visual mode, `D` confirms batch deletion. Identity checking runs in the background before the dialog enables `y` or Enter. `n` or Escape cancels and preserves the selection. Confirming enqueues the selected entries and leaves visual mode; queue pause, ordering, overlap and cancellation rules apply to the batch too.
 
 ## Deletion
 
-`d` opens confirmation. `n` or Escape cancels; `y` or Enter starts background deletion. `q` and `?` are ignored in the confirmation dialog. Confirmation stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
+`d` opens confirmation. `n` or Escape cancels; `y` or Enter adds the target to the deletion queue. Further entries can be confirmed while removal runs. `?` is ignored in the deletion confirmation. `q` is ignored while no deletion is queued; with queued or active work it opens the guarded quit dialog. Confirmation waits for the identity snapshot and stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
 
-Successful deletion updates the listing and ancestor totals incrementally. It does not restart the scan or leave a success dialog open. Failure shows a brief notice and marks the affected branch partial, preserving its observed totals. Use `r` after a partial deletion to refresh them. Once confirmed, deletion has no cancellation command; quitting during recursive removal can leave a partial result.
+Outside visual mode, `D` opens the styled queue. One worker removes entries in FIFO order. The queue shows the active target, removal progress and waiting targets. Up/Down or `k`/`j` selects a row; Shift-Up/Down or `K`/`J` moves a waiting target. Space or `p` pauses and resumes waiting work. The active worker continues while the queue is paused. `d` removes a selected waiting target or cancels a selected active target; `x` or Delete removes a waiting target, and `c` cancels the active worker. `D` or Escape closes the queue.
 
-Deletion requires Linux and accessible procfs. The worker resolves the parent beneath a held root anchor, refuses symlink ancestors, and reads and rechecks the target identity. Identity is captured after confirmation, so changes since the scan or dialog opened are not detected. These checks do not provide an atomic guarantee against concurrent filesystem changes. A final symlink is unlinked without following its target. Other platforms report deletion as unsupported.
+Confirming an already queued target, or an entry inside a queued ancestor, does not add a duplicate. A newly queued ancestor replaces its waiting descendants. An active descendant finishes or stops before a queued ancestor starts. Removing a waiting target leaves its files untouched.
+
+Queued branches stop contributing new scan work and related scan errors while deletion is pending. Unrelated scanning continues. Successful deletion updates the listing and ancestor totals incrementally, without a full rescan or success dialog. Cancellation is cooperative between removal steps: already removed entries stay removed, while remaining entries survive. Cancelled or failed directory deletion requests a scoped refresh of the surviving target; an overlapping queued deletion delays that refresh. A failure preserves open dialogs and shows a brief notice after they close. The latest waiting failure replaces earlier waiting notices.
+
+Deletion requires Linux and accessible procfs. An asynchronous snapshot resolves the parent beneath a held root anchor before confirmation. The queue retains the parent and target identities; removal compares them before changing the filesystem and rejects replacement parents or targets. A missing target at snapshot time cannot authorize a replacement that appears later. Symlink ancestors are refused, and target identities are rechecked during traversal. These checks do not provide an atomic guarantee against concurrent inode reuse, renames or filesystem changes. A final symlink is unlinked without following its target. A target already absent when its queued turn arrives succeeds. Other platforms report deletion as unsupported.
 
 ## Size accounting
 

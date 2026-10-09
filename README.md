@@ -12,7 +12,9 @@ Terminal disk-usage browser written in Rust. Browse folder sizes while a paralle
 - Gray Braille spinners beside folders still scanning
 - Cached sorted directory views, with matching subfolder previews on wide terminals
 - Fractional block bars for size distribution
-- Background deletion that updates totals without restarting the scan
+- Cancellable FIFO deletion queue that updates totals without restarting the scan
+- Scoped refresh of the selected folder or current directory
+- Visual keyboard and mouse selection with confirmed batch deletion
 
 ## Build
 
@@ -41,11 +43,17 @@ With no path, `ldu` scans the current directory. Run it in an interactive termin
 | `n`, `s`, `C` | Sort by name, size, or item count; repeat to reverse |
 | `a`, `g` | Change size mode or graph |
 | `e`, `t` | Toggle hidden entries or directories first |
-| `d` | Delete with confirmation |
-| `r` | Rescan |
+| `d` | Confirm and queue deletion |
+| `V` | Toggle visual selection |
+| `D` | Open queue; confirm batch deletion in visual mode |
+| `r`, `R` | Refresh selected folder or current directory |
 | `?`, `q` / Ctrl-C | Help, quit |
 
-Allocated disk usage is the default. Scanning and finished entries sort together; the selected entry stays selected as totals change. At 120 columns or wider, hovering over a directory shows its subdirectories beside the main list.
+In visual mode, arrows and Shift-arrows extend selection, Enter toggles the current row, and `D` confirms deletion of the selected entries. Shift-click extends selection; Shift-drag reverses marks in its range. `V` or Escape leaves visual mode.
+
+In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down or `K`/`J` reorders, and `d` removes the selected waiting job or cancels the active job. `c` cancels the active job. Quitting with deletions queued requires confirmation and cancels the remaining work.
+
+Allocated disk usage is the default. Scanning and finished entries sort together; the selected entry stays selected as totals change. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, hovering over a directory shows its subdirectories beside the main list.
 
 [Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md) · [Review results](REVIEW.md)
 

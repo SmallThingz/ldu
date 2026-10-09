@@ -49,6 +49,8 @@ pub struct Entry {
 #[derive(Debug)]
 pub enum ScanEvent {
     RootInfo {
+        /// Opaque canonical hardlink group for a regular-file scan root.
+        file_identity: Option<NodeId>,
         kind: NodeKind,
         sizes: Sizes,
         error: Option<String>,
