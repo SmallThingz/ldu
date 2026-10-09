@@ -6,7 +6,7 @@ The terminal opens before scanning starts. Directory scanning normally uses brea
 
 Scanning and completed entries share the same sort. Near-size groups retain their previous order to reduce movement. Each group spans at most 2%; nearby entries in different groups can still exchange places. Selection tracks the entry by its ID as live totals change.
 
-Gray Braille spinners mark folders still being scanned. Bars use fractional block glyphs. The main list has one path header and a `?` help hint, with no frame. At widths of at least 120 columns, the selected directory's subdirectories appear in a side preview using the current sorting, size, graph and hidden-entry settings. Files are omitted from the preview.
+Gray Braille spinners mark folders still being scanned. Bars use fractional block glyphs. The main list has one path header with compact `v select` and `? help` hints, with no frame. Narrow terminals shorten the hints. Visual mode shows the selected count and deletion controls in that header. At widths of at least 120 columns, the selected directory's subdirectories appear in a side preview using the current sorting, size, graph and hidden-entry settings. Files are omitted from the preview.
 
 Hidden entries are visible initially. Hiding dotfiles changes the listing, not the totals. Sizes remain partial while scanning or after read errors. A changing filesystem is not a consistent snapshot.
 
@@ -40,23 +40,28 @@ JSON includes both apparent and allocated sizes. Exit status is 0 for a complete
 | `i` | Open selected entry information |
 | `r` | Refresh the selected folder |
 | `R` | Refresh the current directory |
-| `d` | Confirm and queue deletion of the selected entry |
-| `V` | Toggle visual selection |
+| `d` | Confirm and queue deletion of the current entry; batch deletion in visual mode |
+| `v` / `V` | Toggle visual selection |
 | `D` | Open the queue, or confirm batch deletion in visual mode |
+| Delete | Confirm batch deletion in visual mode |
 | `?` | Open help |
 | `q`, Ctrl-C | Quit |
 
-Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. With deletions queued or active, `q` and Ctrl-C open a quit confirmation: `q`, Enter or a second Ctrl-C cancels the queue and active worker, then waits for active removal to stop before restoring the terminal. Cancelled metadata capture retires in the background and does not delay terminal restoration. `n` or Escape keeps browsing. Confirmation stays disabled until the quit choices fit on screen.
+Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and ordinary notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. With deletions queued or active, `q` and Ctrl-C open a quit confirmation: `q`, Enter or a second Ctrl-C cancels the queue and active worker, then waits for active removal to stop before restoring the terminal. Cancelled metadata capture retires in the background and does not delay terminal restoration. `n` or Escape keeps browsing. Confirmation stays disabled until the quit choices fit on screen.
 
 `r` refreshes only a selected directory; selecting a file has no effect. `R` refreshes the directory currently being browsed. Both preserve the current path, retain unrelated entries and update ancestor totals. Requests are coalesced and wait while a queued deletion overlaps their scope. Hardlink accounting remains shared across the original scan and refreshed subtrees. Fresh hardlink metadata updates its global owner even when that owner lies outside the refreshed folder. Shell spawning is unavailable.
 
-`V` starts visual selection by marking the current row. Arrows and Shift-arrows add a range; Enter toggles the current row and starts a new range from it. Shift-click adds a range, while Shift-drag reverses selected membership across the drag range. Blue backgrounds mark selected entries, including the current cursor. Selection tracks stable entry IDs as sorting changes; each range retains the ordering from when it began. `V` or Escape clears selection and leaves visual mode. Navigating to another directory also clears it.
+`v` or `V` starts visual selection by marking the current row. Arrows and Shift-arrows add a range. Enter toggles the current row and starts a new range from it; moving afterward preserves an explicit deselection of that row. A `›` marks the cursor; `✓` marks other selected rows. Blue backgrounds indicate selection. An unselected cursor has a gray background. The header shows the selection count and controls as space allows. Selection tracks stable entry IDs as sorting changes; each range retains the ordering from when it began. `v`, `V` or Escape clears selection and leaves visual mode. Navigating to another directory also clears it.
 
-In visual mode, `D` confirms batch deletion. Identity checking runs in the background before the dialog enables `y` or Enter. `n` or Escape cancels and preserves the selection. Confirming enqueues the selected entries and leaves visual mode; queue pause, ordering, overlap and cancellation rules apply to the batch too.
+In visual mode, a plain click toggles a row and a plain drag adds a range. Shift-click adds a range from the selection anchor; Shift-drag reverses selected membership across the drag range. The modifiers at mouse press determine the gesture even if Shift changes during the drag. Dragging at the top or bottom of the list scrolls to include offscreen entries.
+
+In visual mode, `d`, `D` or Delete requests batch deletion. If a range or earlier selection input is still being processed, a `Selecting entries` notice stays open until it finishes. Enter is ignored throughout selection-preparation waits. `n` or Escape cancels the pending request and preserves the selection. Identity checking then runs in the background before the confirmation dialog enables `y` or Enter. Cancelling that dialog also preserves the selection.
+
+Confirming leaves visual mode and opens `Enqueueing selection` while the selected entries are added to the queue in their displayed order. Browsing and further confirmations wait until this finishes; already queued deletions continue. `n` or Escape stops adding the remaining entries, while entries already queued keep their place and may continue deleting. This does not restore visual selection. `q` or Ctrl-C opens the guarded quit dialog; confirming quit cancels the remaining additions and all queued or active deletions. Cancelling quit returns to enqueueing if it is still underway. The enqueueing dialog closes automatically when all entries have been added; queue pause, ordering, overlap and cancellation rules apply to those entries.
 
 ## Deletion
 
-`d` opens confirmation. `n` or Escape cancels; `y` or Enter adds the target to the deletion queue. Further entries can be confirmed while removal runs. `?` is ignored in the deletion confirmation. `q` is ignored while no deletion is queued; with queued or active work it opens the guarded quit dialog. Confirmation waits for the identity snapshot and stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
+Outside visual mode, `d` opens confirmation for the current entry. `n` or Escape cancels; `y` or Enter adds the target to the deletion queue. Further entries can be confirmed while removal runs. `?` is ignored in the deletion confirmation. `q` is ignored while no deletion is queued; with queued or active work it opens the guarded quit dialog. Confirmation waits for the identity snapshot and stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
 
 Outside visual mode, `D` opens the styled queue. One worker removes entries in FIFO order. The queue shows the active target, removal progress and waiting targets. Up/Down or `k`/`j` selects a row; Shift-Up/Down or `K`/`J` moves a waiting target. Space or `p` pauses and resumes waiting work. The active worker continues while the queue is paused. `d` removes a selected waiting target or cancels a selected active target; `x` or Delete removes a waiting target, and `c` cancels the active worker. `D` or Escape closes the queue.
 

@@ -1488,6 +1488,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scoped_root_refresh_reads_changed_inode_metadata() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        fs::write(&root, b"before").unwrap();
+        let initial = spawn(root.clone(), options());
+        let events = collect(&initial);
+        assert!(matches!(
+            events.first(),
+            Some(ScanEvent::RootInfo {
+                kind: NodeKind::File,
+                sizes,
+                error: None,
+                ..
+            }) if sizes.apparent == 6
+        ));
+
+        // A file changes size reliably even on filesystems with fixed-size
+        // directory metadata. This uses the same empty path as a root refresh.
+        fs::write(&root, b"updated root metadata").unwrap();
+        let expected = backend::root_metadata(&root).unwrap();
+        assert_ne!(expected.sizes.apparent, 6);
+        let scoped = spawn_subtree(
+            Arc::clone(initial.anchor.get().unwrap()),
+            PathBuf::new(),
+            options(),
+            initial.hardlinks(),
+        );
+        let events = collect(&scoped);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ScanEvent::RootInfo {
+                    kind: NodeKind::File,
+                    sizes,
+                    error: None,
+                    ..
+                },
+                ScanEvent::DirectoryDone { id: 0, error: None },
+                ScanEvent::Finished { cancelled: false }
+            ] if *sizes == expected.sizes
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn fallback_root_refresh_observes_symlink_replacement_and_missing_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(fixture.0.join("outside")).unwrap();
+        fs::write(fixture.0.join("outside/payload"), b"must not traverse").unwrap();
+        let initial = spawn(root.clone(), options());
+        collect(&initial);
+        let anchor = Arc::clone(initial.anchor.get().unwrap());
+        fs::remove_dir(&root).unwrap();
+        symlink("outside", &root).unwrap();
+
+        let scoped = spawn_subtree(
+            Arc::clone(&anchor),
+            PathBuf::new(),
+            options(),
+            initial.hardlinks(),
+        );
+        assert!(matches!(
+            collect(&scoped).as_slice(),
+            [
+                ScanEvent::RootInfo {
+                    kind: NodeKind::Symlink,
+                    error: None,
+                    ..
+                },
+                ScanEvent::DirectoryDone { id: 0, error: None },
+                ScanEvent::Finished { cancelled: false }
+            ]
+        ));
+
+        fs::remove_file(&root).unwrap();
+        let missing = spawn_subtree(anchor, PathBuf::new(), options(), initial.hardlinks());
+        assert!(matches!(
+            collect(&missing).as_slice(),
+            [
+                ScanEvent::RootInfo {
+                    kind: NodeKind::Unknown,
+                    error: Some(_),
+                    ..
+                },
+                ScanEvent::DirectoryDone { id: 0, error: None },
+                ScanEvent::Finished { cancelled: false }
+            ]
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn scoped_refresh_shares_groups_for_previously_single_link_files() {

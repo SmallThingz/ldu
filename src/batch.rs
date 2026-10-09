@@ -42,6 +42,14 @@ pub struct BatchCapture {
     input_finished: AtomicBool,
     confirmed: AtomicBool,
     next_ordinal: AtomicUsize,
+    #[cfg(test)]
+    after_empty: std::cell::RefCell<Option<FinishAfterEmpty>>,
+}
+
+#[cfg(test)]
+struct FinishAfterEmpty {
+    output: Sender<BatchEvent>,
+    events: Vec<BatchEvent>,
 }
 
 impl BatchCapture {
@@ -69,6 +77,8 @@ impl BatchCapture {
             input_finished: AtomicBool::new(false),
             confirmed: AtomicBool::new(false),
             next_ordinal: AtomicUsize::new(0),
+            #[cfg(test)]
+            after_empty: std::cell::RefCell::new(None),
         })
     }
 
@@ -145,8 +155,49 @@ impl BatchCapture {
         self.finished.load(Ordering::Acquire)
     }
 
+    /// Observe completion before checking the channel: a previous empty receive
+    /// can predate the worker's final events and must not prove that it drained.
+    pub fn is_drained(&self) -> bool {
+        self.is_finished() && self.events.is_empty()
+    }
+
+    #[cfg(not(test))]
     pub fn event(&self) -> Option<BatchEvent> {
         self.events.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub fn event(&self) -> Option<BatchEvent> {
+        let event = self.events.try_recv().ok();
+        if event.is_none() {
+            if let Some(finish) = self.after_empty.borrow_mut().take() {
+                for event in finish.events {
+                    assert!(finish.output.try_send(event).is_ok());
+                }
+                self.finished.store(true, Ordering::Release);
+            }
+        }
+        event
+    }
+
+    /// Publish final events strictly between an empty receive and its caller's
+    /// completion check, without relying on thread scheduling or sleeps.
+    #[cfg(test)]
+    pub(crate) fn finishing_after_empty(events: Vec<BatchEvent>) -> Self {
+        assert!(events.len() <= CAPACITY);
+        let (requests, _) = bounded(CAPACITY);
+        let (output, input) = bounded(CAPACITY);
+        Self {
+            requests,
+            events: input,
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicBool::new(true)),
+            input_finished: AtomicBool::new(true),
+            confirmed: AtomicBool::new(true),
+            next_ordinal: AtomicUsize::new(0),
+            after_empty: std::cell::RefCell::new(Some(FinishAfterEmpty { output, events })),
+        }
     }
 }
 

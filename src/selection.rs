@@ -21,6 +21,15 @@ struct Range {
     desired: (usize, usize),
     applied: Option<(usize, usize)>,
     mode: RangeMode,
+    preserve_anchor: bool,
+    explicit_anchor: Option<(NodeId, bool)>,
+}
+
+struct PendingRange {
+    snapshot: Arc<CachedSnapshot>,
+    lead: NodeId,
+    mode: RangeMode,
+    boundary: usize,
 }
 
 struct Retired {
@@ -37,7 +46,10 @@ pub struct VisualSelection {
     active: bool,
     selected: HashSet<NodeId>,
     anchor: Option<NodeId>,
+    removed_anchor: Option<NodeId>,
+    preserve_anchor: bool,
     range: Option<Range>,
+    pending_range: Option<PendingRange>,
     retirer: Retirer<Vec<Retired>>,
     retired: Vec<Retired>,
 }
@@ -49,7 +61,10 @@ impl VisualSelection {
             active: false,
             selected: HashSet::new(),
             anchor: None,
+            removed_anchor: None,
+            preserve_anchor: false,
             range: None,
+            pending_range: None,
             retirer: Retirer::new()?,
             retired: Vec::new(),
         })
@@ -76,6 +91,10 @@ impl VisualSelection {
     }
 
     pub fn is_pending(&self) -> bool {
+        self.pending_range.is_some() || self.range_pending()
+    }
+
+    fn range_pending(&self) -> bool {
         self.range
             .as_ref()
             .is_some_and(|range| range.applied != Some(range.desired))
@@ -105,6 +124,9 @@ impl VisualSelection {
         self.directory = directory;
         self.active = false;
         self.anchor = None;
+        self.removed_anchor = None;
+        self.preserve_anchor = false;
+        self.clear_pending_range();
         self.retired.push(Retired {
             _selected: std::mem::take(&mut self.selected),
             _range: self.range.take(),
@@ -120,6 +142,7 @@ impl VisualSelection {
             return false;
         }
         self.reanchor(id);
+        self.preserve_anchor = true;
         if self.selected.contains(&id) {
             self.selected.remove(&id);
         } else {
@@ -131,6 +154,8 @@ impl VisualSelection {
     /// Restore the persistent baseline captured at mouse press before deciding
     /// whether the gesture is an additive click or an inverse drag.
     pub fn restore_snapshot(&mut self, selected: HashSet<NodeId>, anchor: NodeId) {
+        self.clear_pending_range();
+        self.preserve_anchor = false;
         self.retired.push(Retired {
             _selected: std::mem::replace(&mut self.selected, selected),
             _range: self.range.take(),
@@ -138,12 +163,16 @@ impl VisualSelection {
         });
         self.active = true;
         self.anchor = Some(anchor);
+        self.removed_anchor = None;
         self.flush_retired();
     }
 
     /// Begin a new gesture without changing this row's selected membership.
     pub fn reanchor(&mut self, id: NodeId) {
+        self.clear_pending_range();
         self.anchor = Some(id);
+        self.removed_anchor = None;
+        self.preserve_anchor = false;
         if let Some(range) = self.range.take() {
             self.retired.push(Retired {
                 _selected: HashSet::new(),
@@ -157,7 +186,11 @@ impl VisualSelection {
     pub fn remove(&mut self, id: NodeId) {
         self.selected.remove(&id);
         if self.anchor == Some(id) {
+            // A press can precede the first range; keep its deleted anchor slot
+            // until a frozen snapshot transfers it into the range exclusions.
+            self.removed_anchor = self.range.is_none().then_some(id);
             self.anchor = None;
+            self.preserve_anchor = false;
         }
         if let Some(range) = &mut self.range {
             // The frozen slot still defines this gesture's interval. Retain it
@@ -165,6 +198,34 @@ impl VisualSelection {
             // deleted IDs through additive or inverse pumping.
             range.baseline.remove(&id);
             range.excluded.insert(id);
+        }
+    }
+
+    /// Add from the anchor while committing existing marks. A deleted anchor
+    /// retains its frozen slot, including when the previous gesture inverted it.
+    pub fn add_range(&mut self, snapshot: Arc<CachedSnapshot>, lead: NodeId) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.restart_range(lead, RangeMode::Add);
+        self.begin_range(snapshot, lead, RangeMode::Add)
+    }
+
+    /// Commit current marks for a new gesture while retaining a deleted
+    /// anchor's frozen interval and exclusions.
+    fn restart_range(&mut self, lead: NodeId, mode: RangeMode) {
+        if self.anchor.is_none() && self.range.is_some() {
+            self.clear_pending_range();
+            self.preserve_anchor = false;
+            let range = self.range.as_mut().expect("retained range exists");
+            let baseline = std::mem::replace(&mut range.baseline, self.selected.clone());
+            range.mode = mode;
+            range.applied = None;
+            range.preserve_anchor = false;
+            range.explicit_anchor = None;
+            self.retire_snapshot(baseline);
+        } else if self.removed_anchor.is_none() {
+            self.reanchor(self.anchor.unwrap_or(lead));
         }
     }
 
@@ -180,30 +241,55 @@ impl VisualSelection {
         if !self.active {
             return false;
         }
-        if self.anchor.is_none() && self.range.is_some() && !self.is_pending() {
-            self.reanchor(lead);
-        }
+        // Removing an anchor excludes its ID but retains the frozen range slot.
         if self.range.as_ref().is_some_and(|range| range.mode != mode) {
-            self.reanchor(self.anchor.unwrap_or(lead));
+            self.restart_range(lead, mode);
         }
+        if let Some(range) = &self.range {
+            if !range.snapshot.positions.contains_key(&lead) {
+                if !snapshot.positions.contains_key(&lead) {
+                    return false;
+                }
+                let boundary = if range.desired.0 == range.anchor {
+                    range.desired.1
+                } else {
+                    range.desired.0
+                };
+                self.clear_pending_range();
+                self.pending_range = Some(PendingRange {
+                    snapshot,
+                    lead,
+                    mode,
+                    boundary,
+                });
+                return true;
+            }
+        }
+        self.clear_pending_range();
         if self.range.is_none() {
             if !snapshot.positions.contains_key(&lead) {
                 return false;
             }
+            let removed_anchor = self.removed_anchor.take();
             let anchor_id = self
                 .anchor
+                .or(removed_anchor)
                 .filter(|id| snapshot.positions.contains_key(id))
                 .unwrap_or(lead);
             let anchor = snapshot.positions[&anchor_id];
-            self.anchor = Some(anchor_id);
+            let preserve_anchor = self.preserve_anchor && self.anchor == Some(anchor_id);
+            self.anchor = (removed_anchor != Some(anchor_id)).then_some(anchor_id);
             self.range = Some(Range {
                 snapshot,
                 baseline: self.selected.clone(),
-                excluded: HashSet::new(),
+                excluded: removed_anchor.into_iter().collect(),
                 anchor,
                 desired: (anchor, anchor),
                 applied: None,
                 mode,
+                preserve_anchor,
+                explicit_anchor: preserve_anchor
+                    .then(|| (anchor_id, self.selected.contains(&anchor_id))),
             });
         }
         let range = self.range.as_mut().expect("range was initialized");
@@ -224,11 +310,49 @@ impl VisualSelection {
         mut eligible: impl FnMut(NodeId) -> bool,
     ) -> bool {
         self.flush_retired();
-        let Some(range) = &mut self.range else {
-            return false;
-        };
         let mut progressed = false;
         for _ in 0..limit {
+            if !self.range_pending() {
+                if let Some(next) = &mut self.pending_range {
+                    // A deleted endpoint may leave a long missing span. Find a
+                    // surviving shared boundary one slot per budget step before
+                    // starting the next segment, preserving its existing mark.
+                    let range = self.range.as_ref().expect("pending segment has a range");
+                    let id = range.snapshot.ids[next.boundary];
+                    let boundary = if !range.excluded.contains(&id)
+                        && next.snapshot.positions.contains_key(&id)
+                    {
+                        Some(Some(id))
+                    } else if next.boundary == range.anchor {
+                        Some(None)
+                    } else {
+                        next.boundary = if next.boundary > range.anchor {
+                            next.boundary - 1
+                        } else {
+                            next.boundary + 1
+                        };
+                        None
+                    };
+                    progressed = true;
+                    if let Some(boundary) = boundary {
+                        let excluded = range.excluded.clone();
+                        let explicit_anchor = range.explicit_anchor;
+                        let next = self.pending_range.take().expect("pending segment exists");
+                        self.reanchor(boundary.unwrap_or(next.lead));
+                        self.preserve_anchor = boundary.is_some();
+                        self.begin_range(next.snapshot, next.lead, next.mode);
+                        let range = self.range.as_mut().expect("next segment exists");
+                        range.excluded = excluded;
+                        // Only a user toggle owns this override. The new shared
+                        // boundary is protected separately by preserve_anchor.
+                        range.explicit_anchor = explicit_anchor;
+                    }
+                    continue;
+                }
+            }
+            let Some(range) = &mut self.range else {
+                break;
+            };
             let (index, entering) = match range.applied {
                 None => {
                     range.applied = Some((range.anchor, range.anchor));
@@ -255,7 +379,7 @@ impl VisualSelection {
             progressed = true;
             let id = range.snapshot.ids[index];
             let baseline = range.baseline.contains(&id);
-            let selected = if entering {
+            let selected = if entering && !(index == range.anchor && range.preserve_anchor) {
                 match range.mode {
                     RangeMode::Add => true,
                     RangeMode::Invert => !baseline,
@@ -263,6 +387,10 @@ impl VisualSelection {
             } else {
                 baseline
             };
+            let selected = range
+                .explicit_anchor
+                .filter(|&(anchor, _)| anchor == id)
+                .map_or(selected, |(_, selected)| selected);
             if selected && !range.excluded.contains(&id) && eligible(id) {
                 self.selected.insert(id);
             } else {
@@ -298,6 +426,12 @@ impl VisualSelection {
         self.flush_retired();
     }
 
+    fn clear_pending_range(&mut self) {
+        if let Some(pending) = self.pending_range.take() {
+            self.retire_snapshot_and_order(HashSet::new(), pending.snapshot);
+        }
+    }
+
     fn flush_retired(&mut self) {
         if self.retired.is_empty() {
             return;
@@ -310,6 +444,7 @@ impl VisualSelection {
 
 impl Drop for VisualSelection {
     fn drop(&mut self) {
+        self.clear_pending_range();
         self.retired.push(Retired {
             _selected: std::mem::take(&mut self.selected),
             _range: self.range.take(),
@@ -438,6 +573,50 @@ mod tests {
     }
 
     #[test]
+    fn deleted_unmaterialized_anchor_stays_excluded_across_ranges() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for backwards in [false, true] {
+                for stale in [false, true] {
+                    let anchor = if backwards { 5 } else { 1 };
+                    let mut ids = vec![1, 2, 3, 4, 5];
+                    if !stale {
+                        ids.retain(|&id| id != anchor);
+                    }
+                    let mut selection = VisualSelection::new(0).unwrap();
+                    selection.enter(0, Some(anchor));
+                    selection.remove(anchor);
+                    assert!(selection.begin_range(view(&ids), 3, mode));
+                    finish(&mut selection);
+                    assert!(!selection.contains(anchor));
+                    assert!(selection.contains(3));
+                    if stale {
+                        assert!(selection.contains(if backwards { 4 } else { 2 }));
+                    }
+                    // A later stale snapshot must not restore the deleted ID,
+                    // including when the first snapshot omitted its old slot.
+                    selection.begin_range(view(&[1, 2, 3, 4, 5]), anchor, mode);
+                    finish(&mut selection);
+                    assert!(!selection.contains(anchor));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_toggle_replaces_a_deleted_unmaterialized_anchor() {
+        let mut selection = VisualSelection::new(0).unwrap();
+        selection.enter(0, Some(1));
+        selection.remove(1);
+        selection.toggle(3);
+        selection.toggle(3);
+        selection.begin_range(view(&[1, 2, 3, 4]), 4, RangeMode::Add);
+        finish(&mut selection);
+        assert_eq!(selection.len(), 1);
+        assert!(selection.contains(4));
+        assert!(!selection.contains(1) && !selection.contains(2) && !selection.contains(3));
+    }
+
+    #[test]
     fn deleting_the_anchor_allows_a_new_range_in_the_updated_directory() {
         let mut selection = VisualSelection::new(0).unwrap();
         selection.enter(0, Some(1));
@@ -497,5 +676,416 @@ mod tests {
             assert!(selection.contains(id));
         }
         assert_eq!(selection.len(), 4);
+    }
+
+    #[test]
+    fn toggled_anchor_keeps_its_mark_when_extending_in_either_direction() {
+        for lead in [1, 3] {
+            for initially_marked in [false, true] {
+                let mut selection = VisualSelection::new(0).unwrap();
+                selection.enter(0, None);
+                if initially_marked {
+                    selection.toggle(2);
+                }
+                selection.toggle(2);
+                selection.begin_range(view(&[1, 2, 3]), lead, RangeMode::Add);
+                finish(&mut selection);
+                assert_eq!(selection.contains(2), !initially_marked);
+                assert!(selection.contains(lead));
+                selection.begin_range(view(&[3, 2, 1]), 2, RangeMode::Add);
+                finish(&mut selection);
+                assert_eq!(selection.contains(2), !initially_marked);
+                assert!(!selection.contains(lead));
+
+                selection.reanchor(2);
+                selection.begin_range(view(&[1, 2, 3]), lead, RangeMode::Add);
+                finish(&mut selection);
+                assert!(selection.contains(2) && selection.contains(lead));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_anchor_membership_survives_segments_reversal_and_deletion() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for marked in [false, true] {
+                for pending in [false, true] {
+                    let mut selection = VisualSelection::new(0).unwrap();
+                    selection.enter(0, Some(99));
+                    selection.toggle(2);
+                    if !marked {
+                        selection.toggle(2);
+                    }
+                    selection.begin_range(view(&[1, 2, 3]), 3, mode);
+                    if pending {
+                        selection.pump(1);
+                    } else {
+                        finish(&mut selection);
+                    }
+                    selection.begin_range(view(&[4, 2, 1, 3]), 4, mode);
+                    finish(&mut selection);
+                    assert_eq!(selection.contains(2), marked);
+                    assert!(selection.contains(1) && selection.contains(3));
+                    assert!(selection.contains(4) && selection.contains(99));
+
+                    // Reverse past the explicit anchor, then cross it again in
+                    // another segment without turning a shared boundary into
+                    // an additional explicit membership override.
+                    selection.begin_range(view(&[4, 2, 1, 3]), 1, mode);
+                    finish(&mut selection);
+                    assert_eq!(selection.contains(2), marked);
+                    assert!(!selection.contains(4));
+                    selection.begin_range(view(&[5, 2, 3, 1, 4]), 5, mode);
+                    finish(&mut selection);
+                    assert_eq!(selection.contains(2), marked);
+                    assert_eq!(selection.contains(3), mode == RangeMode::Add);
+                    assert!(selection.contains(1) && selection.contains(5));
+                    assert!(selection.contains(99));
+
+                    // Deletion still wins even over an explicit selected mark.
+                    selection.remove(2);
+                    selection.begin_range(view(&[6, 2, 5, 3, 1, 4]), 6, mode);
+                    finish(&mut selection);
+                    assert!(!selection.contains(2));
+                    assert!(selection.contains(6));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deliberate_gestures_reset_the_original_explicit_anchor_override() {
+        for gesture in 0..3 {
+            let mut selection = VisualSelection::new(0).unwrap();
+            selection.enter(0, Some(1));
+            selection.toggle(1);
+            selection.begin_range(view(&[1, 2]), 2, RangeMode::Add);
+            finish(&mut selection);
+            let next = view(&[3, 1, 2]);
+            selection.begin_range(Arc::clone(&next), 3, RangeMode::Add);
+            finish(&mut selection);
+            assert!(!selection.contains(1));
+            assert!(selection.contains(2) && selection.contains(3));
+            match gesture {
+                0 => {
+                    // A new drag starts at the explicitly deselected row.
+                    selection.reanchor(1);
+                    selection.begin_range(next, 3, RangeMode::Add);
+                }
+                1 => {
+                    // Shift-click deliberately adds even after its current
+                    // segment anchor was deleted, keeping deletion exclusions.
+                    selection.remove(2);
+                    selection.add_range(next, 3);
+                }
+                _ => {
+                    selection.toggle(1);
+                    selection.begin_range(next, 3, RangeMode::Invert);
+                }
+            }
+            finish(&mut selection);
+            assert!(selection.contains(1));
+            assert_eq!(selection.contains(2), gesture != 1);
+        }
+    }
+
+    #[test]
+    fn new_rows_start_bounded_segments_without_losing_previous_marks() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for (endpoint, lead) in [(1, 0), (3, 4)] {
+                for pending in [false, true] {
+                    let mut selection = VisualSelection::new(0).unwrap();
+                    selection.enter(0, Some(99));
+                    selection.toggle(2);
+                    selection.reanchor(2);
+                    selection.begin_range(view(&[1, 2, 3]), endpoint, mode);
+                    if pending {
+                        selection.pump(1);
+                        assert!(selection.is_pending());
+                    } else {
+                        finish(&mut selection);
+                    }
+                    assert!(selection.begin_range(view(&[0, 1, 2, 3, 4]), lead, mode));
+                    assert!(selection.is_pending());
+                    assert!(!selection.contains(lead));
+                    selection.pump(1);
+                    assert!(
+                        selection.is_pending(),
+                        "one step cannot finish both segments"
+                    );
+                    finish(&mut selection);
+                    assert!(selection.contains(99));
+                    assert!(selection.contains(endpoint));
+                    assert!(selection.contains(lead));
+                    assert_eq!(selection.contains(2), mode == RangeMode::Add);
+                    assert_eq!(selection.len(), if mode == RangeMode::Add { 4 } else { 3 });
+
+                    // Reversing the new segment restores its baseline, and
+                    // reordering cannot reinterpret the original row interval.
+                    selection.begin_range(view(&[4, 3, 2, 1, 0]), endpoint, mode);
+                    finish(&mut selection);
+                    assert!(!selection.contains(lead));
+                    assert!(selection.contains(endpoint) && selection.contains(99));
+                    assert_eq!(selection.contains(2), mode == RangeMode::Add);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_an_anchor_keeps_pending_and_completed_ranges_reversible() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for pending in [false, true] {
+                for reversed in [false, true] {
+                    let mut ids = vec![1, 2, 3, 4, 5];
+                    if reversed {
+                        ids.reverse();
+                    }
+                    let mut selection = VisualSelection::new(0).unwrap();
+                    selection.enter(0, Some(1));
+                    selection.toggle(4);
+                    selection.reanchor(1);
+                    selection.begin_range(view(&ids), 3, mode);
+                    if pending {
+                        selection.pump(1);
+                    } else {
+                        finish(&mut selection);
+                    }
+                    selection.remove(1);
+                    ids.retain(|&id| id != 1);
+                    selection.begin_range(view(&ids), 5, mode);
+                    finish(&mut selection);
+                    assert!(!selection.contains(1));
+                    assert!(selection.contains(2) && selection.contains(3));
+                    assert_eq!(selection.contains(4), mode == RangeMode::Add);
+                    assert!(selection.contains(5));
+
+                    // A resort cannot reinterpret the surviving frozen interval.
+                    ids.reverse();
+                    selection.begin_range(view(&ids), 2, mode);
+                    finish(&mut selection);
+                    assert_eq!(selection.len(), 2);
+                    assert!(selection.contains(2) && selection.contains(4));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode_changes_keep_deleted_anchor_intervals_and_exclusions() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for pending in [false, true] {
+                for backwards in [false, true] {
+                    for stale in [false, true] {
+                        let anchor = if backwards { 5 } else { 1 };
+                        let removed = if backwards { 4 } else { 2 };
+                        let lead = if backwards { 1 } else { 5 };
+                        let mut selection = VisualSelection::new(0).unwrap();
+                        selection.enter(0, Some(99));
+                        if mode == RangeMode::Invert {
+                            for id in 1..=5 {
+                                selection.toggle(id);
+                            }
+                        }
+                        selection.reanchor(anchor);
+                        selection.begin_range(view(&[1, 2, 3, 4, 5]), 3, mode);
+                        if pending {
+                            selection.pump(1);
+                        } else {
+                            finish(&mut selection);
+                        }
+                        selection.remove(anchor);
+                        selection.remove(removed);
+                        let baseline = selection.snapshot();
+                        let mut next: Vec<_> = (1..=5)
+                            .filter(|&id| stale || (id != anchor && id != removed))
+                            .collect();
+                        next.reverse();
+                        let next_mode = match mode {
+                            RangeMode::Add => RangeMode::Invert,
+                            RangeMode::Invert => RangeMode::Add,
+                        };
+                        assert!(selection.begin_range(view(&next), lead, next_mode));
+                        assert_eq!(selection.snapshot(), baseline);
+                        selection.pump(1);
+                        assert!(selection.is_pending());
+                        finish(&mut selection);
+                        for id in 1..=5 {
+                            let expected = id != anchor
+                                && id != removed
+                                && (next_mode == RangeMode::Add || !baseline.contains(&id));
+                            assert_eq!(selection.contains(id), expected);
+                        }
+                        assert!(selection.contains(99));
+
+                        // Reversal still uses the original interval and restores
+                        // the membership committed at the mode change.
+                        assert!(selection.begin_range(view(&next), 3, next_mode));
+                        finish(&mut selection);
+                        for id in 1..=5 {
+                            let in_range = if backwards { id >= 3 } else { id <= 3 };
+                            let expected = id != anchor
+                                && id != removed
+                                && if in_range {
+                                    next_mode == RangeMode::Add || !baseline.contains(&id)
+                                } else {
+                                    baseline.contains(&id)
+                                };
+                            assert_eq!(selection.contains(id), expected);
+                        }
+                        assert!(selection.contains(99));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deleted_segment_endpoints_preserve_surviving_marks_and_new_rows() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for pending in [false, true] {
+                for reversed in [false, true] {
+                    for stale in [false, true] {
+                        let mut old = vec![1, 2, 3];
+                        let mut next = if stale {
+                            vec![1, 2, 3, 4, 5, 6]
+                        } else {
+                            vec![1, 2, 4, 5, 6]
+                        };
+                        if reversed {
+                            old.reverse();
+                            next.reverse();
+                        }
+                        let mut selection = VisualSelection::new(0).unwrap();
+                        selection.enter(0, None);
+                        selection.toggle(2);
+                        selection.reanchor(1);
+                        selection.begin_range(view(&old), 3, mode);
+                        if pending {
+                            selection.pump(1);
+                        } else {
+                            finish(&mut selection);
+                        }
+                        selection.remove(3);
+                        selection.begin_range(view(&next), 6, mode);
+                        finish(&mut selection);
+                        assert!(selection.contains(1));
+                        assert_eq!(selection.contains(2), mode == RangeMode::Add);
+                        assert!(!selection.contains(3));
+                        assert!(selection.contains(4) && selection.contains(5));
+                        assert!(selection.contains(6));
+
+                        selection.begin_range(view(&next), 4, mode);
+                        finish(&mut selection);
+                        assert!(selection.contains(4));
+                        assert!(!selection.contains(3) && !selection.contains(5));
+                        assert!(!selection.contains(6));
+                        selection.begin_range(view(&next), 2, mode);
+                        finish(&mut selection);
+                        assert_eq!(selection.len(), if mode == RangeMode::Add { 2 } else { 1 });
+                        assert!(selection.contains(1));
+                        assert_eq!(selection.contains(2), mode == RangeMode::Add);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn additive_clicks_commit_marks_and_retain_deleted_anchor_slots() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            for deleted_anchor in [false, true] {
+                for new_rows in [false, true] {
+                    for reversed in [false, true] {
+                        let mut old = if new_rows {
+                            vec![1, 2, 3]
+                        } else {
+                            vec![1, 2, 3, 4, 5]
+                        };
+                        let mut next = vec![1, 2, 3, 4, 5];
+                        if deleted_anchor {
+                            next.remove(0);
+                        }
+                        if reversed {
+                            old.reverse();
+                            next.reverse();
+                        }
+                        let mut selection = VisualSelection::new(0).unwrap();
+                        selection.enter(0, Some(99));
+                        selection.toggle(1);
+                        selection.toggle(2);
+                        selection.reanchor(1);
+                        selection.begin_range(view(&old), 3, mode);
+                        finish(&mut selection);
+                        if deleted_anchor {
+                            selection.remove(1);
+                        }
+                        let before = selection.snapshot();
+                        assert!(selection.add_range(view(&next), 5));
+                        assert_eq!(selection.snapshot(), before);
+                        selection.pump(1);
+                        assert!(selection.is_pending());
+                        finish(&mut selection);
+                        assert_eq!(selection.contains(1), !deleted_anchor);
+                        assert!(selection.contains(99));
+                        for id in 2..=5 {
+                            assert!(selection.contains(id));
+                        }
+
+                        // A second Shift-click adds without undoing the first.
+                        let committed = selection.snapshot();
+                        selection.add_range(view(&next), 2);
+                        finish(&mut selection);
+                        assert_eq!(selection.snapshot(), committed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finding_a_surviving_segment_boundary_obeys_the_pump_budget() {
+        for mode in [RangeMode::Add, RangeMode::Invert] {
+            let old: Vec<_> = (1..=4097).collect();
+            let mut selection = VisualSelection::new(0).unwrap();
+            selection.enter(0, Some(1));
+            selection.begin_range(view(&old), 4097, mode);
+            finish(&mut selection);
+            for id in 2..=4097 {
+                selection.remove(id);
+            }
+            // Keep removed slots in the current cache to exercise exclusions as
+            // well as bounded boundary recovery and their transfer to the segment.
+            let next: Vec<_> = (1..=4099).collect();
+            selection.begin_range(view(&next), 4099, mode);
+            assert_eq!(selection.pending_range.as_ref().unwrap().boundary, 4096);
+            assert!(selection.pump(8));
+            assert_eq!(selection.pending_range.as_ref().unwrap().boundary, 4088);
+            assert!(!selection.contains(4098) && !selection.contains(4099));
+            finish(&mut selection);
+            assert_eq!(selection.len(), if mode == RangeMode::Add { 3 } else { 2 });
+            assert_eq!(selection.contains(1), mode == RangeMode::Add);
+            assert!(selection.contains(4098) && selection.contains(4099));
+            selection.begin_range(view(&next), 1, mode);
+            finish(&mut selection);
+            assert_eq!(selection.len(), usize::from(mode == RangeMode::Add));
+        }
+    }
+
+    #[test]
+    fn pending_new_row_can_be_replaced_or_cancelled_by_the_same_gesture() {
+        for cancel in [false, true] {
+            let mut selection = VisualSelection::new(0).unwrap();
+            selection.enter(0, Some(1));
+            selection.begin_range(view(&[1, 2, 3]), 3, RangeMode::Add);
+            selection.pump(1);
+            selection.begin_range(view(&[1, 2, 3, 4]), 4, RangeMode::Add);
+            let lead = if cancel { 2 } else { 5 };
+            selection.begin_range(view(&[1, 2, 3, 4, 5]), lead, RangeMode::Add);
+            finish(&mut selection);
+            for id in 1..=5 {
+                assert_eq!(selection.contains(id), id <= lead);
+            }
+        }
     }
 }

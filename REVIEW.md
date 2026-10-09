@@ -2,7 +2,7 @@
 
 Completion requires two consecutive adversarial review passes, each using all six reviewer slots, with no valid findings. A valid finding and its fix reset the clean-pass count. Tests and measurements are separate evidence and do not count as review passes.
 
-Current consecutive clean passes: **2**. The final source is release-qualified and both saturated Passes 22 and 23 are clean. Publication is authorized. Passes 15 and 16 qualify the previously published baseline only.
+Current consecutive clean passes: **2**. The active revision passed release qualification and consecutive saturated Passes 29 and 30 on unchanged source. Publication is authorized. Passes 22 and 23 qualify the earlier commit `9ffe71e` only.
 
 | Pass | Reviewers | Result | Status |
 | --- | --- | --- | --- |
@@ -27,7 +27,14 @@ Current consecutive clean passes: **2**. The final source is release-qualified a
 | 20 | 6 of 6 | One finding; five reviewers reported none | Fixed and requalified; streak 0 |
 | 21 | 6 of 6 | Two findings; four reviewers reported none | Fixed and requalified; streak 0 |
 | 22 | 6 of 6 | No findings | Clean; streak 1 |
-| 23 | 6 of 6 | No findings | Clean; streak 2; final revision qualified |
+| 23 | 6 of 6 | No findings | Clean; streak 2; previous revision qualified |
+| 24 | 6 of 6 | Four unique findings; two reviewers reported none | Fixed and requalified; streak 0 |
+| 25 | 6 of 6 | Four findings; three reviewers reported none | Fixed and requalified; streak 0 |
+| 26 | 6 of 6 | Two findings; four reviewers reported none | Fixed and requalified; streak 0 |
+| 27 | 6 of 6 | Three findings; three reviewers reported none | Fixed and requalified; streak 0 |
+| 28 | 6 of 6 | Two findings; four reviewers reported none | Fixed and requalified; streak 0 |
+| 29 | 6 of 6 | No findings | Clean; streak 1 |
+| 30 | 6 of 6 | No findings | Clean; streak 2; current revision qualified |
 
 Pass 1 findings, now closed:
 
@@ -242,3 +249,99 @@ All six fresh reviewers were verified running concurrently on qualified source `
 ### Pass 23
 
 All six fresh reviewers were launched before the first final report on the same qualified source as Pass 22. Domains cover filesystem/scanner/terminal reads, selection/input, queue/deletion, accounting, rendering/harness, and cache/lifetime/provenance. All six independently reported **NO FINDINGS**. Both saturated passes completed after release qualification with no source changes between them. Clean streak **2**; the final revision is qualified for authorized publication. Working and staged source bytes were verified against the qualification digest before committing.
+
+## Active revision: complete visual interaction
+
+The user reported that visual selection remained incomplete. Development audits confirmed ignored lowercase `v`, ignored visual Delete, single-target lowercase `d`, lost batch requests during pending range work, unsupported ordinary dragging, drag modifier-release and edge-scroll gaps, newly discovered rows missing frozen ranges, explicit Enter deselection lost on subsequent movement, and opposite queued movements incorrectly collapsed at boundaries. These findings reset the clean streak to **0**.
+
+Six development agents are working on keyboard/batch admission, mouse gestures, selection semantics, terminal regression coverage, documentation/requirements and independent batch review. Development audits do not count as formal clean passes. Final qualification and the new saturated review pair are pending.
+
+Follow-up development review also found visual entry overtaking unresolved navigation, premature Enter cancelling later batch-wait phases, and mouse endpoint/order/timer cases. These corrections are included in the active revision. An intermediate keyboard/selection checkpoint passed **179 unit and 7 filesystem tests (186 total)**; it predates the mouse changes and is not final qualification.
+
+Active visual revision is frozen at `6e73663c493a4639494669dc28be63088d9a815da8e3b3e6dfddc069943910f7` across 25 source/publication paths (this ledger excluded). **185 unit and 7 filesystem tests passed (192 total)**; formatting, all-target Clippy with warnings denied, release build, four real-PTY corpora, and nine native/std/auto JSON crosschecks passed. Focused terminal checks also exercised lowercase mode entry, all batch aliases, plain drag, released-Shift inversion, an 8,192-row pending range, premature Enter, and timer-driven edge scrolling. A queue-fixture path overflow was corrected by using 119 columns without weakening exact-path checks. Evidence: `.tmp/visual-mouse-development.log`, `.tmp/qualification-visual-complete.log`, and `.tmp/qualified-visual-complete.json`.
+
+Unslop audit found no phrase or structure defects in README or behavior documentation. Soft readability/repetition metrics and the behavior document's heading-overlap warning were reviewed and retained as normal technical documentation. No prose rewrite was warranted.
+
+Formal Pass 24 is starting with six fresh adversarial reviewers. Clean streak remains **0**.
+
+### Pass 24
+
+All six fresh reviewers were verified active concurrently before the start barrier was released. Four reviewers reported four unique findings; two reported no findings. The source remained unchanged until all six completed:
+
+- Adjacent queued Enter pairs were discarded despite each toggle also committing and reanchoring the range.
+- A mouse press baseline could restore a selected ID after asynchronous deletion.
+- Ordinary clicks or hover on blank list rows were clamped to the final entry.
+- An unrelated, unconfirmed batch dialog prevented previously confirmed FIFO jobs from starting.
+
+All four fixes are implemented. Toggle intents retain their side effects; deletion removes IDs from the retained mouse baseline; only active drags clamp blank hits, while wheel events still navigate over blank list space; confirmed queue jobs continue during batch review. Grouped regressions cover both toggle variants, ordinary/Shift and immediate/deferred gestures, blank clicks/hover, wheel input and edge drags. A real-PTY case uses 32 paused confirmed jobs and one independent batch target to verify FIFO progress while the new confirmation remains open.
+
+Post-fix Rust checks passed **187 unit and 7 filesystem tests (194 total)** plus all-target Clippy with warnings denied. Release build and full terminal qualification are pending. The clean streak remains **0**.
+
+After the Pass 24 fixes, frozen source is `d502dd6a68bd251d893094b58fffa0d990888e70c1b3b36aa1d056384404ea4a`. **187 unit and 7 filesystem tests passed (194 total)**, with formatting, all-target Clippy, release build, four real-PTY corpora and nine JSON backend crosschecks. The full terminal suite includes confirmed FIFO progress during an unconfirmed batch. Evidence is in `.tmp/visual-pass24-fixes.log`, `.tmp/qualification-visual-complete.log`, and `.tmp/qualified-visual-complete.json`. Formal Pass 25 is starting; clean streak **0**.
+
+### Pass 25
+
+All six fresh reviewers were verified active before release of the start barrier, and the source stayed frozen until all six reports completed. Three reviewers reported no findings. The other three found four issues:
+
+- Deleting an original range anchor or a shared segment endpoint could make subsequent movement skip intermediate rows.
+- Deleting either endpoint of a queued drag discarded the entire surviving interval.
+- A mouse press after an unpainted sort could capture the painted order while freezing a different view.
+- A later confirmed deletion could overtake the undispatched tail of an earlier confirmed batch.
+
+The fixes retain logical frozen intervals despite endpoint removal, recover new-segment boundaries within the pump budget, preserve the exact painted view and viewport during held gestures, and hold an explicit enqueueing dialog until a confirmed batch has entered the FIFO. Already queued deletions continue; stopping additions leaves their accepted prefix intact. Development and requalification are in progress; clean streak **0**.
+
+Pass 25 fixes are complete and qualified. The frozen publication-source digest is `f7b50c54bc32ad9a766a39f30485aa9d59598c0ba70c52503a1ca0c3052fe8c6` (all tracked paths except this ledger). Validation passed: 197 unit tests, 7 filesystem integration tests, formatting, warnings-denied Clippy, release build, full owned-fixture PTY suite, three reused-corpus PTY runs, and nine native/std/auto JSON checks. Evidence: `.tmp/visual-pass25-fixes.log`, `.tmp/qualification-visual-complete.log`, and `.tmp/qualified-visual-complete.json`.
+
+The PTY range-test setup now proves that all 8,192 rows have reached the sorted view before the regression sequence. Scanning completion alone was insufficient. Readiness probes use fresh visual selections and one deadline; the actual stopped-child End + delete + Enter burst is unchanged and executes once. The corrected focused check and full terminal qualification passed. Current clean streak remains zero; Pass 26 begins on this frozen source.
+
+### Pass 26
+
+All six fresh reviewers were verified running simultaneously before RELEASE. The source stayed frozen until all six final reports. Four reported no findings; two reported one finding each:
+
+- A Shift-click with no prior range could lose intermediate surviving rows when its original visual anchor was deleted between press and release.
+- Batch admission could observe an empty event channel, then observe worker completion after the final events were published, and incorrectly discard those confirmed events as a failure.
+
+Both findings reset the clean streak to zero. Fixes and deterministic regression coverage are in progress; root retains sole ownership of compiler runs and qualification.
+
+Pass 26 development fixes are complete. A constant-size deleted-anchor tombstone now transfers the original slot into range exclusions; immediate and deferred drag reconstruction also normalizes removed anchors before starting a range. Grouped regressions cover fresh/toggled anchors, both directions, immediate/deferred input, stale/fresh snapshots, Add/Invert, explicit reanchoring, and continuation after a resort. Batch completion now acquires the finished state before checking the current event queue. Its regression injects final entries after the first empty receive, without sleeps or scheduling assumptions. Both primary regressions were run against the old code and failed at the intended assertions (`.tmp/pass26-shiftclick-before.log`, `.tmp/pass26-batch-before.log`). The batch regression passed after the fix.
+
+All four supporting development audits completed with no outstanding findings. Formatting, 202 unit tests and 7 filesystem integration tests (209 total), and warnings-denied Clippy passed. Release build and terminal qualification are pending. Candidate source digest is `5b21780b57c10a794de094d982704e44ba8b25ab73d1d45415119c95092fc81e`. These development audits do not count toward the required fresh formal pair.
+
+Pass 26 fixes are fully qualified on frozen source `5b21780b57c10a794de094d982704e44ba8b25ab73d1d45415119c95092fc81e`: 202 unit plus 7 filesystem tests, formatting, warnings-denied all-target Clippy, release build, four real-PTY corpora and nine JSON backend checks passed. Evidence: `.tmp/visual-pass26-fixes.log`, `.tmp/qualification-visual-complete.log`, `.tmp/qualified-visual-complete.json`. Pass 27 starts on these unchanged publication bytes; clean streak remains zero.
+
+### Pass 27
+
+All six fresh reviewers were verified running simultaneously before RELEASE. Source stayed frozen until all six final reports. Three reviewers reported no findings; three reported one finding each:
+
+- Continuing a keyboard range to a newly discovered row could restore an explicitly deselected original anchor after an internal segment transition.
+- A confirmation key delivered alongside a terminal shrink could use reviewability from the previous larger frame before the resize event was processed.
+- Non-Linux root refreshes read metadata cached at initial anchor creation, leaving stale root inode sizes even when child contents refreshed.
+
+Fixes and deterministic regression coverage are in progress. The clean streak remains zero.
+
+Pass 27 fixes are implemented. Stable-ID explicit membership now survives internal segment changes while deliberate gestures reset it and deletion exclusions take precedence. Ready Delete, Batch and Quit confirmations compare live terminal geometry with the last frame before dispatch; Unix uses an ioctl-only query. Non-Linux root metadata is read fresh without following the final symlink.
+
+The actual keyboard-discovery regression failed before the selection fix (`.tmp/pass27-selection-before.log`). All three stopped-child resize/confirmation tests failed before the geometry fix, with single/batch jobs improperly enqueued and guarded quit exiting (`.tmp/pass27-resize-before.log`). Source-only supporting audits found no outstanding issues. Formatting and 206 Linux unit plus 7 filesystem tests passed; remaining compiler/build/terminal checks are underway. Non-Linux runtime tests require a native runner; macOS compilation is included in qualification.
+
+Pass 27 fixes are fully qualified on frozen source `895f0cd34644a106eebd053e6d54606196f794c8fe89e3d169ba21887fae9e2b`: 206 unit plus 7 filesystem tests (213 total), formatting, warnings-denied Linux all-target Clippy, release build, macOS all-target compilation, four PTY corpora and nine JSON backend checks passed. The full PTY run includes simultaneous resize/confirmation for single deletion, batch deletion and guarded quit. macOS compilation emitted three test-only dead-code warnings; macOS runtime tests were not run. Evidence: `.tmp/visual-pass27-fixes.log`, `.tmp/qualification-visual-complete.log`, `.tmp/qualified-visual-complete.json`. Pass 28 starts on these unchanged bytes; clean streak remains zero.
+
+### Pass 28
+
+All six fresh reviewers were verified running simultaneously before RELEASE; source stayed frozen until all six final reports. Four reported no findings; two found:
+
+- Shift mouse entry into visual mode captured the old cursor when an earlier normal navigation was still pending, producing different selected IDs than the same input after navigation settled.
+- Switching an inverse range to keyboard Add after the original anchor was deleted discarded its retained frozen slot and skipped intermediate survivors.
+
+Both fixes are in development with deterministic regressions and independent supporting audits. Clean streak remains zero.
+
+Pass 28 regressions reproduced both defects before their fixes: `mode_changes_keep_deleted_anchor_intervals_and_exclusions` and the actual-keyboard continuation test failed (`.tmp/pass28-selection-before.log`); pending Shift mouse entry included the stale cursor ID (`.tmp/pass28-mouse-before.log`). A shared range-restart helper now retains a deleted anchor's frozen interval and exclusions when changing modes. Mouse entry follows the existing deferred visual-entry contract. Supporting source audits and final regression additions are completing before root qualification.
+
+Pass 28 fixes are fully qualified on frozen source `745bcf043a8526ff68e60b7af413dc8ac021d53a94fb0bb9647658aabefec57d`: 209 unit plus 7 filesystem tests (216 total), formatting, strict Linux Clippy, macOS all-target compilation, release build, four PTY corpora and nine JSON backend checks passed. Supporting source audits found no outstanding issues. The mouse regression also verifies batch preparation waits for corrected selection and cancellation preserves it. macOS runtime remains untested; its three test-only dead-code warnings are unchanged. Evidence: `.tmp/visual-pass28-fixes.log`, `.tmp/qualification-visual-complete.log`, `.tmp/qualified-visual-complete.json`. Pass 29 starts on these unchanged bytes; clean streak remains zero.
+
+### Pass 29
+
+All six fresh reviewers were verified running concurrently before RELEASE on qualified source `745bcf043a8526ff68e60b7af413dc8ac021d53a94fb0bb9647658aabefec57d`. Domains: keyboard, mouse, selection lifecycle, deletion, scanner/accounting, and rendering/validation. All six independently reported **NO FINDINGS**. No repository files changed until all six reports completed. Source digest remains unchanged; clean streak is **1**. A fresh saturated Pass 30 follows on the same publication bytes.
+
+### Pass 30
+
+All six fresh reviewers were verified running simultaneously before RELEASE on the same qualified source as Pass 29: `745bcf043a8526ff68e60b7af413dc8ac021d53a94fb0bb9647658aabefec57d`. Domains: keyboard, mouse, selection lifecycle, deletion, scanning/accounting, and rendering/validation. All six independently reported **NO FINDINGS**. Source remained unchanged through both rounds, with no repository writes during either review. Clean streak is **2**. Working, staged and committed publication source bytes are checked against the qualification digest before the authorized push.

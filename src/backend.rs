@@ -61,8 +61,6 @@ pub struct RootAnchor {
     fd: rustix::fd::OwnedFd,
     #[cfg(target_os = "linux")]
     openat2_available: AtomicBool,
-    #[cfg(not(target_os = "linux"))]
-    root_metadata: EntryMetadata,
 }
 
 impl RootAnchor {
@@ -103,11 +101,8 @@ impl RootAnchor {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let root_metadata = std_path_metadata(&path)?;
-            Ok(Self {
-                path,
-                root_metadata,
-            })
+            std_path_metadata(&path)?;
+            Ok(Self { path })
         }
     }
 
@@ -128,7 +123,7 @@ impl RootAnchor {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(self.root_metadata)
+            std_path_metadata(&self.path)
         }
     }
 

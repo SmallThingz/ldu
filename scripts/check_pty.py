@@ -45,7 +45,8 @@ def path_in_header(screen, path):
     raw_path = os.fsdecode(path)
     if not os.path.isabs(raw_path):
         raw_path = os.path.join(os.getcwd(), raw_path)
-    label = screen.text(header=True)[:-8].rstrip()
+    label = re.sub(r"\s+(?:v select\s+)?(?:D queue\s+)?\? help\s*$", "",
+                   screen.text(header=True))
     phase = re.search(r"  Scan complete(?: with errors)?$", label)
     return (screen.help_at_edge() and phase is not None
             and label[:phase.start()] == printable(raw_path))
@@ -270,6 +271,14 @@ def check_printable_names():
     screen.resize(3, 100)
     screen.feed(b"\x1b[1;1H/fixture/folder-root/folder  Scan complete with errors\x1b[1;95H? help")
     assert directory_in_header(screen, root, ["folder"]), "completed error status hid directory identity"
+
+    for hint in ("? help", "v select  ? help", "v select  D queue  ? help"):
+        path = Path("/fixture/v select ? help  Scan complete")
+        screen.resize(3, 100)
+        screen.feed(("\x1b[1;1H" + printable(path) + "  Scan complete"
+                     + f"\x1b[1;{101 - len(hint)}H" + hint).encode())
+        assert path_in_header(screen, path), "header hint was confused with a filename"
+        assert not path_in_header(screen, path.parent), "header hint truncated the directory identity"
 
 
 class Session:
@@ -670,6 +679,9 @@ def check_owned_queue(binary, work, threads):
     (root / "branch" / "leaf").write_bytes(b"l" * 4096)
     session = Session(binary, root, threads)
     try:
+        # Keep the full nested path visible beside queue status and shortcuts,
+        # while remaining below the 120-column preview threshold.
+        session.resize(28, 119)
         session.wait(lambda: path_in_header(session.screen, root), "queue fixture scan did not complete")
         pause_empty_queue(session)
         for name in ("alpha", "beta", "gamma", "alpha"):
@@ -975,7 +987,8 @@ def visual_paths(session, names):
     paths = []
     for row, cells in enumerate(session.screen.cells[1:], 1):
         line = "".join(cells).rstrip()
-        if sum(background == 4 for background, _ in session.screen.attributes[row][:16]) < 3:
+        if (cells[0] not in "›✓"
+                or sum(background == 4 for background, _ in session.screen.attributes[row][:16]) < 3):
             continue
         name = next((name for name in names if line.endswith(" " + name)), None)
         if name is not None:
@@ -983,27 +996,48 @@ def visual_paths(session, names):
     return paths
 
 
-def wait_visual(session, names, expected):
+def cursor_path(session, names):
+    paths = [name for cells in session.screen.cells[1:] if cells[0] == "›"
+             for name in names if "".join(cells).rstrip().endswith(" " + name)]
+    return paths[0] if len(paths) == 1 else None
+
+
+def wait_visual(session, names, expected, cursor=None):
     session.wait(lambda: "Visual" in session.screen.text(header=True)
-                 and visual_paths(session, names) == expected,
-                 f"visual selection did not contain {expected}")
+                 and visual_paths(session, names) == expected
+                 and (cursor is None or cursor_path(session, names) == cursor),
+                 f"visual selection did not contain {expected} with cursor {cursor}")
 
 
 def reset_fixture_visual(session, names):
-    session.key(b"V")
+    session.key(b"v")
     session.wait(lambda: "Visual" not in session.screen.text(header=True)
-                 and not visual_paths(session, names), "V did not clear visual selection")
+                 and not visual_paths(session, names), "v did not clear visual selection")
     fixture_selection(session, "alpha")
     session.key(b"V")
     wait_visual(session, names, ["alpha"])
 
 
-def open_batch_confirmation(session, count=2):
-    session.key(b"D")
+def batch_count(session):
+    match = re.search(r"Permanently remove (\d+) selected entries in:", session.screen.words())
+    return int(match[1]) if match else None
+
+
+def wait_batch_confirmation(session, count=2):
     session.wait(lambda: session.screen.has_modal_title("Delete selection?")
-                 and f"Permanently remove {count} selected entries in:" in session.screen.words()
+                 and batch_count(session) == count
                  and "y / Enter: enqueue selected" in session.screen.words(),
                  "batch confirmation did not finish checking selected targets")
+
+
+def open_batch_confirmation(session, count=2, key=b"D"):
+    session.key(key)
+    wait_batch_confirmation(session, count)
+
+
+def visual_count(session):
+    match = re.search(r"Visual · (\d+) selected", session.screen.text(header=True))
+    return int(match[1]) if match else None
 
 
 def check_owned_visual(binary, work, threads):
@@ -1022,19 +1056,20 @@ def check_owned_visual(binary, work, threads):
                              for name in names if "".join(row).rstrip().endswith(" " + name)] == names,
                      "visual name ordering did not settle")
         fixture_selection(session, "alpha")
-        session.key(b"V")
-        wait_visual(session, names, ["alpha"])
+        session.key(b"v")
+        wait_visual(session, names, ["alpha"], cursor="alpha")
         session.key(b"\x1b[B")
-        wait_visual(session, names, ["alpha", "beta"])
+        wait_visual(session, names, ["alpha", "beta"], cursor="beta")
         session.key(b"\x1b[1;2B")
-        wait_visual(session, names, ["alpha", "beta", "gamma"])
+        wait_visual(session, names, ["alpha", "beta", "gamma"], cursor="gamma")
         session.key(b"\r")
-        wait_visual(session, names, ["alpha", "beta"])
-        open_batch_confirmation(session)
-        session.key(b"n")
-        session.wait(lambda: session.screen.normal_view(), "batch deletion confirmation did not cancel")
-        wait_visual(session, names, ["alpha", "beta"])
-        assert all((root / name).is_file() for name in names), "cancelled batch deletion changed files"
+        wait_visual(session, names, ["alpha", "beta"], cursor="gamma")
+        for key, cancel in ((b"d", b"n"), (b"\x1b[3~", b"\x1b")):
+            open_batch_confirmation(session, key=key)
+            session.key(cancel)
+            session.wait(lambda: session.screen.normal_view(), "batch deletion confirmation did not cancel")
+            wait_visual(session, names, ["alpha", "beta"])
+            assert all((root / name).is_file() for name in names), "cancelled batch deletion changed files"
         open_batch_confirmation(session)
         session.resize(4, 24)
         session.wait(lambda: "Resize to review" in session.screen.words(),
@@ -1054,6 +1089,14 @@ def check_owned_visual(binary, work, threads):
         wait_visual(session, names, ["alpha", "beta", "gamma"])
         reset_fixture_visual(session, names)
         session.key(b"\x1b[<4;35;2M\x1b[<36;35;3M\x1b[<4;35;3m")
+        wait_visual(session, names, ["beta"])
+        reset_fixture_visual(session, names)
+        # A plain drag adds to the marks captured before the press.
+        session.key(b"\x1b[<0;35;3M\x1b[<32;35;4M\x1b[<0;35;4m")
+        wait_visual(session, names, ["alpha", "beta", "gamma"])
+        reset_fixture_visual(session, names)
+        # Releasing Shift before the next motion must retain inverse semantics.
+        session.key(b"\x1b[<4;35;2M\x1b[<32;35;3M\x1b[<0;35;3m")
         wait_visual(session, names, ["beta"])
         reset_fixture_visual(session, names)
         session.key(b"\x1b[B")
@@ -1076,6 +1119,177 @@ def check_owned_visual(binary, work, threads):
         elapsed = session.finish(key=b"q")
         return {"case": "visual-batch-deletion", "first_frame_ms": session.first_frame_ms,
                 "quit_ms": elapsed, "input": []}
+    finally:
+        session.close()
+
+
+def check_owned_batch_queue(binary, work, threads):
+    root = work / "batch-fifo"
+    root.mkdir()
+    victims = [root / f"item-{index:02d}" for index in range(32)]
+    for victim in victims:
+        victim.write_bytes(b"confirmed FIFO job")
+    review = root / "review"
+    review.write_bytes(b"unconfirmed batch target")
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 119)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "batch FIFO fixture scan did not complete")
+        pause_empty_queue(session)
+        session.key(b"n")
+        settled_home(session, lambda: first_row(session).rstrip().endswith(" item-00"),
+                     "batch FIFO name ordering did not settle")
+        session.key(b"v" + b"\x1b[B" * 31)
+        session.wait(lambda: visual_count(session) == 32
+                     and cursor_path(session, ["item-31"]) == "item-31",
+                     "batch FIFO did not select exactly its 32 confirmed targets")
+        open_batch_confirmation(session, count=32, key=b"d")
+        session.key(b"y")
+        session.wait(lambda: session.screen.normal_view() and visual_count(session) is None,
+                     "confirmed FIFO batch did not return to browsing")
+        assert all(victim.is_file() for victim in victims), "FIFO batch ignored the paused queue"
+        session.key(b"\x1b[F")
+        session.wait(lambda: cursor_path(session, ["review"]) == "review",
+                     "batch FIFO did not select the independent review target")
+        session.key(b"D")
+        session.wait(lambda: session.screen.has_modal_title("Deletion queue")
+                     and "32 queued" in session.screen.words()
+                     and "Pending paused" in session.screen.words(),
+                     "batch FIFO did not retain all 32 paused jobs")
+        assert all(victim.is_file() for victim in victims), "paused FIFO changed a confirmed target"
+        # Each event-loop iteration handles one key and can start at most two
+        # jobs. Queue all four keys before resuming our child, so older confirmed
+        # work must remain when d opens review, regardless of deletion speed.
+        with stopped_child(session):
+            keys = b" Dvd"
+            session.key(keys)
+            session.wait(lambda: queued_input_bytes(session) == len(keys),
+                         "batch FIFO keys did not enter the stopped child's PTY")
+        wait_batch_confirmation(session, count=1)
+        assert review.is_file(), "unconfirmed batch changed its target"
+        # Send no more input while the confirmed jobs drain: reviewing C must
+        # not pause the FIFO or authorize C's deletion.
+        session.wait(lambda: all(not victim.exists() for victim in victims)
+                     and session.screen.has_modal_title("Delete selection?")
+                     and batch_count(session) == 1
+                     and "y / Enter: enqueue selected" in session.screen.words(),
+                     "unconfirmed batch paused previously confirmed FIFO work")
+        assert review.is_file(), "FIFO completion deleted the unconfirmed batch target"
+        session.key(b"n")
+        session.wait(lambda: session.screen.normal_view() and visual_count(session) == 1,
+                     "cancelling the batch lost its retained selection")
+        session.key(b"v")
+        session.wait(lambda: session.screen.normal_view() and visual_count(session) is None,
+                     "batch FIFO did not leave visual mode")
+        open_queue(session, [])
+        session.wait(lambda: "No deletions queued" in session.screen.words(),
+                     "completed FIFO retained an active deletion")
+        close_queue(session)
+        elapsed = session.finish(key=b"q")
+        return {"case": "confirmed-fifo-during-batch-review",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed, "input": []}
+    finally:
+        session.close()
+
+
+def check_owned_visual_ranges(binary, work, threads):
+    root = work / "visual-range"
+    root.mkdir()
+    names = [f"item-{index:05d}" for index in range(8192)]
+    for name in names:
+        (root / name).touch()
+    session = Session(binary, root, threads)
+    try:
+        session.wait(lambda: path_in_header(session.screen, root)
+                     and "Scan complete" in session.screen.text(header=True),
+                     "large visual fixture scan did not complete", timeout=30)
+        session.key(b"n")
+        # Scan completion precedes the ordering worker's final publication.
+        # A fresh complete selection proves the whole cache is ready; retries
+        # belong only to setup, never to the deferred-delete regression below.
+        deadline = time.monotonic() + 30
+        def ready(predicate, description):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "large visual fixture cache never became complete"
+            session.wait(predicate, description, timeout=remaining)
+        while True:
+            session.key(b"\x1b[H")
+            ready(lambda: cursor_path(session, names[:1]) == names[0],
+                  "large visual fixture Home did not reach the first sorted row")
+            session.key(b"v")
+            ready(lambda: visual_count(session) == 1,
+                  "large visual fixture did not start a fresh selection")
+            # Help acknowledges consumption of End even for a one-row partial
+            # cache. Closing it preserves selection and allows pumping to finish.
+            session.key(b"\x1b[F?")
+            ready(lambda: session.screen.has_modal_title("Help"),
+                  "large visual fixture did not acknowledge setup End")
+            session.key(b"\x1b")
+            ready(lambda: session.screen.normal_view()
+                  and visual_count(session) is not None
+                  and "Selecting" not in session.screen.text(header=True),
+                  "large visual fixture setup selection did not settle")
+            complete = visual_count(session) == len(names)
+            session.key(b"v")
+            ready(lambda: session.screen.normal_view() and visual_count(session) is None,
+                  "large visual fixture did not clear its setup selection")
+            if complete:
+                break
+        session.key(b"\x1b[H")
+        ready(lambda: cursor_path(session, names[:1]) == names[0],
+              "large visual fixture Home did not return to the first sorted row")
+        session.key(b"v")
+        ready(lambda: visual_count(session) == 1,
+              "large visual fixture did not enter visual mode")
+        # Deliver deletion and an early Enter before an 8192-row range can
+        # finish. Enter must not cancel the waiting request or confirm unseen
+        # targets. A second delete key would mask a discarded request.
+        with stopped_child(session):
+            keys = b"\x1b[Fd\r"
+            session.key(keys)
+            unread = lambda: struct.unpack("I", fcntl.ioctl(
+                session.slave, termios.FIONREAD, struct.pack("I", 0)))[0]
+            session.wait(lambda: unread() == len(keys),
+                         "large range keys did not enter the stopped child's PTY")
+        wait_batch_confirmation(session, len(names))
+        session.key(b"n")
+        session.wait(lambda: session.screen.normal_view()
+                     and visual_count(session) == len(names)
+                     and names[-1] in visual_paths(session, names[-session.screen.rows:]),
+                     "cancelling pending-range deletion did not preserve all marks")
+
+        session.key(b"v")
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "large visual fixture did not exit visual mode")
+        session.key(b"\x1b[H")
+        session.wait(lambda: first_row(session).rstrip().endswith(" " + names[0])
+                     and session.screen.selected_row() == 1,
+                     "edge drag did not start at the first row")
+        session.key(b"v")
+        session.wait(lambda: visual_count(session) == 1,
+                     "edge drag did not enter visual mode")
+        # Hold a plain drag on the last list row without further motion. The
+        # timer must scroll and extend selection beyond the initial viewport.
+        edge = session.screen.rows
+        session.key(f"\x1b[<0;35;2M\x1b[<32;35;{edge}M".encode())
+        session.wait(lambda: (visual_count(session) or 0) > session.screen.rows + 12
+                     and not first_row(session).rstrip().endswith(" " + names[0]),
+                     "held edge drag did not select beyond the viewport")
+        session.key(f"\x1b[<0;35;{edge}md".encode())
+        session.wait(lambda: session.screen.has_modal_title("Delete selection?")
+                     and (batch_count(session) or 0) > session.screen.rows
+                     and "y / Enter: enqueue selected" in session.screen.words(),
+                     "released edge drag did not produce a complete batch selection")
+        selected = batch_count(session)
+        session.key(b"\x1b")
+        session.wait(lambda: session.screen.normal_view()
+                     and visual_count(session) == selected,
+                     "cancelling edge-drag deletion did not preserve marks")
+        assert len(list(root.iterdir())) == len(names), "cancelled range deletion changed files"
+        elapsed = session.finish(key=b"q")
+        return {"case": "visual-pending-range-and-edge-drag",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed, "input": []}
     finally:
         session.close()
 
@@ -1107,6 +1321,81 @@ def stopped_resize_key(session, rows, cols, key):
     with stopped_child(session):
         session.resize(rows, cols)
         session.key(key)
+
+
+def check_owned_resize_confirmation(binary, work, threads, cases=("single", "batch", "quit")):
+    metrics = []
+    for case in cases:
+        root = work / ("resize-" + case)
+        root.mkdir()
+        names = ["alpha", "beta"]
+        for name in names:
+            (root / name).write_bytes(b"resize confirmation")
+        session = Session(binary, root, threads)
+        try:
+            session.resize(28, 119)
+            session.wait(lambda: path_in_header(session.screen, root),
+                         f"{case} resize confirmation fixture scan did not complete")
+            pause_empty_queue(session)
+            fixture_selection(session, "alpha")
+            if case == "single":
+                session.key(b"d")
+                session.wait(lambda: session.screen.has_modal_title("Delete?")
+                             and "alpha" in session.screen.text()
+                             and "y / Enter: delete" in session.screen.words(),
+                             "single resize confirmation did not become reviewable")
+            elif case == "batch":
+                session.key(b"v")
+                wait_visual(session, names, ["alpha"], cursor="alpha")
+                open_batch_confirmation(session, count=1, key=b"d")
+            elif case == "quit":
+                enqueue_fixture(session, "alpha")
+                session.key(b"q")
+                session.wait(lambda: session.screen.has_modal_title("Deletions in progress")
+                             and "q / Enter: cancel all and quit" in session.screen.words(),
+                             "quit resize confirmation did not become reviewable")
+            else:
+                raise AssertionError(f"unknown resize confirmation case: {case}")
+
+            # Make both input and SIGWINCH ready before the owned child resumes.
+            # Do not wait for a refusal redraw before sending confirmation: the
+            # terminal parser may return the keys before the pending resize.
+            keys = b"q\r\x03" if case == "quit" else b"y\r"
+            with stopped_child(session):
+                session.resize(4, 24)
+                session.key(keys)
+                session.wait(lambda: queued_input_bytes(session) == len(keys),
+                             f"{case} confirmation burst did not reach stopped child's PTY")
+            session.wait(lambda: "Resize to review" in session.screen.words()
+                         and queued_input_bytes(session) == 0,
+                         f"{case} confirmation accepted stale geometry before resize redraw",
+                         timeout=5)
+            assert session.child.poll() is None, f"tiny {case} confirmation exited"
+            assert all((root / name).is_file() for name in names), f"tiny {case} confirmation removed a file"
+            session.key(b"n")
+            session.wait(lambda: "Resize to review" not in session.screen.words()
+                         and not session.screen.has_modal_border(),
+                         f"tiny {case} confirmation did not cancel")
+            session.resize(28, 119)
+            session.wait(lambda: session.screen.normal_view(),
+                         f"{case} confirmation did not restore browser geometry")
+            if case == "batch":
+                wait_visual(session, names, ["alpha"], cursor="alpha")
+                session.key(b"v")
+                session.wait(lambda: visual_count(session) is None,
+                             "resize batch cancellation did not leave visual mode")
+            expected = ["alpha"] if case == "quit" else []
+            open_queue(session, expected)
+            assert "Pending paused" in session.screen.words(), "resize confirmation changed queue pause"
+            assert all((root / name).is_file() for name in names), "resize confirmation changed fixture files"
+            close_queue(session)
+            elapsed = session.finish(key=b"q\r" if case == "quit" else b"q")
+            metrics.append({"case": "simultaneous-resize-" + case + "-confirmation",
+                            "first_frame_ms": session.first_frame_ms,
+                            "quit_ms": elapsed, "input": []})
+        finally:
+            session.close()
+    return metrics
 
 
 def prepare_input_fixture(session, root, label):
@@ -1347,7 +1636,10 @@ def main():
             metrics.append(check_owned_quit_guard(args.binary, Path(work), args.threads))
             metrics.append(check_owned_refresh(args.binary, Path(work), args.threads))
             metrics.append(check_owned_visual(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_batch_queue(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_visual_ranges(args.binary, Path(work), args.threads))
             metrics.append(check_owned_resize_input(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_resize_confirmation(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_fragmented_input(args.binary, Path(work), args.threads))
     if args.report_latencies:
         print(json.dumps({"pty": metrics, "requested_threads": args.threads,
@@ -1360,7 +1652,7 @@ def main():
         checks = ["initial frame", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
                   "scan error", "terminal restoration"]
         if args.root is None:
-            checks += ["shared preview bars", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "deletion cancellation attempt", "guarded deletion quit", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "visual batch deletion", "simultaneous resize and End", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
+            checks += ["shared preview bars", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "deletion cancellation attempt", "guarded deletion quit", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
         if any(sample["during_scanning"] and "help" in sample["action"]
                for metric in metrics for sample in metric["input"]):
             checks.append("help during scanning")
