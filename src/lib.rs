@@ -3,6 +3,7 @@ pub mod batch;
 pub mod delete;
 pub mod model;
 pub mod order;
+pub mod preview;
 pub mod queue;
 mod retire;
 pub mod scan;

@@ -2,7 +2,7 @@
 
 Completion requires two consecutive adversarial review passes, each using all six reviewer slots, with no valid findings. A valid finding and its fix reset the clean-pass count. Tests and measurements are separate evidence and do not count as review passes.
 
-Current consecutive clean passes: **2**. Startup selection and resort context passed qualification on source `14ce7ab9bad3cd819b4cddbe5eeff0bb3c26cbc0f6214bb4dae88ca946ab43e4`. Passes 38 and 39 each used all six reviewer slots and reported no findings on this unchanged source.
+Current consecutive clean passes: **2**. Passes 43 and 44 are clean on the same qualified source and release binary.
 
 | Pass | Reviewers | Result | Status |
 | --- | --- | --- | --- |
@@ -43,7 +43,12 @@ Current consecutive clean passes: **2**. Startup selection and resort context pa
 | 36 | 6 of 6 | No findings | Clean; streak 1 |
 | 37 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
 | 38 | 6 of 6 | No findings | Clean; streak 1 |
-| 39 | 6 of 6 | No findings | Clean; streak 2; current source qualified |
+| 39 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
+| 40 | 6 of 6 | One finding; five reviewers reported none | Fixed and requalified; streak 0 |
+| 41 | 6 of 6 | No findings | Clean; streak 1, reset by Pass 42 |
+| 42 | 6 of 6 | Two findings; four reviewers reported none | Fixed and requalified; streak 0 |
+| 43 | 6 of 6 | No findings | Clean; streak 1 |
+| 44 | 6 of 6 | No findings | Clean; streak 2; qualified for publication |
 
 Pass 1 findings, now closed:
 
@@ -413,3 +418,37 @@ Pass 38 used all six reviewer slots, verified running together at the READY barr
 Pass 39 began on the same qualified source after all six reviewers were READY and verified running together. Assignments rotated across deletion/shutdown/refresh, navigation and gestures, ordering/filter/preview, scheduler/focus, resource use and compaction, and user contract/validation.
 
 All six Pass 39 reviewers independently reported **NO FINDINGS**. Source and release binary hashes were checked after the final report and remain unchanged through both passes. Consecutive clean passes: **2**. Publication checks compare working, staged and committed source against the qualification digest before the authorized push.
+
+## Deletion indicators and file previews
+
+Queued and active deletion targets must be marked together with their descendants. Paused jobs stay marked, and cancellation clears coverage when the target is no longer queued or active. At 96 columns and wider, use a proportional 4:3 browser/preview split; text files show plain text and other file types show details. File preview work must stay bounded and off the input thread. Qualification and saturated review results are recorded below.
+
+Development checks removed duplicate preview reads after coalesced wakeups and stopped preview work during active deletion or guarded shutdown. Marker snapshots reuse queue retirement so large cancelled batches are not freed on the UI thread. A final tiny-terminal check found content reads with no visible text rows; the request gate now requires room below the preview title. The first compiler attempt also caught a missing test import. These corrections preceded qualification and formal review for this change.
+
+Qualification passed on frozen source `401e924e7a21354823d34eb3bea663fcf8e756406149e93656ebbb8fe3c8923b`: 268 unit tests plus 7 filesystem tests, formatting, warnings-denied Linux Clippy, macOS all-target compilation, the release build, the full PTY suite plus three reused corpora, and nine native/std/auto JSON comparisons. The macOS check retains three existing test-only warnings; macOS runtime was not tested. Terminal coverage includes text and metadata previews, 95/96/160-column layouts, inherited queued markers and cancellation, alongside existing navigation, filtering, visual selection, deletion and shutdown checks. Evidence: `.tmp/preview-checks.log`, `.tmp/qualified-preview.json`.
+
+Release binary: 2102624 bytes, SHA-256 `fefe466c2d4bda92264ce6dd33899c4eab50f7783f2b6ff8254b5ffda1f33e78`; 46576 bytes larger than the published baseline. No dependencies or per-scanned-entry fields were added. No throughput claim is made on the busy shared host. Linux previews reuse the scanner descriptor; other Unix systems retain the existing path-backed root limitation.
+
+Pass 40 began only after qualification and after all six READY reviewers were verified running simultaneously. Independent domains cover the file worker, inherited queue markers, UI geometry and interaction, deletion/scan/shutdown integration, resources and compaction, and contract/validation evidence.
+
+Pass 40 completed with one contract finding: built-in help still said previews required 120 columns and omitted the deletion marker. The other five reviewers reported **NO FINDINGS**. Help now describes the 96-column threshold, folder/text/file-detail previews, and the queued/deleting marker; the existing mode-specific help test checks the updated guidance. This resets the clean count to zero. Qualification is being repeated before the next fully saturated sweep.
+
+The help correction and updated help-scroll assertion passed fresh qualification: 268 unit plus 7 filesystem tests, formatting, Linux Clippy, macOS compilation, release build, four PTY corpora and nine backend comparisons. Qualified source: `e706f88a3c2b3c69df7ea843ccf615d9865ae015856a85b54c6382726162c4f8`. Binary size remains 2102624 bytes; SHA-256 `b04ed543ca3c1a3fd5a47acf5b61b077b3bfcb0c22a46f53a4df41ad26bd1eda`. Current evidence: `.tmp/preview-checks.log`, `.tmp/qualified-preview.json`. Earlier Pass 40 evidence was preserved separately in `.tmp/preview-pass40.log` and `.tmp/qualified-preview-pass40.json`.
+
+Pass 41 began after that qualification and after all six READY reviewers were verified running together. Domains rotated across UI interactions, file reads/decoding, queue coverage, resources/compaction, scan/deletion/shutdown integration, and contract/validation.
+
+All six Pass 41 reviewers independently reported **NO FINDINGS**. Source and release binary hashes were checked after the last report and are unchanged. Clean streak: **1**. Pass 42 is preparing with rotated assignments on this same qualified source.
+
+Pass 42 used all six slots, verified running together after READY and before RELEASE, with rotated domains on the same qualified source as Pass 41. Four reviewers reported **NO FINDINGS**. Two valid file-reader findings reset the streak: truncation relied on metadata length rather than actual read-limit/EOF evidence; and a non-UTF-16 binary containing NUL could consume up to 15 extra reads after classification was already certain. The correction will retain the read cap, avoid redundant content decoding, and test reads with inconsistent metadata lengths and a counting reader.
+
+Both Pass 42 findings are fixed. Metadata length is now only a bounded allocation hint; observed EOF and the 64 KiB read cap determine truncation. Binary detection stops further reads after a conclusive header or NUL-containing prefix, preserving split headers and UTF-16 BOMs. Text decoding runs once. Counted readers cover overstated and understated lengths, EOF, the read cap, one-byte chunks and early binary detection.
+
+Fresh qualification passed: 268 unit and 7 filesystem tests, formatting, warnings-denied Linux Clippy, macOS compilation, release build, four PTY corpora and nine backend comparisons. Source: `d741bdbc3126f5b5a701d19ca7ead767866c50ac669f7d07f28db5ff087ee3f4`. Release binary: 2102880 bytes, SHA-256 `6a48e981f8cf83fb07190442eac3a087c3921b740321138a5c56a77c6cbcebe8`. The existing macOS test-only warnings and runtime limitation remain; the busy host still precludes throughput timing claims. Evidence: `.tmp/preview-checks.log`, `.tmp/qualified-preview.json`. Pass 42 qualification evidence is preserved in `.tmp/preview-pass42.log` and `.tmp/qualified-preview-pass42.json`.
+
+Pass 43 began after fresh qualification and after all six READY reviewers were verified running together. Roles rotated across UI and navigation, queue coverage and retirement, file reading and decoding, performance and compaction, documentation and validation, and scan/deletion/shutdown integration.
+
+All six Pass 43 reviewers independently reported **NO FINDINGS**. Source and release binary hashes were checked after the last report and are unchanged. Clean streak: **1**. Pass 44 is preparing on the same qualified source with rotated assignments.
+
+Pass 44 began on the same qualified source after all six READY reviewers were verified running together. Rotated domains cover resources and compaction, file reader correctness, UI and interaction, marker/queue lifecycle, scanner/deletion/shutdown integration, and contract/validation evidence.
+
+All six Pass 44 reviewers independently reported **NO FINDINGS**. Working source and release binary hashes were verified unchanged after the last report. Passes 43 and 44 satisfy the two consecutive fully saturated clean sweeps required for completion. Publication compares working, staged and committed source against the qualification digest before pushing.

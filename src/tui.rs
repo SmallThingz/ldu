@@ -3,7 +3,8 @@ use crate::batch::{BatchCapture, BatchEvent};
 use crate::delete::{self, ConfirmedTarget};
 use crate::model::Model;
 use crate::order::{CachedOrderWorker, CachedRow, CachedSnapshot, OrderConfig};
-use crate::queue::{DeleteQueue, QueueId};
+use crate::preview::FilePreview;
+use crate::queue::{DeleteQueue, DeleteState, QueueId, QueueMarks};
 use crate::retire::Retirer;
 use crate::scan::{self, ScanHandle, ScanOptions};
 use crate::selection::{RangeMode, VisualSelection};
@@ -30,8 +31,8 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal};
 use std::panic::{self, PanicHookInfo};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -190,7 +191,7 @@ enum VisualIntent {
 #[derive(Default)]
 struct QueueView {
     status: String,
-    active: bool,
+    marks: QueueMarks,
     cancelling: bool,
     pending: usize,
     paused: bool,
@@ -286,6 +287,8 @@ struct App {
     unsent: Vec<CachedRow>,
     removals: Vec<NodeId>,
     preview: Preview,
+    file_preview: FilePreview,
+    file_anchor: Option<Arc<OnceLock<Arc<RootAnchor>>>>,
     navigation_until: Instant,
     pending_navigation: Option<Navigation>,
     scan_entries: Option<(NodeId, std::vec::IntoIter<Entry>)>,
@@ -337,6 +340,7 @@ impl App {
             positions: HashMap::new(),
         });
         let preview = Preview::new(Arc::clone(&empty));
+        let file_preview = FilePreview::new()?;
         Ok(Self {
             model: Model::new(root.clone()),
             root,
@@ -358,6 +362,8 @@ impl App {
             unsent: Vec::new(),
             removals: Vec::new(),
             preview,
+            file_preview,
+            file_anchor: None,
             navigation_until: Instant::now(),
             pending_navigation: None,
             scan_entries: None,
@@ -1457,8 +1463,8 @@ impl App {
         Action::Continue
     }
 
-    fn sync_queue(&mut self, queue: &DeleteQueue) {
-        self.queue_view.active = queue.active().is_some();
+    fn sync_queue(&mut self, queue: &mut DeleteQueue) {
+        queue.sync_marks(&mut self.queue_view.marks);
         self.queue_view.cancelling = queue.is_cancelling();
         self.queue_view.pending = queue.pending().len();
         self.queue_view.paused = queue.is_paused();
@@ -2382,6 +2388,24 @@ impl App {
         text
     }
 
+    fn deletion_state(&self, mut id: NodeId) -> DeleteState {
+        let mut state = DeleteState::default();
+        if self.queue_view.marks.is_empty() || !self.model.is_live(id) {
+            return state;
+        }
+        loop {
+            state = self.queue_view.marks.include(id, state);
+            let Some(parent) = self.model.node(id).parent else {
+                return state;
+            };
+            id = parent;
+        }
+    }
+
+    fn deleting(&self, id: NodeId) -> bool {
+        self.deletion_state(id).is_deleting()
+    }
+
     fn row(
         &self,
         id: NodeId,
@@ -2389,7 +2413,9 @@ impl App {
         width: u16,
         selected: bool,
         spinner: &'static str,
+        state: DeleteState,
     ) -> Line<'static> {
+        let deleting = self.queue_view.marks.include(id, state).is_deleting();
         let node = self.model.node(id);
         let size = self.size(id);
         let size_label = if node.kind == NodeKind::Unknown {
@@ -2458,8 +2484,17 @@ impl App {
             Color::White
         };
         spans.push(Span::styled(
-            format!("{} ", if node.complete { " " } else { spinner }),
-            Style::default().fg(Color::Gray),
+            format!(
+                "{} ",
+                if deleting {
+                    "×"
+                } else if node.complete {
+                    " "
+                } else {
+                    spinner
+                }
+            ),
+            Style::default().fg(if deleting { Color::Red } else { Color::Gray }),
         ));
         spans.push(Span::styled(name, Style::default().fg(color)));
         let line = Line::from(spans);
@@ -2583,22 +2618,37 @@ impl App {
             area.width,
             area.height.saturating_sub(1),
         );
+        let (body, preview_area) = preview_layout(body);
         let hovered = self.selected.filter(|&id| {
-            area.width >= 120
+            preview_area.is_some()
                 && self.eligible(id)
-                && self.model.node(id).kind == NodeKind::Directory
+                && self.model.node(id).parent == Some(self.directory)
         });
-        self.order.prioritize(self.directory, hovered);
-        self.preview.sync(hovered, &self.order, &self.model);
-        let (body, preview_area) = if hovered.is_some() {
-            let parts = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(70), Constraint::Length(46)])
-                .split(body);
-            (parts[0], Some(parts[1]))
+        let directory = hovered.filter(|&id| self.model.node(id).kind == NodeKind::Directory);
+        self.order.prioritize(self.directory, directory);
+        self.preview.sync(directory, &self.order, &self.model);
+        if let Some(id) = hovered.filter(|&id| {
+            preview_area.is_some_and(|area| area.height > 1)
+                && self.model.node(id).kind == NodeKind::File
+                && !self.deleting(id)
+                && self.queue_view.marks.active.is_none()
+                && !matches!(self.modal, Some(Modal::Quit { .. } | Modal::Stopping))
+        }) {
+            if self.file_preview.selected() != Some(id) {
+                if let Some(anchor) = self
+                    .file_anchor
+                    .as_ref()
+                    .and_then(|anchor| anchor.get())
+                    .cloned()
+                {
+                    if let Ok(relative) = self.model.path(id).strip_prefix(&self.root) {
+                        self.file_preview.request(id, anchor, relative.to_owned());
+                    }
+                }
+            }
         } else {
-            (body, None)
-        };
+            self.file_preview.clear();
+        }
         self.list_area = body;
         let page_size = usize::from(body.height).clamp(1, VIEW_BUDGET);
         let resized = self.page_size != page_size;
@@ -2639,8 +2689,16 @@ impl App {
         self.painted_offset = painted_offset;
         self.painted_directory = self.directory;
         let mut lines = Vec::with_capacity(self.page_size);
+        let state = self.deletion_state(self.directory);
         for &id in &self.painted_rows {
-            lines.push(self.row(id, total, body.width, self.selected == Some(id), spinner));
+            lines.push(self.row(
+                id,
+                total,
+                body.width,
+                self.selected == Some(id),
+                spinner,
+                state,
+            ));
         }
         if lines.is_empty() {
             let message = if !self.filter.is_empty() {
@@ -2679,46 +2737,89 @@ impl App {
                 preview_area.width.saturating_sub(2),
                 preview_area.height,
             );
+            let contents = self.file_preview.snapshot();
             let mut rows = vec![
-                Line::from("Contents").style(
+                Line::from(if directory.is_some() {
+                    "Contents"
+                } else {
+                    "Preview"
+                })
+                .style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
-            for &id in self.preview.view.ids.iter().take(1024) {
-                if rows.len() >= usize::from(pane.height) {
-                    break;
+            if let Some(directory) = directory {
+                let state = self.deletion_state(directory);
+                for &id in self.preview.view.ids.iter().take(1024) {
+                    if rows.len() >= usize::from(pane.height) {
+                        break;
+                    }
+                    if !self.eligible(id) {
+                        continue;
+                    }
+                    rows.push(self.row(
+                        id,
+                        self.size(directory),
+                        pane.width,
+                        false,
+                        spinner,
+                        state,
+                    ));
                 }
-                if !self.eligible(id) {
-                    continue;
+                if rows.len() == 1 {
+                    let node = self.model.node(directory);
+                    let message =
+                        if self
+                            .model
+                            .has_children(directory, false, self.config.show_hidden)
+                        {
+                            "Ordering entries…"
+                        } else if node.error_count > 0 {
+                            "Partial listing; press i for details."
+                        } else if !self.model.listing_complete(directory) {
+                            "Waiting for scan…"
+                        } else {
+                            "No child entries."
+                        };
+                    rows.push(Line::from(message).style(Style::default().fg(Color::DarkGray)));
                 }
-                rows.push(self.row(
-                    id,
-                    self.size(hovered.expect("preview has a hovered directory")),
-                    pane.width,
-                    false,
-                    spinner,
-                ));
-            }
-            if rows.len() == 1 {
-                let directory = self
-                    .model
-                    .node(hovered.expect("preview has a hovered directory"));
-                let message = if self.model.has_children(
-                    hovered.expect("preview has a hovered directory"),
-                    false,
-                    self.config.show_hidden,
-                ) {
-                    "Ordering entries…"
-                } else if directory.error_count > 0 {
-                    "Partial listing; press i for details."
-                } else if !self.model.listing_complete(hovered.unwrap()) {
-                    "Waiting for scan…"
+            } else if let Some(id) = hovered {
+                if let Some(text) = contents
+                    .as_ref()
+                    .and_then(|contents| contents.text.as_deref())
+                {
+                    let truncated = contents.as_ref().is_some_and(|contents| contents.truncated);
+                    let limit = usize::from(pane.height).saturating_sub(1 + usize::from(truncated));
+                    rows.extend(text.lines().take(limit).map(Line::from));
+                    if truncated {
+                        rows.push(Line::from("…").style(Style::default().fg(Color::DarkGray)));
+                    }
                 } else {
-                    "No child entries."
-                };
-                rows.push(Line::from(message).style(Style::default().fg(Color::DarkGray)));
+                    let node = self.model.node(id);
+                    let kind = if self.deleting(id) {
+                        "Marked for deletion"
+                    } else {
+                        contents.as_ref().map_or(
+                            match node.kind {
+                                NodeKind::File => "File",
+                                NodeKind::Symlink => "Symlink",
+                                _ => "Special file",
+                            },
+                            |contents| contents.kind,
+                        )
+                    };
+                    rows.extend([
+                        Line::from(kind),
+                        Line::from(format!("Size  {}", human_size(node.sizes.apparent))),
+                        Line::from(format!("Disk  {}", human_size(node.sizes.allocated))),
+                    ]);
+                }
+            } else {
+                rows.push(
+                    Line::from("No entry selected").style(Style::default().fg(Color::DarkGray)),
+                );
             }
             frame.render_widget(Paragraph::new(rows), pane);
         }
@@ -2726,6 +2827,22 @@ impl App {
             draw_modal(frame, area, modal, &mut self.queue_view);
         }
     }
+}
+
+fn preview_layout(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < 96 {
+        return (area, None);
+    }
+    let width = (u32::from(area.width) * 4 / 7) as u16;
+    (
+        Rect::new(area.x, area.y, width, area.height),
+        Some(Rect::new(
+            area.x + width,
+            area.y,
+            area.width - width,
+            area.height,
+        )),
+    )
 }
 
 fn spinner_frame(tick: u128) -> &'static str {
@@ -2851,7 +2968,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: &mut Modal, queue: &mut 
             queue.visible_rows = usize::from(regions[1].height).min(12);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let summary = if queue.active {
+            let summary = if queue.marks.active.is_some() {
                 queue.status.clone()
             } else if queue.pending == 0 {
                 "No deletions queued".to_owned()
@@ -3162,11 +3279,11 @@ c / x              Cancel active job / remove waiting job
 Shift+↑↓ / K/J     Reorder waiting job
 D / Esc            Close queue
 
-⠋ unfinished entry    ~ partial size    ! read error
+⠋ unfinished    × queued/deleting    ~ partial size    ! read error
 Sorting includes unfinished entries.
 Near-size groups retain their previous order.
 Graph shows the share of known directory size.
-At 120+ columns, preview shows files and directories.
+Preview (96+ columns): folder contents, text, or file details.
 Symlinks are not followed; hardlinks counted once.";
 
 struct DeleteRequest {
@@ -3812,7 +3929,10 @@ fn stop_scanning(scanner: &ScanHandle, scopes: &[ScopedScan]) {
     }
 }
 
-fn prioritize_deletion(scanner: &ScanHandle, scopes: &[ScopedScan], deleting: bool) {
+fn prioritize_deletion(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], deleting: bool) {
+    if deleting || matches!(app.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
+        app.file_preview.clear();
+    }
     scanner.set_paused(deleting);
     for scope in scopes {
         scope.handle.set_paused(deleting);
@@ -3857,6 +3977,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         return Ok(());
     }
     let scanner = scan::spawn(root, options.clone());
+    app.file_anchor = Some(Arc::clone(&scanner.anchor));
     let mut queue = DeleteQueue::new()?;
     let mut scopes = Vec::new();
     let scope_retirer = Retirer::<Vec<ScopedScan>>::new()?;
@@ -3899,7 +4020,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         {
             break;
         }
-        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
+        prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
         let interrupt = take_interrupt(&interrupts);
         let input = if interrupt {
             Ok(true)
@@ -4052,11 +4173,11 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         if !quitting {
                             queue.start_next();
                         }
-                        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
+                        prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
                         app.pump_visual();
                         app.show_delete_notice();
                         prioritize_requested(&mut app, &scanner, &scopes);
-                        app.sync_queue(&queue);
+                        app.sync_queue(&mut queue);
                         // Paint input immediately, before bounded background event work.
                         if failure.is_none() {
                             if let Err(error) = terminal.draw(|frame| {
@@ -4076,7 +4197,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         app.pump_visual();
                         app.show_delete_notice();
                         prioritize_requested(&mut app, &scanner, &scopes);
-                        app.sync_queue(&queue);
+                        app.sync_queue(&mut queue);
                         if let Err(error) = terminal.draw(|frame| {
                             app.draw(
                                 frame,
@@ -4200,12 +4321,12 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                 }
             }
         }
-        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
+        prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
         if !quitting && app.show_delete_notice() {
             next_frame = Instant::now();
         }
         if Instant::now() >= next_frame {
-            app.sync_queue(&queue);
+            app.sync_queue(&mut queue);
             if failure.is_none() {
                 if let Err(error) = terminal.draw(|frame| {
                     app.draw(
@@ -4556,11 +4677,25 @@ mod tests {
         terminal
             .draw(|frame| {
                 frame.render_widget(
-                    Paragraph::new(app.row(5, 24, 80, false, spinner_frame(0))),
+                    Paragraph::new(app.row(
+                        5,
+                        24,
+                        80,
+                        false,
+                        spinner_frame(0),
+                        DeleteState::default(),
+                    )),
                     Rect::new(0, 0, 80, 1),
                 );
                 frame.render_widget(
-                    Paragraph::new(app.row(5, 24, 44, false, spinner_frame(1))),
+                    Paragraph::new(app.row(
+                        5,
+                        24,
+                        44,
+                        false,
+                        spinner_frame(1),
+                        DeleteState::default(),
+                    )),
                     Rect::new(0, 1, 44, 1),
                 );
             })
@@ -4587,7 +4722,7 @@ mod tests {
         let _ = app
             .model
             .apply(ScanEvent::DirectoryDone { id: 5, error: None });
-        let complete = app.row(5, 24, 44, false, spinner_frame(0));
+        let complete = app.row(5, 24, 44, false, spinner_frame(0), DeleteState::default());
         assert!(!complete.to_string().contains('⠋'));
     }
 
@@ -4715,7 +4850,7 @@ mod tests {
         // without treating border cells as part of a logical sentence.
         assert!(
             last.contains("Help")
-                && last.contains("directories.")
+                && last.contains("file details.")
                 && last.contains("counted once.")
         );
         assert!(last.contains("Enter / Esc: close"));
@@ -5001,19 +5136,19 @@ mod tests {
             selected: None,
             offset: None,
         });
-        app.sync_queue(&queue);
+        app.sync_queue(&mut queue);
         app.queue_navigate(&queue, None, 1);
-        app.sync_queue(&queue);
+        app.sync_queue(&mut queue);
         assert_eq!(app.queue_selection(), Some(selected));
         assert!(queue.move_pending(selected, 1));
-        app.sync_queue(&queue);
+        app.sync_queue(&mut queue);
         assert_eq!(app.queue_selection(), Some(selected));
         queue.remove_pending(first);
-        app.sync_queue(&queue);
+        app.sync_queue(&mut queue);
         assert_eq!(app.queue_selection(), Some(selected));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
         terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
-        app.sync_queue(&queue);
+        app.sync_queue(&mut queue);
         terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
         assert!(rendered(&terminal).contains("Deletion queue"));
         assert!(rendered(&terminal).contains("unmodified-selected"));
@@ -7704,8 +7839,16 @@ mod tests {
         app.visual.enter(ROOT, Some(1));
         app.visual.toggle(2);
         app.selected = Some(2);
-        assert!(app.row(1, 30, 80, false, " ").to_string().starts_with('✓'));
-        assert!(app.row(2, 30, 80, true, " ").to_string().starts_with('›'));
+        assert!(
+            app.row(1, 30, 80, false, " ", DeleteState::default())
+                .to_string()
+                .starts_with('✓')
+        );
+        assert!(
+            app.row(2, 30, 80, true, " ", DeleteState::default())
+                .to_string()
+                .starts_with('›')
+        );
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
@@ -7713,7 +7856,9 @@ mod tests {
         assert!(rendered(&terminal).contains("Visual 2"));
         app.visual.toggle(2);
         assert_eq!(
-            app.row(2, 30, 80, true, " ").style.bg,
+            app.row(2, 30, 80, true, " ", DeleteState::default())
+                .style
+                .bg,
             Some(Color::DarkGray)
         );
     }
@@ -7975,7 +8120,7 @@ mod tests {
         let changed = app.model.mark_partial(1);
         app.changed(changed);
         assert!(app.info().contains("Partial total"));
-        let row = app.row(1, 22, 80, false, spinner_frame(0));
+        let row = app.row(1, 22, 80, false, spinner_frame(0), DeleteState::default());
         assert!(row.to_string().contains('~'));
     }
 
@@ -8015,7 +8160,14 @@ mod tests {
                     !parent_metadata_available
                 );
                 let row = app
-                    .row(parent, app.size(ROOT), 80, false, spinner_frame(0))
+                    .row(
+                        parent,
+                        app.size(ROOT),
+                        80,
+                        false,
+                        spinner_frame(0),
+                        DeleteState::default(),
+                    )
                     .to_string();
                 assert_eq!(row.contains('~'), !parent_metadata_available);
                 assert!(!row.contains(spinner_frame(0)));
@@ -8164,7 +8316,7 @@ mod tests {
             .find(|cell| (0..10).any(|tick| cell.symbol() == spinner_frame(tick)))
             .unwrap();
         assert_eq!(marker.fg, Color::Gray);
-        terminal.backend_mut().resize(119, 12);
+        terminal.backend_mut().resize(95, 12);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8176,6 +8328,150 @@ mod tests {
             .unwrap();
         assert!(!rendered(&terminal).contains("Contents"));
     }
+    #[test]
+    fn preview_layout_scales_and_keeps_mouse_hits_in_the_main_pane() {
+        for width in [0, 1, 95, 96, 120, 160, u16::MAX] {
+            let area = Rect::new(0, 1, width, 10);
+            let (main, preview) = preview_layout(area);
+            if width < 96 {
+                assert_eq!(main, area);
+                assert!(preview.is_none());
+            } else {
+                let preview = preview.unwrap();
+                assert_eq!(u32::from(main.width), u32::from(width) * 4 / 7);
+                assert_eq!(main.right(), preview.x);
+                assert_eq!(main.width + preview.width, width);
+            }
+        }
+        let mut app = browser_fixture();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(96, 12)).unwrap();
+        for selected in [Some(1), Some(2), None] {
+            app.selected = selected;
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert_eq!(app.list_area.width, 54);
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 55,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.selected, selected);
+            assert!(
+                app.file_preview.selected().is_none(),
+                "no scan anchor means no file I/O"
+            );
+        }
+    }
+
+    #[test]
+    fn file_preview_is_async_clears_old_text_and_stops_on_narrow_resize() {
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        std::fs::write(
+            fixture.path().join("root-file"),
+            "preview hello\nsecond line\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path().join("binary-file"), [0, 1, 2]).unwrap();
+        let mut app = browser_fixture_at(fixture.path().to_owned());
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(6, "binary-file", NodeKind::File, 3)],
+            },
+        );
+        wait_cache(&mut app, ROOT, &[1, 2, 6]);
+        app.sync_order(true);
+        let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+        app.file_anchor = Some(Arc::new(OnceLock::from(anchor)));
+        app.selected = Some(2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(95, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(app.file_preview.selected().is_none());
+        terminal.backend_mut().resize(120, 12);
+        for (id, expected) in [(2, "preview hello"), (6, "Binary")] {
+            app.selected = Some(id);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert_eq!(app.file_preview.selected(), Some(id));
+            if id == 6 {
+                assert!(!rendered(&terminal).contains("preview hello"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.file_preview.snapshot().is_none() {
+                assert!(Instant::now() < deadline, "file preview did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let screen = rendered(&terminal);
+            assert!(screen.contains("Preview") && screen.contains(expected));
+            if id == 6 {
+                assert!(screen.contains("Size") && screen.contains("Disk"));
+            }
+        }
+        app.selected = Some(2);
+        app.queue_view.pending = 1;
+        app.queue_view.paused = true;
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert_eq!(
+            app.file_preview.selected(),
+            Some(2),
+            "paused unrelated jobs allow previews"
+        );
+        for blocked in 0..3 {
+            match blocked {
+                0 => app.queue_view.marks.active = Some(1),
+                1 => app.modal = Some(Modal::Quit { reviewable: false }),
+                _ => app.modal = Some(Modal::Stopping),
+            }
+            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            assert!(app.file_preview.selected().is_none() && app.file_preview.snapshot().is_none());
+            app.queue_view.marks.active = None;
+            app.modal = None;
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert_eq!(app.file_preview.selected(), Some(2));
+        }
+        for height in [0, 1, 2] {
+            terminal.backend_mut().resize(120, height);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(app.file_preview.selected().is_none() && app.file_preview.snapshot().is_none());
+            terminal.backend_mut().resize(120, 3);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert_eq!(app.file_preview.selected(), Some(2));
+        }
+        terminal.backend_mut().resize(95, 12);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(app.file_preview.selected().is_none() && app.file_preview.snapshot().is_none());
+        assert_eq!(app.list_area.width, 95);
+        terminal.backend_mut().resize(160, 12);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(app.file_preview.selected(), Some(2));
+        assert_eq!(app.list_area.width, 91);
+        app.selected = Some(1);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(app.file_preview.selected().is_none());
+        assert!(rendered(&terminal).contains("Contents"));
+    }
+
     #[test]
     fn preview_uses_live_entry_kinds_in_a_warmed_snapshot() {
         for kind in [NodeKind::File, NodeKind::Symlink] {
@@ -8285,6 +8581,45 @@ mod tests {
         let screen = rendered(&terminal);
         assert!(screen.contains("remove-me") && screen.contains("survivor"));
         assert!(screen.contains("child-folder/"));
+    }
+
+    #[test]
+    fn deletion_rows_mark_confirmed_targets_and_descendants_in_both_panes() {
+        let mut app = browser_fixture();
+        let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+        let mut queue = DeleteQueue::new().unwrap();
+        queue.toggle_pause();
+        let job = queue.enqueue(1, anchor, "folder".into()).id;
+        app.sync_queue(&mut queue);
+        assert!(!app.deleting(ROOT) && !app.deleting(2));
+        assert!(app.deleting(1) && app.deleting(3) && app.deleting(5));
+        for (id, parent) in [(1, ROOT), (3, 1), (5, 1)] {
+            let row = app.row(
+                id,
+                30,
+                80,
+                false,
+                spinner_frame(0),
+                app.deletion_state(parent),
+            );
+            assert!(row.to_string().contains("× "));
+            assert!(
+                row.spans
+                    .iter()
+                    .any(|span| span.content == "× " && span.style.fg == Some(Color::Red))
+            );
+            assert!(!row.to_string().contains(spinner_frame(0)));
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert!(rendered(&terminal).matches('×').count() >= 4);
+        queue.remove_pending(job).unwrap();
+        app.sync_queue(&mut queue);
+        assert!(!app.deleting(1) && !app.deleting(3) && !app.deleting(5));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(!rendered(&terminal).contains('×'));
     }
 
     #[test]
@@ -8975,6 +9310,7 @@ mod tests {
             };
             assert_eq!(*title, "Help");
             assert!(text.contains(COMMON_HELP));
+            assert!(text.contains("× queued/deleting") && text.contains("Preview (96+ columns)"));
             assert!(text.contains(if visual { VISUAL_HELP } else { NORMAL_HELP }));
             assert!(!text.contains(if visual { NORMAL_HELP } else { VISUAL_HELP }));
         }

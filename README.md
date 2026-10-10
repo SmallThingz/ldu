@@ -10,7 +10,7 @@ Terminal disk-usage browser written in Rust. Browse folder sizes while a paralle
 
 - Live totals with scan work balanced by entries checked
 - Gray Braille spinners beside folders still scanning
-- Cached sorted directory views, with matching contents previews on wide terminals
+- Cached sorted directory views, text previews and file metadata
 - Fractional block bars for size distribution
 - Cancellable FIFO deletion queue that updates totals without restarting the scan
 - Scoped refresh of the selected folder or current directory
@@ -101,11 +101,13 @@ In visual mode, click to toggle a row, or drag to add a range. Shift-click adds 
 
 After batch confirmation, an `Enqueueing selection` dialog stays open until the entries join the queue. `n` or Escape stops adding the remaining entries; already queued deletions continue. `q` or Ctrl-C opens a warning while confirmed deletions finish.
 
-In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down or `K`/`J` reorders, and `d` removes the selected waiting job or cancels the active job. `c` cancels the active job. Scanning pauses while deletion is active and resumes afterward.
+In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down or `K`/`J` reorders, and `d` removes the selected waiting job or cancels the active job. `c` cancels the active job. Scanning pauses while deletion is active and resumes afterward. A red `×` marks queued or active deletion targets and their descendants in the main list and directory preview.
 
 With confirmed deletions pending, the first `q` or Ctrl-C stops scans and waits for deletion to finish, then exits. A deletion error hidden by the warning is reported after the terminal is restored. Queue pause still applies. A second Ctrl-C cancels all deletions and quits. `n` or Escape keeps browsing; stopped scans stay stopped until you refresh with `r` or `R`.
 
-Allocated disk usage is the default. Scanning and finished entries sort together. At startup, the cursor stays at the top until you navigate or select an entry. Afterward, live reordering follows the selected entry and keeps up to three rows visible above and below it where space allows. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, the selected directory's files and folders appear in a Contents preview beside the main list.
+Allocated disk usage is the default. Scanning and finished entries sort together. At startup, the cursor stays at the top until you navigate or select an entry. Afterward, live reordering follows the selected entry and keeps up to three rows visible above and below it where space allows. Hovering over or entering an unfinished folder gives its scan priority.
+
+At 96 columns or wider, the list and preview share the width in a 4:3 ratio. The preview shows directory contents, text, or metadata for binary files such as images and PDFs.
 
 [Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md) · [Review results](REVIEW.md)
 

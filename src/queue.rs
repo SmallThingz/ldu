@@ -14,6 +14,41 @@ use std::sync::Arc;
 pub type QueueId = u64;
 type Paths = HashMap<usize, OrdMap<Arc<[OsString]>, QueueId>>;
 
+#[derive(Clone, Default)]
+pub struct QueueMarks {
+    pending: HashMap<NodeId, QueueId>,
+    superseded: HashMap<NodeId, QueueId>,
+    pub active: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DeleteState {
+    latest: Option<QueueId>,
+    cutoff: QueueId,
+    active: bool,
+}
+
+impl QueueMarks {
+    pub fn is_empty(&self) -> bool {
+        self.active.is_none() && self.pending.is_empty()
+    }
+
+    pub fn include(&self, node: NodeId, mut state: DeleteState) -> DeleteState {
+        state.latest = state.latest.max(self.pending.get(&node).copied());
+        state.cutoff = state
+            .cutoff
+            .max(self.superseded.get(&node).copied().unwrap_or(0));
+        state.active |= self.active == Some(node);
+        state
+    }
+}
+
+impl DeleteState {
+    pub fn is_deleting(self) -> bool {
+        self.active || self.latest.is_some_and(|id| id >= self.cutoff)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueEntry {
     pub id: QueueId,
@@ -46,6 +81,7 @@ struct PendingNode {
 #[derive(Default)]
 pub struct PendingQueue {
     entries: HashMap<QueueId, PendingNode>,
+    targets: HashMap<NodeId, QueueId>,
     first: Option<QueueId>,
     last: Option<QueueId>,
 }
@@ -81,6 +117,7 @@ impl PendingQueue {
 
     fn push_back(&mut self, entry: QueueEntry) {
         let id = entry.id;
+        self.targets.insert(entry.node, id);
         self.entries.insert(
             id,
             PendingNode {
@@ -102,6 +139,9 @@ impl PendingQueue {
 
     fn remove(&mut self, id: QueueId) -> Option<QueueEntry> {
         let node = self.entries.remove(&id)?;
+        if self.targets.get(&node.entry.node) == Some(&id) {
+            self.targets.remove(&node.entry.node);
+        }
         if let Some(previous) = node.previous {
             self.entries
                 .get_mut(&previous)
@@ -247,6 +287,7 @@ impl Worker {
 #[derive(Clone)]
 struct Prune {
     anchor: usize,
+    node: NodeId,
     ancestor: QueueId,
     prefix: Arc<[OsString]>,
     // A cheap persistent snapshot fixes which already-confirmed jobs were
@@ -255,6 +296,9 @@ struct Prune {
 }
 
 enum Retired {
+    Marks {
+        _marks: QueueMarks,
+    },
     Entry {
         _entry: QueueEntry,
     },
@@ -265,6 +309,7 @@ enum Retired {
         _pending: PendingQueue,
         _paths: Paths,
         _superseded: Paths,
+        _superseded_nodes: HashMap<NodeId, QueueId>,
         _pruning: Vector<Prune>,
     },
 }
@@ -275,6 +320,7 @@ pub struct DeleteQueue {
     pending: PendingQueue,
     paths: Paths,
     superseded: Paths,
+    superseded_nodes: HashMap<NodeId, QueueId>,
     pruning: Vector<Prune>,
     active: Option<ActiveDelete>,
     paused: bool,
@@ -289,6 +335,7 @@ impl DeleteQueue {
             pending: PendingQueue::default(),
             paths: Paths::new(),
             superseded: Paths::new(),
+            superseded_nodes: HashMap::new(),
             pruning: Vector::new(),
             active: None,
             paused: false,
@@ -365,18 +412,40 @@ impl DeleteQueue {
             target,
         });
         if let Some(paths) = superseded {
+            self.superseded_nodes.insert(node, id);
             self.superseded
                 .entry(root)
                 .or_default()
                 .insert(components.clone(), id);
             self.pruning.push_back(Prune {
                 anchor: root,
+                node,
                 ancestor: id,
                 prefix: components,
                 paths,
             });
         }
         EnqueueOutcome { id, inserted: true }
+    }
+
+    pub fn sync_marks(&mut self, marks: &mut QueueMarks) {
+        let active = self.active().map(|entry| entry.node);
+        if marks.active == active
+            && marks.pending.ptr_eq(&self.pending.targets)
+            && marks.superseded.ptr_eq(&self.superseded_nodes)
+        {
+            return;
+        }
+        let previous = std::mem::replace(
+            marks,
+            QueueMarks {
+                pending: self.pending.targets.clone(),
+                superseded: self.superseded_nodes.clone(),
+                active,
+            },
+        );
+        self.retired.push(Retired::Marks { _marks: previous });
+        self.flush_retired();
     }
 
     pub fn active(&self) -> Option<&QueueEntry> {
@@ -499,6 +568,7 @@ impl DeleteQueue {
             _pending: std::mem::take(&mut self.pending),
             _paths: std::mem::take(&mut self.paths),
             _superseded: std::mem::take(&mut self.superseded),
+            _superseded_nodes: std::mem::take(&mut self.superseded_nodes),
             _pruning: std::mem::take(&mut self.pruning),
         });
         self.flush_retired();
@@ -583,6 +653,9 @@ impl DeleteQueue {
                 changed = true;
             } else {
                 let prune = self.pruning.pop_front().expect("prune exists");
+                if self.superseded_nodes.get(&prune.node) == Some(&prune.ancestor) {
+                    self.superseded_nodes.remove(&prune.node);
+                }
                 if let Some(markers) = self.superseded.get_mut(&prune.anchor) {
                     if markers.get(&prune.prefix) == Some(&prune.ancestor) {
                         markers.remove(&prune.prefix);
@@ -1099,6 +1172,74 @@ mod tests {
             next_worker.finish();
             assert!(queue.poll().unwrap().result.outcome.is_ok());
             assert!(!queue.is_busy());
+        }
+    }
+
+    #[test]
+    fn deletion_marks_follow_supersession_cancellation_and_same_node_reconfirmation() {
+        let anchor = anchor();
+        let mut queue = DeleteQueue::new().unwrap();
+        let mut marks = QueueMarks::default();
+        let marked = |marks: &QueueMarks, ids: &[NodeId]| {
+            ids.iter()
+                .fold(DeleteState::default(), |state, &id| {
+                    marks.include(id, state)
+                })
+                .is_deleting()
+        };
+        queue.toggle_pause();
+        queue.enqueue(2, Arc::clone(&anchor), "parent/child".into());
+        let parent = queue.enqueue(1, Arc::clone(&anchor), "parent".into()).id;
+        queue.sync_marks(&mut marks);
+        assert!(marked(&marks, &[2, 1]) && marked(&marks, &[3, 1]));
+        queue.remove_pending(parent).unwrap();
+        queue.sync_marks(&mut marks);
+        // The child is still physically queued but cannot run after supersession.
+        assert!(queue.is_updating() && !queue.pending().is_empty());
+        assert!(!marked(&marks, &[2, 1]) && !marked(&marks, &[3, 1]));
+        let fresh = queue
+            .enqueue(2, Arc::clone(&anchor), "parent/child".into())
+            .id;
+        queue.sync_marks(&mut marks);
+        assert!(marked(&marks, &[2, 1]) && !marked(&marks, &[3, 1]));
+        while queue.is_updating() {
+            queue.pump(1);
+        }
+        queue.sync_marks(&mut marks);
+        assert!(marked(&marks, &[2, 1]));
+        queue.remove_pending(fresh).unwrap();
+        queue.sync_marks(&mut marks);
+        assert!(marks.is_empty() && !marked(&marks, &[2, 1]));
+    }
+
+    #[test]
+    fn deletion_marks_retain_active_work_until_completion_and_keep_fresh_targets() {
+        for keep_fresh in [false, true] {
+            let anchor = anchor();
+            let mut queue = DeleteQueue::new().unwrap();
+            let mut marks = QueueMarks::default();
+            queue.enqueue(1, Arc::clone(&anchor), "parent".into());
+            let worker = start(&mut queue).unwrap();
+            queue.cancel_active();
+            queue.toggle_pause();
+            queue.enqueue(1, Arc::clone(&anchor), "parent".into());
+            if !keep_fresh {
+                queue.cancel_all();
+            }
+            queue.sync_marks(&mut marks);
+            assert!(marks.include(1, DeleteState::default()).is_deleting());
+            worker.send_result(Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+            assert!(queue.poll().is_none());
+            worker.finish();
+            queue.poll().unwrap();
+            queue.sync_marks(&mut marks);
+            assert_eq!(
+                marks.include(1, DeleteState::default()).is_deleting(),
+                keep_fresh
+            );
+            queue.cancel_all();
+            queue.sync_marks(&mut marks);
+            assert!(marks.is_empty());
         }
     }
 }

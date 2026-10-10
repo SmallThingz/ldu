@@ -176,6 +176,14 @@ class Screen:
         # A diff can briefly contain both the old and new highlighted rows.
         return rows[0] if len(rows) == 1 else None
 
+    def main_line(self, row):
+        split = self.cols * 4 // 7
+        end = split if self.cols >= 96 and self.cells[row][split] == "│" else self.cols
+        return "".join(self.cells[row][:end])
+
+    def main_rows(self):
+        return (self.main_line(row) for row in range(1, self.rows))
+
     def text(self, header=False):
         rows = self.cells[:1] if header else self.cells
         return "\n".join("".join(row) for row in rows)
@@ -396,7 +404,7 @@ def measured_key(session, key, predicate, description):
 
 
 def first_row(session):
-    return "".join(session.screen.cells[1]) if session.screen.rows > 1 else ""
+    return session.screen.main_line(1) if session.screen.rows > 1 else ""
 
 
 def settled_home(session, predicate, description, multiple=True):
@@ -423,12 +431,13 @@ def enter_directory(session, root, names):
 
 
 def preview_rows(session):
-    rows = []
-    for cells in session.screen.cells[1:]:
-        line = "".join(cells)
-        if "│" in line:
-            rows.append(line.split("│", 1)[1])
-    return rows
+    split = session.screen.cols * 4 // 7
+    return ["".join(cells[split + 1:]) for cells in session.screen.cells[1:]
+            if session.screen.cols >= 96 and cells[split] == "│"]
+
+
+def preview_text(session):
+    return "\n".join(preview_rows(session))
 
 
 def preview_fixture_ready(session):
@@ -585,7 +594,7 @@ def check_hidden_and_delete(session, root):
         transcript = len(session.raw)
         session.key(confirm)
         session.wait(lambda: not victim.exists(), "confirmed asynchronous deletion did not remove the owned victim")
-        session.wait(lambda: "Delete?" not in session.screen.text() and session.screen.normal_view() and not any("".join(row).rstrip().endswith(" " + filename) for row in session.screen.cells[1:])
+        session.wait(lambda: "Delete?" not in session.screen.text() and session.screen.normal_view() and not any(row.rstrip().endswith(" " + filename) for row in session.screen.main_rows())
                      and "Scan complete" in session.screen.text(header=True), "deleted row did not leave the current view")
         assert "/large" in session.screen.text(header=True), "successful deletion changed the current directory"
         assert not any(marker in session.raw[transcript:] for marker in (b"Deleted:", b"Refreshing", b"Waiting to scan")), "successful deletion started a notice or full rescan"
@@ -599,14 +608,19 @@ def fixture_selection(session, name, directory=False):
     session.key(b"\x1b[H")
     session.wait(lambda: session.screen.selected_row() == 1,
                  "Home did not select the first fixture row")
-    row = next((index for index, cells in enumerate(session.screen.cells[1:], 1)
-                if "".join(cells).rstrip().endswith(suffix)), None)
+    row = next((index for index, line in enumerate(session.screen.main_rows(), 1)
+                if line.rstrip().endswith(suffix)), None)
     assert row is not None, f"owned fixture row missing: {name}\n{session.screen.text()}"
     for _ in range(row - 1):
         session.key(b"j")
     session.wait(lambda: session.screen.selected_row() == row
-                 and "".join(session.screen.cells[row]).rstrip().endswith(suffix),
+                 and session.screen.main_line(row).rstrip().endswith(suffix),
                  f"fixture selection did not reach {name}")
+
+
+def deletion_marks(session, names):
+    return {name: "×" in row for row in session.screen.main_rows()
+            for name in names if row.rstrip().endswith(" " + name)}
 
 
 def fixture_directory(session, path):
@@ -684,15 +698,18 @@ def check_owned_queue(binary, work, threads):
         (root / name).write_bytes(b"q" * 4096)
     (root / "branch").mkdir()
     (root / "branch" / "leaf").write_bytes(b"l" * 4096)
+    (root / "branch" / "other").write_bytes(b"o" * 4096)
     session = Session(binary, root, threads)
     try:
-        # Keep the full nested path visible beside queue status and shortcuts,
-        # while remaining below the 120-column preview threshold.
+        # Keep the full nested path visible beside queue status and shortcuts.
         session.resize(28, 119)
         session.wait(lambda: path_in_header(session.screen, root), "queue fixture scan did not complete")
         pause_empty_queue(session)
         for name in ("alpha", "beta", "gamma", "alpha"):
             enqueue_fixture(session, name)
+        session.wait(lambda: deletion_marks(session, ("alpha", "beta", "gamma"))
+                     == {"alpha": True, "beta": True, "gamma": True},
+                     "paused queued targets did not show deletion markers")
         open_queue(session, ["alpha", "beta", "gamma"])
         session.key(b"\x1b[H")
         session.wait(lambda: queue_selected(session) == "alpha", "queue Home did not select alpha")
@@ -713,6 +730,9 @@ def check_owned_queue(binary, work, threads):
                      "d did not remove only the selected waiting deletion")
         assert (root / "alpha").is_file(), "removing a waiting deletion changed its file"
         close_queue(session)
+        session.wait(lambda: deletion_marks(session, ("alpha", "beta", "gamma"))
+                     == {"alpha": False, "beta": True, "gamma": True},
+                     "removing one waiting job did not clear only its marker")
 
         fixture_selection(session, "branch", directory=True)
         session.key(b"l")
@@ -724,9 +744,25 @@ def check_owned_queue(binary, work, threads):
         fixture_selection(session, "branch", directory=True)
         session.key(b"l")
         session.wait(lambda: fixture_directory(session, root / "branch"), "covered leaf navigation failed")
+        session.wait(lambda: deletion_marks(session, ("leaf", "other")) == {"leaf": True, "other": True},
+                     "queued parent did not mark its independently unqueued descendant")
         enqueue_fixture(session, "leaf")
         session.key(b"<")
         session.wait(lambda: fixture_directory(session, root), "covered leaf check did not return to parent")
+        open_queue(session, ["beta", "gamma", "branch"])
+        session.key(b"\x1b[F")
+        session.wait(lambda: queue_selected(session) == "branch", "queue End did not select parent")
+        session.key(b"d")
+        session.wait(lambda: queue_paths(session) == ["beta", "gamma"], "queued parent was not removed")
+        close_queue(session)
+        fixture_selection(session, "branch", directory=True)
+        session.key(b"l")
+        session.wait(lambda: fixture_directory(session, root / "branch")
+                     and deletion_marks(session, ("leaf", "other")) == {"leaf": False, "other": False},
+                     "removing queued parent left inherited deletion markers")
+        session.key(b"<")
+        session.wait(lambda: fixture_directory(session, root), "unqueued descendant check lost parent")
+        enqueue_fixture(session, "branch", directory=True)
         open_queue(session, ["beta", "gamma", "branch"])
         assert "Pending paused" in session.screen.words(), "enqueue resumed a paused queue"
         transcript = len(session.raw)
@@ -788,8 +824,8 @@ def check_owned_cancellation(binary, work, threads):
         assert b"Delete failed" not in session.raw[transcript:], "deletion attempt reported an error"
         close_queue(session)
         if not slow.exists():
-            session.wait(lambda: not any("".join(row).rstrip().endswith(" slow/")
-                                        for row in session.screen.cells[1:]),
+            session.wait(lambda: not any(row.rstrip().endswith(" slow/")
+                                        for row in session.screen.main_rows()),
                          "naturally completed deletion retained its model row")
 
         session.key(b"q")
@@ -1113,9 +1149,9 @@ def check_owned_refresh(binary, work, threads):
 
 def visual_paths(session, names):
     paths = []
-    for row, cells in enumerate(session.screen.cells[1:], 1):
-        line = "".join(cells).rstrip()
-        if (cells[0] not in "›✓"
+    for row, line in enumerate(session.screen.main_rows(), 1):
+        line = line.rstrip()
+        if (not line or line[0] not in "›✓"
                 or sum(background == 4 for background, _ in session.screen.attributes[row][:16]) < 3):
             continue
         name = next((name for name in names if line.endswith(" " + name)), None)
@@ -1125,8 +1161,8 @@ def visual_paths(session, names):
 
 
 def cursor_path(session, names):
-    paths = [name for cells in session.screen.cells[1:] if cells[0] == "›"
-             for name in names if "".join(cells).rstrip().endswith(" " + name)]
+    paths = [name for line in session.screen.main_rows() if line.startswith("›")
+             for name in names if line.rstrip().endswith(" " + name)]
     return paths[0] if len(paths) == 1 else None
 
 
@@ -1181,8 +1217,7 @@ def check_owned_visual(binary, work, threads):
         assert b"\x1b[?1000h" in session.raw, "visual browser did not enable mouse input"
         pause_empty_queue(session)
         session.key(b"n")
-        session.wait(lambda: [name for row in session.screen.cells[1:]
-                             for name in names if "".join(row).rstrip().endswith(" " + name)] == names,
+        session.wait(lambda: visible_paths(session, names) == names,
                      "visual name ordering did not settle")
         fixture_selection(session, "alpha")
         session.key(b"v")
@@ -1254,8 +1289,8 @@ def check_owned_visual(binary, work, threads):
 
 def visible_paths(session, names):
     """Known fixture basenames in painted order; directory names include '/'."""
-    return [name for row in session.screen.cells[1:]
-            for name in names if "".join(row).rstrip().endswith(" " + name)]
+    return [name for row in session.screen.main_rows()
+            for name in names if row.rstrip().endswith(" " + name)]
 
 
 def check_owned_input_modes(binary, work, threads):
@@ -1341,8 +1376,7 @@ def check_owned_filter(binary, work, threads):
     known = names + ["unrelated-child.bin", "deep-needle.txt"]
     session = Session(binary, root, threads)
     try:
-        # Stay below the preview threshold: descendants must never appear as
-        # matches, and a preview pane would make a text-only check ambiguous.
+        # Match only main-list rows; the Contents pane may show descendants.
         session.resize(28, 119)
         session.wait(lambda: path_in_header(session.screen, root),
                      "filter fixture scan did not complete")
@@ -1704,8 +1738,8 @@ def check_owned_resize_confirmation(binary, work, threads, cases=("single", "bat
 def prepare_input_fixture(session, root, label):
     def ordered_rows():
         return (path_in_header(session.screen, root)
-                and "".join(session.screen.cells[1]).rstrip().endswith(" folder/")
-                and "".join(session.screen.cells[2]).rstrip().endswith(" last-file"))
+                and session.screen.main_line(1).rstrip().endswith(" folder/")
+                and session.screen.main_line(2).rstrip().endswith(" last-file"))
 
     session.wait(lambda: path_in_header(session.screen, root)
                  and "Scan complete" in session.screen.text(header=True),
@@ -1736,7 +1770,7 @@ def check_owned_resize_input(binary, work, threads):
         stopped_resize_key(session, 28, 140, b"\x1b[F")
         session.wait(lambda: session.screen.help_at_edge()
                      and session.screen.selected_row() == 2
-                     and "".join(session.screen.cells[2]).rstrip().endswith(" last-file")
+                     and session.screen.main_line(2).rstrip().endswith(" last-file")
                      and "Contents" not in session.screen.text(),
                      "simultaneous resize and End lost owned PTY input")
         elapsed = session.finish(key=b"q")
@@ -1780,7 +1814,7 @@ def check_owned_fragmented_input(binary, work, threads):
             assert session.child.poll() is None, f"incomplete {label} terminated owned child"
             session.key(completion)
             session.wait(lambda: session.screen.selected_row() == 2
-                         and "".join(session.screen.cells[2]).rstrip().endswith(" last-file")
+                         and session.screen.main_line(2).rstrip().endswith(" last-file")
                          and "Contents" not in session.screen.text(),
                          f"completed {label} prevented End from being parsed", timeout=5)
             consumed_fragment(session, prefix, label)
@@ -1828,7 +1862,7 @@ def check(binary, root, owned_fixture, max_input_ms, threads):
                     # Begin at the list boundary before measuring one-row moves.
                     session.key(b"\x1b[H")
                     session.wait(lambda: session.screen.selected_row() == 1
-                                 and "".join(session.screen.cells[2]).strip(), "Home did not expose two rows")
+                                 and session.screen.main_line(2).strip(), "Home did not expose two rows")
                     inputs.append(measured_key(session, b"j", lambda: session.screen.selected_row() == 2, "move selection down"))
                     inputs.append(measured_key(session, b"k", lambda: session.screen.selected_row() == 1, "move selection up"))
                 # Probe input while a full visible-row reorder is in flight.
@@ -1853,8 +1887,21 @@ def check(binary, root, owned_fixture, max_input_ms, threads):
                     session.wait(lambda: preview_fixture_ready(session),
                                  "wide hovered-directory preview did not show its entries")
                     check_preview_rows(session)
-                    session.key(b"\x1b[F")
-                    session.wait(lambda: "Contents" not in session.screen.text(), "file hover did not hide preview")
+                    fixture_selection(session, "preview-file")
+                    session.wait(lambda: "Preview" in preview_text(session)
+                                 and "PTY text preview" in preview_text(session)
+                                 and "second line" in preview_text(session),
+                                 "text file did not render its content in the preview")
+                    for name, kind in (("preview-pdf.pdf", "PDF"),
+                                       ("preview-image.png", "Image"),
+                                       ("preview-binary", "Binary")):
+                        fixture_selection(session, name)
+                        session.wait(lambda: kind in preview_text(session)
+                                     and "Size" in preview_text(session)
+                                     and "Disk" in preview_text(session)
+                                     and not any(marker in preview_text(session) for marker in
+                                                 ("PTY text preview", "PDF_SENTINEL", "BINARY_SENTINEL")),
+                                     f"{kind} did not replace old text with file metadata")
                     loading = set()
                     session.observe = lambda screen: loading.update(
                         marker for marker in ("Loading", "Ordering entries", "Updating", "Waiting for scan")
@@ -1867,8 +1914,16 @@ def check(binary, root, owned_fixture, max_input_ms, threads):
                         session.observe = None
                     assert not loading, f"hovering a cached directory flashed a placeholder: {loading}"
                     check_preview_rows(session)
-                    session.resize(28, 100)
-                    session.wait(lambda: session.screen.help_at_edge() and "Contents" not in session.screen.text(), "narrow terminal still showed preview")
+                    assert "PTY text preview" not in preview_text(session), "directory retained file content"
+                    for width in (96, 160):
+                        session.resize(28, width)
+                        session.wait(lambda: session.screen.help_at_edge()
+                                     and session.screen.cells[1][width * 4 // 7] == "│"
+                                     and preview_fixture_ready(session),
+                                     f"preview did not use the proportional pane at width {width}")
+                    session.resize(28, 95)
+                    session.wait(lambda: session.screen.help_at_edge() and not preview_rows(session)
+                                 and "Contents" not in session.screen.text(), "narrow terminal still showed preview")
                 enter_directory(session, root, names)
                 if owned_fixture:
                     check_reorder_navigation(session, inputs)
@@ -1927,7 +1982,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="ldu-pty-", dir=".tmp") as work:
         root = args.root or Path(work)
         if args.root is None:
-            (root / "preview-file").write_bytes(b"preview")
+            (root / "preview-file").write_bytes(b"PTY text preview\nsecond line\n")
+            (root / "preview-pdf.pdf").write_bytes(b"%PDF-1.7\nPDF_SENTINEL\n")
+            (root / "preview-image.png").write_bytes(bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "0000000b49444154789c636000020000050001a5f645400000000049454e44ae426082"))
+            (root / "preview-binary").write_bytes(b"\0BINARY_SENTINEL")
             for dirname, count in (("large", 300), ("small", 2)):
                 directory = root / dirname
                 directory.mkdir()
@@ -1968,7 +2028,7 @@ def main():
         checks = ["initial frame", "untouched startup selection", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
                   "scan error", "terminal restoration"]
         if args.root is None:
-            checks += ["shared preview bars", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
+            checks += ["shared preview bars", "text and binary file previews", "responsive pane widths", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "queued descendant markers", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
         if args.root is None:
             checks.append("target-replacement error after terminal restoration")
         if any(sample["during_scanning"] and "help" in sample["action"]
