@@ -2,7 +2,7 @@
 
 Completion requires two consecutive adversarial review passes, each using all six reviewer slots, with no valid findings. A valid finding and its fix reset the clean-pass count. Tests and measurements are separate evidence and do not count as review passes.
 
-Current consecutive clean passes: **2**. Navigation margins, separate visual controls, current-directory fuzzy filtering, full contents previews, deletion priority and bounded shutdown passed qualification on source `62720dd653c2de083290fc6955966b8d49d7e7da240fcf9c7f572454d8569e1f`. Passes 36 and 37 were clean on the same source, with all six reviewer slots occupied in each round and assignments rotated between rounds.
+Current consecutive clean passes: **2**. Startup selection and resort context passed qualification on source `14ce7ab9bad3cd819b4cddbe5eeff0bb3c26cbc0f6214bb4dae88ca946ab43e4`. Passes 38 and 39 each used all six reviewer slots and reported no findings on this unchanged source.
 
 | Pass | Reviewers | Result | Status |
 | --- | --- | --- | --- |
@@ -41,7 +41,9 @@ Current consecutive clean passes: **2**. Navigation margins, separate visual con
 | 34 | 6 of 6 | No findings | Clean; streak 1, reset by Pass 35 |
 | 35 | 6 of 6 | One finding; five reviewers reported none | Fixed and requalified; streak 0 |
 | 36 | 6 of 6 | No findings | Clean; streak 1 |
-| 37 | 6 of 6 | No findings | Clean; streak 2; current source qualified |
+| 37 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
+| 38 | 6 of 6 | No findings | Clean; streak 1 |
+| 39 | 6 of 6 | No findings | Clean; streak 2; current source qualified |
 
 Pass 1 findings, now closed:
 
@@ -393,3 +395,21 @@ Qualification passed on source `62720dd653c2de083290fc6955966b8d49d7e7da240fcf9c
 Pass 36 used all six reviewer slots, verified running together at the READY barrier before RELEASE. The reviewers independently covered shutdown/deletion priority, filesystem/accounting, navigation/selection/focus, ordering/filter/preview, contract/regressions, and resource/scheduler behavior. All six reported **NO FINDINGS**. Qualified source and release binary hashes are unchanged. Clean streak: **1**.
 
 Pass 37 used all six reviewer slots, verified running together at the READY barrier before RELEASE. Assignments rotated across ordering/filter/preview, contract and terminal evidence, shutdown/deletion, navigation/selection/focus, filesystem/accounting, and combined interaction/resource behavior. All six reported **NO FINDINGS**. The qualified source and binary stayed unchanged through both rounds and their hashes were checked again after the final report. Consecutive clean passes: **2**. Publication checks compare the working tree, staged files and commit against the qualification digest before pushing.
+
+## Startup selection and resort context
+
+The new request resets the clean-pass count to zero. Untouched startup must remain at the first sorted entry. Once the user takes control of the selection, the selected entry must remain tracked through resorts with visible context above and below where space allows. Development checks also found that movement before the first scan entries arrived was discarded; this is included in the correction.
+
+The startup correction uses one application-level cursor state: untouched top-follow, waiting for first entries, or stable entry tracking. No per-entry fields or caches were added. Live resorts apply the existing bounded scroll margin, preserving held mouse row mapping. Pre-discovery movement survives until entries arrive; cold-folder priority is dispatched before later child focus.
+
+Development qualification caught a deleted-all visual-input stall in the initial waiting rule. The three-state policy distinguishes first discovery from a previously populated list that became empty. The unchanged regression failed before that correction, then passed with added coverage for both stale rows and a published empty snapshot.
+
+Qualification passed: 261 unit tests, 7 filesystem tests, formatting, warnings-denied Linux Clippy, macOS all-target compilation, the release build, four PTY corpora and nine native/std/auto JSON comparisons. macOS retains three existing test-only warnings; its runtime was not tested. The escaped-name corpus initially exceeded the harness documented full-header-path requirement; shortening those ignored fixture names completed qualification without changing source or binary. Evidence: `.tmp/startup-recheck.log`, `.tmp/startup-checks.log`, `.tmp/startup-finish.log`, `.tmp/qualified-startup.json`.
+
+Frozen source: `14ce7ab9bad3cd819b4cddbe5eeff0bb3c26cbc0f6214bb4dae88ca946ab43e4`. Release binary: 2056048 bytes, SHA-256 `8cafb1ee5f71ad5de11f2916d326e1b7d80b71e50b50707144265bbc9fe74b7c`. The busy shared host precluded performance timing claims. Pass 38 began only after qualification and after all six reviewers were verified running at the READY barrier.
+
+Pass 38 used all six reviewer slots, verified running together at the READY barrier before RELEASE. Independent domains covered startup input and stable identity, resort context and mouse gestures, ordering/filter/preview, scheduler/focus, resource use and bounded work, and contract/qualification evidence. All six reported **NO FINDINGS**. Qualified source and binary hashes were checked again and are unchanged. Clean streak: **1**.
+
+Pass 39 began on the same qualified source after all six reviewers were READY and verified running together. Assignments rotated across deletion/shutdown/refresh, navigation and gestures, ordering/filter/preview, scheduler/focus, resource use and compaction, and user contract/validation.
+
+All six Pass 39 reviewers independently reported **NO FINDINGS**. Source and release binary hashes were checked after the final report and remain unchanged through both passes. Consecutive clean passes: **2**. Publication checks compare working, staged and committed source against the qualification digest before the authorized push.

@@ -1803,13 +1803,21 @@ def has_multiple_entries(root):
 
 def check(binary, root, owned_fixture, max_input_ms, threads):
     metrics = []
-    for quit_action in ("q", "ctrl-c", "sigterm", "missing-root"):
+    for quit_action in ("startup", "q", "ctrl-c", "sigterm", "missing-root"):
         session = Session(binary, root / "does-not-exist" if quit_action == "missing-root" else root, threads)
         inputs = []
         try:
             session.wait(lambda: b"Waiting to scan" in session.raw, "initial frame missing")
             assert session.raw.find(b"Waiting to scan") < session.raw.find(b"Scanning") or b"Scanning" not in session.raw
-            if quit_action == "q":
+            if quit_action == "startup":
+                # No input before this check: startup must follow the first sorted row.
+                # The owned corpus has a known largest entry; its discovery order is irrelevant.
+                session.wait(lambda: path_in_header(session.screen, root)
+                             and session.screen.selected_row() == 1
+                             and (not owned_fixture or first_row(session).rstrip().endswith(" large/")),
+                             "untouched startup did not settle at the largest first row")
+                elapsed = session.finish(key=b"q")
+            elif quit_action == "q":
                 session.wait(lambda: b"Scanning" in session.raw or path_in_header(session.screen, root),
                              "scan did not start or complete for the expected root")
                 inputs.append(measured_key(session, b"?", lambda: session.screen.has_modal_title("Help"), "open help"))
@@ -1817,7 +1825,7 @@ def check(binary, root, owned_fixture, max_input_ms, threads):
                 session.wait(lambda: "Scan complete" in session.screen.text(header=True), "scan did not complete")
                 # Measure actual visible selection feedback, rather than only opening overlays.
                 if has_multiple_entries(root):
-                    # Anchored selections may leave a valid blank tail after live resorting.
+                    # Begin at the list boundary before measuring one-row moves.
                     session.key(b"\x1b[H")
                     session.wait(lambda: session.screen.selected_row() == 1
                                  and "".join(session.screen.cells[2]).strip(), "Home did not expose two rows")
@@ -1957,7 +1965,7 @@ def main():
                           "max_input_ms": max(s["response_ms"] for m in metrics for s in m["input"]),
                           "input_cap_ms": args.max_input_ms}))
     else:
-        checks = ["initial frame", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
+        checks = ["initial frame", "untouched startup selection", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
                   "scan error", "terminal restoration"]
         if args.root is None:
             checks += ["shared preview bars", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]

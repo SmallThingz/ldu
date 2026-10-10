@@ -105,7 +105,7 @@ In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down
 
 With confirmed deletions pending, the first `q` or Ctrl-C stops scans and waits for deletion to finish, then exits. A deletion error hidden by the warning is reported after the terminal is restored. Queue pause still applies. A second Ctrl-C cancels all deletions and quits. `n` or Escape keeps browsing; stopped scans stay stopped until you refresh with `r` or `R`.
 
-Allocated disk usage is the default. Scanning and finished entries sort together; the selected entry stays selected as totals change. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, the selected directory's files and folders appear in a Contents preview beside the main list.
+Allocated disk usage is the default. Scanning and finished entries sort together. At startup, the cursor stays at the top until you navigate or select an entry. Afterward, live reordering follows the selected entry and keeps up to three rows visible above and below it where space allows. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, the selected directory's files and folders appear in a Contents preview beside the main list.
 
 [Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md) · [Review results](REVIEW.md)
 

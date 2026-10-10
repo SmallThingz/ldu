@@ -258,6 +258,13 @@ impl Navigation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorMode {
+    Top,
+    Waiting,
+    Tracked,
+}
+
 struct App {
     model: Model,
     root: PathBuf,
@@ -308,6 +315,7 @@ struct App {
     mouse_position: Option<(u16, u16)>,
     capture_inflight: Option<Arc<AtomicBool>>,
     focus_after_selection: bool,
+    cursor_mode: CursorMode,
     deferred_batch: Option<BatchRequest>,
     waiting_batch: Option<WaitingBatch>,
     deferred_delete: Option<DeleteRequest>,
@@ -379,6 +387,7 @@ impl App {
             mouse_position: None,
             capture_inflight: None,
             focus_after_selection: false,
+            cursor_mode: CursorMode::Top,
             deferred_batch: None,
             waiting_batch: None,
             deferred_delete: None,
@@ -398,6 +407,11 @@ impl App {
                 navigation.cursor = None;
             }
         } else {
+            self.cursor_mode = if self.selected.is_some() {
+                CursorMode::Tracked
+            } else {
+                CursorMode::Waiting
+            };
             self.pending_navigation = None;
             self.view = Arc::clone(&self.empty);
             self.view_directory = self.directory;
@@ -631,7 +645,11 @@ impl App {
                     if let Some(navigation) = self.pending_navigation.as_mut() {
                         navigation.cursor = None;
                     }
-                    if self.selected.is_some_and(|id| {
+                    if self.cursor_mode == CursorMode::Top {
+                        self.selected = None;
+                        self.offset = 0;
+                        self.pending_navigation = Some(Navigation::new(Some(false), 0));
+                    } else if self.selected.is_some_and(|id| {
                         !self.eligible(id)
                             || self.model.node(id).parent != Some(self.directory)
                             || (!self.filter.is_empty() && !self.view.positions.contains_key(&id))
@@ -646,7 +664,11 @@ impl App {
                     if let (Some(row), Some(index)) = (row, self.selection_index()) {
                         self.offset = self.offset_for_row(index, row);
                     }
-                    self.keep_selection_visible();
+                    if self.mouse_press_view.is_none() && !self.has_held_mouse() {
+                        self.scroll_selection(SCROLL_MARGIN);
+                    } else {
+                        self.keep_selection_visible();
+                    }
                 }
             }
         }
@@ -662,6 +684,7 @@ impl App {
     }
 
     fn update_filter(&mut self) {
+        self.track_selection();
         let visual = self.visual.active();
         self.clear_visual_intent();
         self.visual.reset(self.directory);
@@ -767,12 +790,22 @@ impl App {
         self.offset = self.offset.max(last.saturating_sub(VIEW_BUDGET - 1));
     }
 
+    fn track_selection(&mut self) {
+        if self.selected.is_some() {
+            self.cursor_mode = CursorMode::Tracked;
+        } else if self.cursor_mode == CursorMode::Top {
+            self.cursor_mode = CursorMode::Waiting;
+        }
+    }
+
     fn edge_selection(&mut self, end: bool) {
+        self.track_selection();
         self.pending_navigation = Some(Navigation::new(Some(end), 0));
         self.advance_navigation();
     }
 
     fn move_selection(&mut self, amount: isize) {
+        self.track_selection();
         let mut navigation = self
             .pending_navigation
             .take()
@@ -794,11 +827,20 @@ impl App {
         let has_children = self
             .model
             .has_children(self.directory, false, self.config.show_hidden);
+        let empty_filter = !self.filter.is_empty()
+            && !Arc::ptr_eq(&self.view, &self.empty)
+            && self.view.ids.is_empty();
         if !has_children
-            || (!self.filter.is_empty()
-                && !Arc::ptr_eq(&self.view, &self.empty)
-                && self.view.ids.is_empty())
+            && !empty_filter
+            && self.cursor_mode == CursorMode::Waiting
+            && (navigation.amount != 0 || navigation.end == Some(true))
+            && !self.model.finished
+            && !self.model.listing_complete(self.directory)
         {
+            self.pending_navigation = Some(navigation);
+            return;
+        }
+        if !has_children || empty_filter {
             let cleared = self.selected.take().is_some();
             self.prioritize_requested |= cleared;
             self.focus_after_selection |= cleared;
@@ -882,6 +924,9 @@ impl App {
         if complete {
             let previous_selected = self.selected;
             self.selected = cursor.target;
+            if self.cursor_mode == CursorMode::Waiting {
+                self.cursor_mode = CursorMode::Tracked;
+            }
             self.bind_visual_cursor(self.selected);
             if std::mem::take(&mut self.focus_after_selection) && previous_selected != self.selected
             {
@@ -1127,6 +1172,25 @@ impl App {
                 },
             }
             return Action::Continue;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Enter
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Char(
+                    'j' | 'k' | 'h' | 'l' | '<' | 'v' | 'V' | '/' | 'e' | 'd' | 'r' | 'R' | 'i'
+                )
+        ) {
+            self.track_selection();
         }
         if self.filter_editing {
             let changed = match key.code {
@@ -2090,6 +2154,7 @@ impl App {
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) {
+            self.track_selection();
             self.finish_mouse_for_input();
             let amount = if mouse.kind == MouseEventKind::ScrollUp {
                 -3
@@ -2126,6 +2191,7 @@ impl App {
         };
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.cursor_mode = CursorMode::Tracked;
                 if self.mouse_press_view.is_some() || self.has_held_mouse() {
                     self.finish_mouse_for_input();
                 }
@@ -2228,6 +2294,7 @@ impl App {
                 self.set_drag_edge(edge, id);
             }
             MouseEventKind::Moved if !self.mouse_dragging && !self.has_held_mouse() => {
+                self.cursor_mode = CursorMode::Tracked;
                 if self.visual.active() && self.visual_busy() {
                     self.enqueue_visual(VisualIntent::CursorId(id));
                     return;
@@ -3573,9 +3640,10 @@ fn pump_retired_batches(app: &mut App, retired: &mut VecDeque<BatchCapture>) {
 }
 
 fn prioritize_requested(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan]) {
-    if !app.prioritize_requested || app.pending_navigation.is_some() {
+    if !app.prioritize_requested || (app.pending_navigation.is_some() && app.selected.is_some()) {
         return;
     }
+    app.focus_after_selection |= app.pending_navigation.is_some();
     app.prioritize_requested = false;
     let focus = app.scan_focus();
     let Some(id) = focus else {
@@ -4797,6 +4865,7 @@ mod tests {
         wait_cache(&mut app, ROOT, &[1, 2]);
         wait_cache(&mut app, 1, &[3, 4, 5]);
         app.sync_order(true);
+        app.cursor_mode = CursorMode::Tracked;
         app
     }
 
@@ -6472,14 +6541,20 @@ mod tests {
             );
             assert!(!app.visual.contains(4));
         }
-        let mut app = pending_folder_selection();
-        app.removed(3);
-        app.removed(4);
-        app.removed(5);
-        app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, 1), true));
-        app.enqueue_visual(VisualIntent::ToggleCurrent);
-        finish_visual(&mut app);
-        assert!(app.visual_intents.is_empty() && !app.range_requested);
+        for published_empty in [false, true] {
+            let mut app = pending_folder_selection();
+            app.removed(3);
+            app.removed(4);
+            app.removed(5);
+            if published_empty {
+                wait_cache(&mut app, 1, &[]);
+                app.sync_order(true);
+            }
+            app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, 1), true));
+            app.enqueue_visual(VisualIntent::ToggleCurrent);
+            finish_visual(&mut app);
+            assert!(app.visual_intents.is_empty() && !app.range_requested);
+        }
     }
 
     #[test]
@@ -8213,6 +8288,210 @@ mod tests {
     }
 
     #[test]
+    fn untouched_startup_follows_the_largest_row_without_requesting_scan_focus() {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        app.page_size = 10;
+        wait_cache(&mut app, ROOT, &[]);
+        app.sync_order(true);
+        assert!(app.selected.is_none());
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(1, "first", NodeKind::Directory, 10),
+                    entry(2, "second", NodeKind::Directory, 100),
+                ],
+            },
+        );
+        wait_cache(&mut app, ROOT, &[2, 1]);
+        app.sync_order(true);
+        assert_eq!(app.selected, Some(2));
+        for code in [
+            KeyCode::Char('g'),
+            KeyCode::Char('c'),
+            KeyCode::Char('?'),
+            KeyCode::Esc,
+        ] {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+        }
+        let changed = app.model.update_directory_sizes(
+            1,
+            crate::types::Sizes {
+                apparent: 1000,
+                allocated: 1000,
+            },
+        );
+        app.changed(changed);
+        wait_cache(&mut app, ROOT, &[1, 2]);
+        app.sync_order(true);
+        assert_eq!(app.selected, Some(1));
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(3, "third", NodeKind::Directory, 10000)],
+            },
+        );
+        wait_cache(&mut app, ROOT, &[3, 1, 2]);
+        for _ in 0..3 {
+            app.sync_order(true);
+            assert_eq!(
+                (app.selected, app.offset, app.selection_screen_row()),
+                (Some(3), 0, Some(0))
+            );
+            assert!(
+                app.cursor_mode == CursorMode::Top
+                    && !app.prioritize_requested
+                    && !app.focus_after_selection
+            );
+        }
+    }
+
+    #[test]
+    fn early_navigation_survives_discovery_then_resorts_with_visible_context() {
+        for height in [1, 5, 10] {
+            let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+            app.page_size = height;
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                None,
+                false,
+            );
+            assert!(app.cursor_mode != CursorMode::Top && app.pending_navigation.is_some());
+            for _ in 0..3 {
+                app.sync_order(true);
+                assert!(app.pending_navigation.is_some());
+            }
+            apply(
+                &mut app,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: (1..=40)
+                        .map(|id| {
+                            entry(
+                                id,
+                                &format!("folder-{id}"),
+                                NodeKind::Directory,
+                                u64::from(41 - id) * 100,
+                            )
+                        })
+                        .collect(),
+                },
+            );
+            let ids: Vec<_> = (1..=40).collect();
+            wait_cache(&mut app, ROOT, &ids);
+            app.sync_order(true);
+            assert_eq!(app.selected, Some(2));
+            assert!(app.pending_navigation.is_none());
+            let changed = app.model.update_directory_sizes(
+                2,
+                crate::types::Sizes {
+                    apparent: 1950,
+                    allocated: 1950,
+                },
+            );
+            app.changed(changed);
+            let ids: Vec<_> = (1..=40).filter(|&id| id != 2).collect();
+            let mut reordered = ids;
+            reordered.insert(20, 2);
+            wait_cache(&mut app, ROOT, &reordered);
+            app.sync_order(true);
+            let margin = SCROLL_MARGIN.min((height - 1) / 2);
+            assert_eq!(app.selected, Some(2));
+            assert_eq!(app.selection_screen_row(), Some(margin), "height={height}");
+            assert_eq!(app.offset, 20 - margin);
+            assert!(app.cursor_mode != CursorMode::Top);
+        }
+    }
+
+    #[test]
+    fn empty_startup_navigation_settles_on_scan_completion_errors_and_leaf_roots() {
+        for event in [
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: Some("unreadable".into()),
+            },
+            ScanEvent::Finished { cancelled: true },
+            ScanEvent::RootInfo {
+                kind: NodeKind::File,
+                sizes: Default::default(),
+                error: None,
+                file_identity: None,
+            },
+        ] {
+            let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                None,
+                false,
+            );
+            assert!(app.pending_navigation.is_some());
+            apply(&mut app, event);
+            app.sync_order(true);
+            assert!(app.pending_navigation.is_none() && app.selected.is_none());
+            assert!(app.cursor_mode != CursorMode::Top);
+        }
+    }
+
+    #[test]
+    fn cold_entry_with_pending_movement_prioritizes_the_folder_then_its_selected_child() {
+        std::fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let mut app = browser_fixture_at(fixture.path().to_owned());
+        app.directory = 1;
+        app.selected = Some(5);
+        app.reset_order(false);
+        app.key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.directory, 5);
+        assert!(app.pending_navigation.is_none());
+        assert_eq!(app.scan_focus(), Some(5));
+        app.key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(app.pending_navigation.is_some());
+        let scanner = scan::spawn(
+            fixture.path().to_owned(),
+            ScanOptions {
+                threads: 1,
+                ..ScanOptions::default()
+            },
+        );
+        prioritize_requested(&mut app, &scanner, &[]);
+        assert!(!app.prioritize_requested && app.focus_after_selection);
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: 5,
+                entries: vec![
+                    entry(6, "first", NodeKind::Directory, 2),
+                    entry(7, "second", NodeKind::Directory, 1),
+                ],
+            },
+        );
+        wait_cache(&mut app, 5, &[6, 7]);
+        app.sync_order(true);
+        assert_eq!(app.selected, Some(7));
+        assert_eq!(app.scan_focus(), Some(7));
+        assert!(app.prioritize_requested && !app.focus_after_selection);
+        prioritize_requested(&mut app, &scanner, &[]);
+        for _ in 0..3 {
+            app.sync_order(true);
+            assert!(!app.prioritize_requested && !app.focus_after_selection);
+        }
+    }
+
+    #[test]
     fn active_navigation_keeps_its_order_then_resorts_without_moving_the_cursor_row() {
         let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
         apply(
@@ -8405,6 +8684,7 @@ mod tests {
         wait_cache(&mut app, ROOT, &ids);
         app.sync_order(true);
         app.page_size = 10;
+        app.cursor_mode = CursorMode::Tracked;
         app
     }
 
