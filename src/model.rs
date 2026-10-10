@@ -99,6 +99,7 @@ impl Node {
     const REMOVED: u8 = 1;
     const READ_DONE: u8 = 2;
     const OVERFLOW_REPORTED: u8 = 4;
+    const METADATA_UNCERTAIN: u8 = 8;
 
     fn new(name: Arc<OsStr>, parent: Option<NodeId>, kind: NodeKind, sizes: Sizes) -> Self {
         let complete = kind != NodeKind::Directory;
@@ -347,6 +348,28 @@ impl Model {
         changed
     }
 
+    /// A completed removal can leave its parent's own inode bytes unchecked.
+    /// Mark that uncertainty without suppressing unrelated scan contributions.
+    pub fn mark_metadata_uncertain(&mut self, id: NodeId) -> Vec<NodeId> {
+        if !self.is_live(id)
+            || self.nodes[id as usize].kind != NodeKind::Directory
+            || self.nodes[id as usize].flags & Node::METADATA_UNCERTAIN != 0
+        {
+            return Vec::new();
+        }
+        self.nodes[id as usize].flags |= Node::METADATA_UNCERTAIN;
+        let mut changed = Vec::new();
+        let mut current = Some(id);
+        while let Some(ancestor) = current {
+            let node = &mut self.nodes[ancestor as usize];
+            node.suppressed_subtrees = node.suppressed_subtrees.saturating_add(1);
+            changed.push(ancestor);
+            current = node.parent;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        changed
+    }
+
     /// Completion describes scanner work; partial totals also include later
     /// deletions whose filesystem changes have not yet been reconciled.
     pub fn has_partial_totals(&self, id: NodeId) -> bool {
@@ -396,7 +419,7 @@ impl Model {
         node.items = 0;
         node.error_count = 0;
         node.complete = false;
-        node.flags &= !(Node::READ_DONE | Node::OVERFLOW_REPORTED);
+        node.flags &= !(Node::READ_DONE | Node::OVERFLOW_REPORTED | Node::METADATA_UNCERTAIN);
         node.pending_dirs = 0;
         node.first_child = NO_NODE;
         node.last_child = NO_NODE;
@@ -638,12 +661,28 @@ impl Model {
         if !self.is_live(id) || self.nodes[id as usize].kind != NodeKind::Directory {
             return Vec::new();
         }
+        let uncertain = self.nodes[id as usize].flags & Node::METADATA_UNCERTAIN != 0;
         let old = std::mem::replace(&mut self.directories.entry(id).or_default().sizes, sizes);
-        if old == sizes {
+        if old == sizes && !uncertain {
             return Vec::new();
         }
         let mut changed = Vec::new();
-        self.replace_node_charge(id, old, sizes, &mut changed);
+        if uncertain {
+            self.nodes[id as usize].flags &= !Node::METADATA_UNCERTAIN;
+            let mut current = Some(id);
+            while let Some(ancestor) = current {
+                let node = &mut self.nodes[ancestor as usize];
+                node.suppressed_subtrees = node.suppressed_subtrees.saturating_sub(1);
+                changed.push(ancestor);
+                current = node.parent;
+            }
+            if self.nodes[ROOT as usize].complete {
+                self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
+            }
+        }
+        if old != sizes {
+            self.replace_node_charge(id, old, sizes, &mut changed);
+        }
         self.revision = self.revision.wrapping_add(1);
         changed
     }
@@ -2383,6 +2422,132 @@ mod tests {
         assert_eq!(model.node(ROOT).sizes.apparent, 8);
         assert_eq!(model.node(ROOT).error_count, 0);
         assert!(model.last_error.is_none());
+    }
+
+    #[test]
+    fn uncertain_parent_metadata_keeps_scanning_and_reconciles_its_own_marker_once() {
+        for repair in 0..3 {
+            let mut model = model();
+            model.apply(ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(1, "parent", NodeKind::Directory, 3, 4),
+                    entry(2, "other", NodeKind::Directory, 5, 8),
+                ],
+            });
+            assert_eq!(model.mark_metadata_uncertain(1), vec![1, ROOT]);
+            assert!(model.mark_metadata_uncertain(1).is_empty());
+            assert!(model.node(1).suppression_cutoff.is_none());
+            assert!(!model.cancelled);
+            model.apply(ScanEvent::Entries {
+                parent: 1,
+                entries: vec![entry(3, "late", NodeKind::File, 7, 8)],
+            });
+            assert!(model.is_live(3));
+            assert_eq!(model.node(1).sizes.apparent, 10);
+            done(&mut model, ROOT, 0, 1);
+            done(&mut model, ROOT, 0, 2);
+            done(&mut model, ROOT, 0, ROOT);
+            finish(&mut model, ROOT, 0);
+            assert!(model.node(ROOT).complete && model.has_partial_totals(ROOT));
+            assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+            model.mark_partial(2);
+            assert_eq!(model.node(ROOT).suppressed_subtrees, 2);
+            match repair {
+                0 => {
+                    model.update_directory_sizes(
+                        1,
+                        Sizes {
+                            apparent: 3,
+                            allocated: 4,
+                        },
+                    );
+                    assert!(
+                        model
+                            .update_directory_sizes(
+                                1,
+                                Sizes {
+                                    apparent: 3,
+                                    allocated: 4
+                                }
+                            )
+                            .is_empty()
+                    );
+                }
+                1 => {
+                    model.begin_rescan(1, 1);
+                    scoped_root(&mut model, 1, 1, 3);
+                    done(&mut model, 1, 1, ROOT);
+                    finish(&mut model, 1, 1);
+                }
+                _ => {
+                    model.remove(1);
+                }
+            }
+            assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+            assert!(model.has_partial_totals(ROOT) && model.has_partial_totals(2));
+            assert!(!model.has_partial_totals(1));
+            assert_eq!(model.node(ROOT).error_count, 0);
+            assert!(model.cancelled && model.node(ROOT).complete);
+            model.begin_rescan(2, 2);
+            scoped_root(&mut model, 2, 2, 5);
+            done(&mut model, 2, 2, ROOT);
+            finish(&mut model, 2, 2);
+            assert_eq!(model.node(ROOT).suppressed_subtrees, 0);
+            assert!(model.node(ROOT).complete && !model.has_partial_totals(ROOT));
+            assert!(!model.cancelled && model.last_error.is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_recovery_preserves_descendant_and_same_node_suppression_markers() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "parent", NodeKind::Directory, 3, 4)],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        model.mark_metadata_uncertain(ROOT);
+        model.mark_metadata_uncertain(1);
+        model.mark_partial(1);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 3);
+        let root_sizes = model.directories.get(&ROOT).unwrap().sizes;
+        assert_eq!(model.update_directory_sizes(ROOT, root_sizes), vec![ROOT]);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 2);
+        assert_eq!(model.node(1).suppressed_subtrees, 2);
+        let revision = model.revision;
+        assert_eq!(
+            model.update_directory_sizes(
+                1,
+                Sizes {
+                    apparent: 3,
+                    allocated: 4
+                }
+            ),
+            vec![1, ROOT]
+        );
+        assert!(model.revision != revision);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+        assert_eq!(model.node(1).suppressed_subtrees, 1);
+        assert!(model.node(1).suppression_cutoff.is_some());
+        assert!(model.has_partial_totals(1) && model.cancelled);
+        assert!(
+            model
+                .update_directory_sizes(
+                    1,
+                    Sizes {
+                        apparent: 3,
+                        allocated: 4
+                    }
+                )
+                .is_empty()
+        );
+        model.remove(1);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 0);
+        assert!(model.node(ROOT).complete && !model.has_partial_totals(ROOT));
+        assert!(!model.cancelled && model.last_error.is_none());
     }
 
     #[test]

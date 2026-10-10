@@ -67,6 +67,13 @@ pub struct RootAnchor {
 
 impl RootAnchor {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_cancellable(path, &AtomicBool::new(false))
+    }
+
+    /// Open the original root while checking cancellation between path components
+    /// and interrupted retries. The resulting anchor has the same path guarantees.
+    pub fn open_cancellable(path: &Path, cancel: &AtomicBool) -> io::Result<Self> {
+        check_cancel(cancel)?;
         let path = normalize_root_path(path);
         if path.as_os_str().is_empty() {
             return Err(io::Error::new(
@@ -80,6 +87,7 @@ impl RootAnchor {
             let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
             let base_name = if path.is_absolute() { "/" } else { "." };
             let base = loop {
+                check_cancel(cancel)?;
                 match open(base_name, flags, Mode::empty()) {
                     Err(rustix::io::Errno::INTR) => continue,
                     result => break result.map_err(io::Error::from)?,
@@ -90,11 +98,13 @@ impl RootAnchor {
             } else {
                 path.as_path()
             };
-            let fd = component_open(
+            let fd = component_open_cancellable(
                 &base,
                 relative,
                 OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                cancel,
             )?;
+            check_cancel(cancel)?;
             Ok(Self {
                 path,
                 fd,
@@ -103,7 +113,15 @@ impl RootAnchor {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            std_path_metadata(&path)?;
+            loop {
+                check_cancel(cancel)?;
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            check_cancel(cancel)?;
             Ok(Self { path })
         }
     }
@@ -131,7 +149,19 @@ impl RootAnchor {
 
     #[cfg(target_os = "linux")]
     pub fn open_directory(&self, relative: &Path) -> io::Result<rustix::fd::OwnedFd> {
+        self.open_directory_cancellable(relative, &AtomicBool::new(false))
+    }
+
+    /// Preserve anchored resolution while allowing cancellation between opens
+    /// and interrupted retries, including the deep-path component fallback.
+    #[cfg(target_os = "linux")]
+    pub fn open_directory_cancellable(
+        &self,
+        relative: &Path,
+        cancel: &AtomicBool,
+    ) -> io::Result<rustix::fd::OwnedFd> {
         use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+        check_open_cancel(cancel)?;
         validate_relative(relative)?;
         let path = if relative.as_os_str().is_empty() {
             Path::new(".")
@@ -141,6 +171,7 @@ impl RootAnchor {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         if self.openat2_available.load(Ordering::Relaxed) {
             loop {
+                check_open_cancel(cancel)?;
                 match openat2(
                     &self.fd,
                     path,
@@ -148,7 +179,10 @@ impl RootAnchor {
                     Mode::empty(),
                     ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
                 ) {
-                    Ok(fd) => return Ok(fd),
+                    Ok(fd) => {
+                        check_open_cancel(cancel)?;
+                        return Ok(fd);
+                    }
                     Err(rustix::io::Errno::INTR) => continue,
                     // Whole paths can exceed PATH_MAX while each component is valid.
                     Err(rustix::io::Errno::NAMETOOLONG) => break,
@@ -164,12 +198,22 @@ impl RootAnchor {
                 }
             }
         }
-        component_open(&self.fd, relative, flags)
+        component_open_cancellable(&self.fd, relative, flags, cancel)
     }
 
     /// Open a selected entry's parent while retaining the original scan root.
     #[cfg(target_os = "linux")]
     pub fn open_parent(&self, relative: &Path) -> io::Result<rustix::fd::OwnedFd> {
+        self.open_parent_cancellable(relative, &AtomicBool::new(false))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn open_parent_cancellable(
+        &self,
+        relative: &Path,
+        cancel: &AtomicBool,
+    ) -> io::Result<rustix::fd::OwnedFd> {
+        check_open_cancel(cancel)?;
         validate_relative(relative)?;
         if relative.file_name().is_none() {
             return Err(io::Error::new(
@@ -177,7 +221,7 @@ impl RootAnchor {
                 "the scan root has no selectable parent",
             ));
         }
-        self.open_directory(relative.parent().unwrap_or(Path::new("")))
+        self.open_directory_cancellable(relative.parent().unwrap_or(Path::new("")), cancel)
     }
 }
 
@@ -205,10 +249,11 @@ fn validate_relative(relative: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn component_open(
+fn component_open_cancellable(
     base: &rustix::fd::OwnedFd,
     path: &Path,
     final_flags: rustix::fs::OFlags,
+    cancel: &AtomicBool,
 ) -> io::Result<rustix::fd::OwnedFd> {
     use rustix::fs::OFlags;
     use std::path::Component;
@@ -233,26 +278,45 @@ fn component_open(
         } else {
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
         };
-        let next = open_component(current.as_ref().unwrap_or(base), name, flags)?;
+        let next =
+            open_component_cancellable(current.as_ref().unwrap_or(base), name, flags, cancel)?;
         current = Some(next);
     }
     match current {
         Some(fd) => Ok(fd),
-        None => open_component(base, OsStr::new("."), final_flags),
+        None => open_component_cancellable(base, OsStr::new("."), final_flags, cancel),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn open_component(
+fn open_component_cancellable(
     parent: &rustix::fd::OwnedFd,
     name: &OsStr,
     flags: rustix::fs::OFlags,
+    cancel: &AtomicBool,
 ) -> io::Result<rustix::fd::OwnedFd> {
     loop {
+        check_open_cancel(cancel)?;
         match rustix::fs::openat(parent, name, flags, rustix::fs::Mode::empty()) {
             Err(rustix::io::Errno::INTR) => continue,
-            result => return result.map_err(io::Error::from),
+            result => {
+                let fd = result.map_err(io::Error::from)?;
+                check_open_cancel(cancel)?;
+                return Ok(fd);
+            }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_open_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "anchored operation cancelled",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -288,7 +352,7 @@ pub fn enumerate(
     emit: impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     check_cancel(cancel)?;
-    let anchor = RootAnchor::open(path)?;
+    let anchor = RootAnchor::open_cancellable(path, cancel)?;
     enumerate_anchored(
         &anchor,
         Path::new(""),
@@ -315,7 +379,7 @@ pub fn enumerate_anchored(
     let batch_size = batch_size.max(1);
     #[cfg(target_os = "linux")]
     {
-        let reader = MetadataReader::Native(anchor.open_directory(relative)?);
+        let reader = MetadataReader::Native(anchor.open_directory_cancellable(relative, cancel)?);
         if backend != Backend::Std {
             let mut emitted = false;
             let result = enumerate_native(
@@ -641,6 +705,10 @@ mod tests {
     #[test]
     fn pre_cancelled_enumeration_does_not_open_the_path() {
         let cancel = AtomicBool::new(true);
+        for path in [Path::new("a-path-that-does-not-exist"), Path::new("")] {
+            let error = RootAnchor::open_cancellable(path, &cancel).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
         let result = enumerate(
             Path::new("a-path-that-does-not-exist"),
             Backend::Auto,
@@ -839,6 +907,44 @@ mod tests {
                 anchor.openat2_available.load(Ordering::Relaxed),
                 fast_open_available,
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_anchored_opens_skip_fast_and_component_resolution() {
+        std::fs::create_dir_all(".tmp").unwrap();
+        let work = tempfile::Builder::new()
+            .prefix("cancel-open-")
+            .tempdir_in(".tmp")
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let anchor = RootAnchor::open_cancellable(work.path(), &cancel).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let error = RootAnchor::open_cancellable(work.path(), &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        for fast in [true, false] {
+            anchor.openat2_available.store(fast, Ordering::Relaxed);
+            let error = anchor
+                .open_directory_cancellable(Path::new("missing/child"), &cancel)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            let error = anchor
+                .open_parent_cancellable(Path::new("missing/target"), &cancel)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            cancel.store(false, Ordering::Relaxed);
+            assert!(
+                anchor
+                    .open_directory_cancellable(Path::new(""), &cancel)
+                    .is_ok()
+            );
+            assert!(
+                anchor
+                    .open_parent_cancellable(Path::new("../outside"), &cancel)
+                    .is_err()
+            );
+            cancel.store(true, Ordering::Relaxed);
         }
     }
 }

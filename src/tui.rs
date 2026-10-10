@@ -31,7 +31,7 @@ use std::io::{self, IsTerminal};
 use std::panic::{self, PanicHookInfo};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -41,7 +41,9 @@ const MAX_BATCHES: usize = 32;
 const ORDER_BATCH: usize = 256;
 const PENDING_LIMIT: usize = 8192;
 const VIEW_BUDGET: usize = 1024;
+const SCROLL_MARGIN: usize = 3;
 const VISUAL_INTENT_LIMIT: usize = 128;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
 
 struct TerminalGuard(Option<Arc<PanicHook>>);
@@ -124,10 +126,13 @@ enum Modal {
     },
 }
 impl Modal {
-    fn help() -> Self {
+    fn help(visual: bool) -> Self {
         Self::Text {
             title: "Help",
-            text: HELP.to_owned(),
+            text: format!(
+                "{}\n\n{COMMON_HELP}",
+                if visual { VISUAL_HELP } else { NORMAL_HELP }
+            ),
             scroll: 0,
         }
     }
@@ -149,6 +154,7 @@ impl Modal {
 enum Action {
     Continue,
     Refresh(NodeId),
+    QuitWarning,
     Quit,
     QueueNavigate { end: Option<bool>, amount: isize },
     QueuePause,
@@ -263,6 +269,8 @@ struct App {
     offset: usize,
     page_size: usize,
     config: OrderConfig,
+    filter: String,
+    filter_editing: bool,
     order: CachedOrderWorker,
     next_new: usize,
     replay_cursor: Option<usize>,
@@ -299,7 +307,7 @@ struct App {
     drag_scroll: Option<(isize, usize, Instant)>,
     mouse_position: Option<(u16, u16)>,
     capture_inflight: Option<Arc<AtomicBool>>,
-    focus_after_refresh: bool,
+    focus_after_selection: bool,
     deferred_batch: Option<BatchRequest>,
     waiting_batch: Option<WaitingBatch>,
     deferred_delete: Option<DeleteRequest>,
@@ -318,7 +326,6 @@ impl App {
             generation: 0,
             child_epoch: 0,
             ids: Vec::new(),
-            directory_ids: Vec::new(),
             positions: HashMap::new(),
         });
         let preview = Preview::new(Arc::clone(&empty));
@@ -333,6 +340,8 @@ impl App {
             offset: 0,
             page_size: 1,
             config,
+            filter: String::new(),
+            filter_editing: false,
             order,
             next_new: 0,
             replay_cursor: None,
@@ -369,7 +378,7 @@ impl App {
             drag_scroll: None,
             mouse_position: None,
             capture_inflight: None,
-            focus_after_refresh: false,
+            focus_after_selection: false,
             deferred_batch: None,
             waiting_batch: None,
             deferred_delete: None,
@@ -378,6 +387,11 @@ impl App {
     }
 
     fn reset_order(&mut self, keep_previous: bool) {
+        if self.view_directory != self.directory {
+            self.filter.clear();
+            self.filter_editing = false;
+            self.order.clear_filter();
+        }
         if keep_previous {
             self.order.configure(self.config);
             if let Some(navigation) = self.pending_navigation.as_mut() {
@@ -433,6 +447,17 @@ impl App {
         false
     }
 
+    fn deletion_succeeded(&mut self, id: NodeId, parent_metadata_available: bool) {
+        let parent = self.model.node(id).parent;
+        self.removed(id);
+        if !parent_metadata_available {
+            if let Some(parent) = parent {
+                let changed = self.model.mark_metadata_uncertain(parent);
+                self.changed(changed);
+            }
+        }
+    }
+
     fn removed(&mut self, id: NodeId) {
         let old_index = self.selection_index().unwrap_or(0);
         let changed = self.model.remove(id);
@@ -457,6 +482,7 @@ impl App {
                 self.directory = self.model.node(self.directory).parent.unwrap_or(ROOT);
             }
             self.selected = None;
+            self.focus_after_selection = true;
             self.prioritize_requested = true;
             self.reset_order(false);
         } else if self
@@ -476,6 +502,7 @@ impl App {
                         .copied()
                         .find(|&next| self.eligible(next))
                 });
+            self.focus_after_selection |= self.selected.is_none();
             self.prioritize_requested = true;
             self.keep_selection_visible();
         }
@@ -592,8 +619,7 @@ impl App {
             });
         if !traversing {
             if let Some(view) = self
-                .order
-                .snapshot(self.directory)
+                .current_snapshot()
                 .filter(|view| view.child_epoch == self.model.node(self.directory).child_epoch)
             {
                 if !Arc::ptr_eq(&self.view, &view) {
@@ -606,9 +632,13 @@ impl App {
                         navigation.cursor = None;
                     }
                     if self.selected.is_some_and(|id| {
-                        !self.eligible(id) || self.model.node(id).parent != Some(self.directory)
+                        !self.eligible(id)
+                            || self.model.node(id).parent != Some(self.directory)
+                            || (!self.filter.is_empty() && !self.view.positions.contains_key(&id))
                     }) {
                         self.selected = None;
+                        self.focus_after_selection = true;
+                        self.prioritize_requested = true;
                     }
                     if self.selected.is_none() && self.pending_navigation.is_none() {
                         self.pending_navigation = Some(Navigation::new(Some(false), 0));
@@ -621,6 +651,37 @@ impl App {
             }
         }
         self.advance_navigation();
+    }
+
+    fn current_snapshot(&self) -> Option<Arc<CachedSnapshot>> {
+        if self.filter.is_empty() {
+            self.order.snapshot(self.directory)
+        } else {
+            self.order.filtered_snapshot(self.directory)
+        }
+    }
+
+    fn update_filter(&mut self) {
+        let visual = self.visual.active();
+        self.clear_visual_intent();
+        self.visual.reset(self.directory);
+        if visual {
+            self.visual.enter(self.directory, None);
+        }
+        self.pending_navigation = None;
+        self.prioritize_requested |= self.selected.take().is_some();
+        self.focus_after_selection = true;
+        self.offset = 0;
+        self.view = Arc::clone(&self.empty);
+        self.painted_rows.clear();
+        self.painted_view = Arc::clone(&self.empty);
+        if self.filter.is_empty() {
+            self.order.clear_filter();
+        } else {
+            self.order.set_filter(self.directory, &self.filter, false);
+        }
+        self.navigation_until = Instant::now();
+        self.sync_order(true);
     }
 
     fn eligible(&self, id: NodeId) -> bool {
@@ -678,15 +739,32 @@ impl App {
     }
 
     fn keep_selection_visible(&mut self) {
+        self.scroll_selection(0);
+    }
+
+    fn scroll_selection(&mut self, margin: usize) {
         let Some(index) = self.selection_index() else {
             self.offset = 0;
             return;
         };
-        if index < self.offset {
-            self.offset = index;
-        } else if self.selection_screen_row().is_none() {
-            self.offset = self.offset_for_row(index, self.page_size.saturating_sub(1));
+        let margin = margin.min(self.page_size.saturating_sub(1) / 2);
+        // Bound successor work and retain its raw extent: hidden or deleted
+        // slots can otherwise exhaust the painted window before the context.
+        let (following, last) = self
+            .rows_in(&self.view, index)
+            .skip(1)
+            .take(margin)
+            .fold((0, index), |(count, _), (next, _)| (count + 1, next));
+        let row = self.selection_screen_row();
+        if index < self.offset || row.is_some_and(|row| row < margin) {
+            self.offset = self.offset_for_row(index, margin);
+        } else if row.is_none_or(|row| row >= self.page_size.saturating_sub(margin)) {
+            let bottom = self.page_size.saturating_sub(following + 1);
+            if row.is_none_or(|row| row > bottom) {
+                self.offset = self.offset_for_row(index, bottom);
+            }
         }
+        self.offset = self.offset.max(last.saturating_sub(VIEW_BUDGET - 1));
     }
 
     fn edge_selection(&mut self, end: bool) {
@@ -716,8 +794,14 @@ impl App {
         let has_children = self
             .model
             .has_children(self.directory, false, self.config.show_hidden);
-        if !has_children {
-            self.selected = None;
+        if !has_children
+            || (!self.filter.is_empty()
+                && !Arc::ptr_eq(&self.view, &self.empty)
+                && self.view.ids.is_empty())
+        {
+            let cleared = self.selected.take().is_some();
+            self.prioritize_requested |= cleared;
+            self.focus_after_selection |= cleared;
             self.offset = 0;
             self.range_requested = false;
             self.bind_visual_cursor(None);
@@ -799,7 +883,8 @@ impl App {
             let previous_selected = self.selected;
             self.selected = cursor.target;
             self.bind_visual_cursor(self.selected);
-            if self.focus_after_refresh && previous_selected != self.selected {
+            if std::mem::take(&mut self.focus_after_selection) && previous_selected != self.selected
+            {
                 self.prioritize_requested = true;
             }
             if self.range_requested {
@@ -808,6 +893,10 @@ impl App {
                         .begin_range(Arc::clone(&self.view), id, RangeMode::Add);
                 }
                 self.range_requested = false;
+            } else if self.visual.active() && previous_selected != self.selected {
+                if let Some(id) = self.selected {
+                    self.visual.reanchor(id);
+                }
             }
             if let Some(end) = navigation.end {
                 self.offset = if end {
@@ -818,7 +907,7 @@ impl App {
                     0
                 };
             }
-            self.keep_selection_visible();
+            self.scroll_selection(SCROLL_MARGIN);
         } else {
             navigation.cursor = Some(cursor);
             self.pending_navigation = Some(navigation);
@@ -845,10 +934,19 @@ impl App {
     fn key(&mut self, key: KeyEvent, anchor: Option<Arc<RootAnchor>>, deleting: bool) -> Action {
         let interrupt =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+        // Ctrl-C remains an escape hatch before a dialog has been painted and
+        // in terminals too small to display ordinary confirmation choices.
+        if interrupt && matches!(self.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
+            return Action::Quit;
+        }
         if matches!(self.modal, Some(Modal::Stopping)) {
             return Action::Continue;
         }
-        if interrupt || (key.code == KeyCode::Char('q') && deleting) {
+        if interrupt
+            || (key.code == KeyCode::Char('q')
+                && deleting
+                && (!self.filter_editing || self.modal.is_some()))
+        {
             if let Some(Modal::Quit { reviewable }) = self.modal.as_ref() {
                 return if *reviewable {
                     Action::Quit
@@ -859,7 +957,7 @@ impl App {
             if deleting {
                 self.previous_modal = self.modal.take();
                 self.modal = Some(Modal::Quit { reviewable: false });
-                return Action::Continue;
+                return Action::QuitWarning;
             }
             return Action::Quit;
         }
@@ -1014,7 +1112,9 @@ impl App {
                         }
                     }
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {}
-                    KeyCode::Char('?') if title != "Help" => self.modal = Some(Modal::help()),
+                    KeyCode::Char('?') if title != "Help" => {
+                        self.modal = Some(Modal::help(self.visual.active()))
+                    }
                     KeyCode::Char('?') => {}
                     other => {
                         scroll_key(other, &mut scroll);
@@ -1028,6 +1128,51 @@ impl App {
             }
             return Action::Continue;
         }
+        if self.filter_editing {
+            let changed = match key.code {
+                KeyCode::Esc => {
+                    self.filter_editing = false;
+                    let changed = !self.filter.is_empty();
+                    self.filter.clear();
+                    changed
+                }
+                KeyCode::Enter => {
+                    self.filter_editing = false;
+                    false
+                }
+                KeyCode::Backspace => self.filter.pop().is_some(),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let changed = !self.filter.is_empty();
+                    self.filter.clear();
+                    changed
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !c.is_control()
+                        && self.filter.len() + c.len_utf8() <= 1024 =>
+                {
+                    self.filter.push(c);
+                    true
+                }
+                _ => false,
+            };
+            if changed {
+                self.update_filter();
+            }
+            return Action::Continue;
+        }
+        if key.code == KeyCode::Char('/') {
+            self.finish_mouse_for_input();
+            self.filter_editing = true;
+            return Action::Continue;
+        }
+        if key.code == KeyCode::Esc && !self.filter.is_empty() {
+            self.filter.clear();
+            self.update_filter();
+            return Action::Continue;
+        }
         let moving = matches!(
             key.code,
             KeyCode::Up
@@ -1039,24 +1184,6 @@ impl App {
                 | KeyCode::Char('j')
                 | KeyCode::Char('k')
         );
-        if moving
-            && key.modifiers.contains(KeyModifiers::SHIFT)
-            && !self.visual.active()
-            && self.pending_navigation.is_some()
-        {
-            self.visual.enter(self.directory, None);
-            self.range_requested = true;
-            let (end, amount) = match key.code {
-                KeyCode::Home => (Some(false), 0),
-                KeyCode::End => (Some(true), 0),
-                KeyCode::PageUp => (None, -(self.page_size as isize)),
-                KeyCode::PageDown => (None, self.page_size as isize),
-                KeyCode::Up | KeyCode::Char('k') => (None, -1),
-                _ => (None, 1),
-            };
-            self.enqueue_visual(VisualIntent::Navigate(Navigation::new(end, amount), true));
-            return Action::Continue;
-        }
         if self.visual.active() && (moving || key.code == KeyCode::Enter) {
             self.finish_mouse_for_input();
             if self.visual_busy() {
@@ -1069,7 +1196,10 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') => (None, -1),
                         _ => (None, 1),
                     };
-                    self.enqueue_visual(VisualIntent::Navigate(Navigation::new(end, amount), true));
+                    self.enqueue_visual(VisualIntent::Navigate(
+                        Navigation::new(end, amount),
+                        key.modifiers.contains(KeyModifiers::SHIFT),
+                    ));
                 } else {
                     let future_cursor = self.cursor_pending() || self.range_requested;
                     if future_cursor {
@@ -1090,12 +1220,8 @@ impl App {
         }
         if moving {
             self.prioritize_requested = true;
-            if self.visual.active() || key.modifiers.contains(KeyModifiers::SHIFT) {
-                if !self.visual.active() {
-                    self.visual.enter(self.directory, self.selected);
-                }
-                self.range_requested = true;
-            }
+            self.range_requested =
+                self.visual.active() && key.modifiers.contains(KeyModifiers::SHIFT);
         }
         if (self.cursor_pending()
             || self
@@ -1113,17 +1239,7 @@ impl App {
         {
             return Action::Continue;
         }
-        if matches!(
-            key.code,
-            KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Home
-                | KeyCode::End
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Char('j')
-                | KeyCode::Char('k')
-        ) {
+        if moving {
             self.navigation_until = Instant::now() + Duration::from_millis(150);
         }
         match key.code {
@@ -1149,7 +1265,13 @@ impl App {
                     offset: None,
                 })
             }
-            KeyCode::Char('?') => self.modal = Some(Modal::help()),
+            KeyCode::Char('?') => self.modal = Some(Modal::help(self.visual.active())),
+            KeyCode::Up | KeyCode::Down
+                if !self.visual.active() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+                self.move_selection(direction * self.page_size as isize);
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Home => self.edge_selection(false),
@@ -1177,6 +1299,7 @@ impl App {
                     if self.eligible(id) && self.model.node(id).kind == NodeKind::Directory {
                         self.directory = id;
                         self.selected = None;
+                        self.focus_after_selection = true;
                         self.clear_visual_intent();
                         self.visual.reset(id);
                         self.prioritize_requested = true;
@@ -1204,6 +1327,7 @@ impl App {
                 self.config.show_hidden = !self.config.show_hidden;
                 if self.selected.is_some_and(|id| !self.eligible(id)) {
                     self.selected = None;
+                    self.focus_after_selection = true;
                     self.prioritize_requested = true;
                 }
                 self.reset_order(true);
@@ -1529,8 +1653,15 @@ impl App {
             }
             _ => {}
         }
-        // The event loop stops reading before this bounded queue can fill.
-        debug_assert!(self.visual_intents.len() < VISUAL_INTENT_LIMIT);
+        // Keep reading terminal events so interrupts and mouse release remain
+        // reachable. Excess ordinary intents are rejected after coalescing.
+        if self.visual_intents.len() >= VISUAL_INTENT_LIMIT {
+            if let VisualIntent::Mouse(gesture) = intent {
+                self.visual
+                    .retire_snapshot_and_order(im::HashSet::new(), gesture.view);
+            }
+            return;
+        }
         self.visual_intents.push_back(intent);
     }
 
@@ -1597,6 +1728,7 @@ impl App {
                 .filter(|&id| live(id) && view.positions.contains_key(&id))
         });
         self.selected = cursor;
+        self.focus_after_selection |= cursor.is_none();
         self.prioritize_requested = true;
         if let Some(id) = cursor {
             self.bind_visual_cursor(Some(id));
@@ -1781,6 +1913,12 @@ impl App {
                 VisualIntent::CursorId(id) => {
                     self.bind_visual_cursor(Some(id));
                     if self.eligible(id) && self.model.node(id).parent == Some(self.directory) {
+                        if self.visual.active()
+                            && self.selected != Some(id)
+                            && self.mouse_press_view.is_none()
+                        {
+                            self.visual.reanchor(id);
+                        }
                         self.selected = Some(id);
                         self.keep_selection_visible();
                         self.prioritize_requested = true;
@@ -1857,7 +1995,7 @@ impl App {
 
     fn begin_model_refresh(&mut self, id: NodeId, generation: u64) {
         let previous_directory = self.directory;
-        self.focus_after_refresh = true;
+        self.focus_after_selection = true;
         self.prioritize_requested = true;
         let changed = self.model.begin_rescan(id, generation);
         self.changed(changed);
@@ -1877,7 +2015,11 @@ impl App {
             self.clear_visual_intent();
             self.visual.reset(self.directory);
         }
-        self.sync_order(true);
+        if self.directory != previous_directory {
+            self.reset_order(false);
+        } else {
+            self.sync_order(true);
+        }
     }
 
     fn repair_directory(&mut self) {
@@ -1898,6 +2040,7 @@ impl App {
             self.directory = self.model.node(self.directory).parent.unwrap_or(ROOT);
         }
         self.selected = self.model.is_live(previous).then_some(previous);
+        self.focus_after_selection |= self.selected.is_none();
         self.prioritize_requested = true;
         self.clear_visual_intent();
         self.visual.reset(self.directory);
@@ -2089,6 +2232,12 @@ impl App {
                     self.enqueue_visual(VisualIntent::CursorId(id));
                     return;
                 }
+                if self.visual.active()
+                    && self.selected != Some(id)
+                    && self.mouse_press_view.is_none()
+                {
+                    self.visual.reanchor(id);
+                }
                 self.selected = Some(id);
                 self.pending_navigation = None;
                 self.range_requested = false;
@@ -2119,6 +2268,12 @@ impl App {
             "Refreshing…"
         } else if !self.started {
             "Waiting to scan"
+        } else if self.model.node(ROOT).complete
+            && self.model.has_partial_totals(ROOT)
+            && self.model.node(ROOT).error_count == 0
+            && self.model.last_error.is_none()
+        {
+            "Partial totals"
         } else if self.model.cancelled {
             "Scan cancelled"
         } else if self.model.has_pending_removals() {
@@ -2266,7 +2421,9 @@ impl App {
     fn draw(&mut self, frame: &mut Frame<'_>, refreshing: bool, deleting: bool) {
         let area = frame.area();
         let header = Rect::new(area.x, area.y, area.width, area.height.min(1));
-        let hint = if self.visual.active() {
+        let hint = if self.filter_editing {
+            "Enter apply  Esc clear"
+        } else if self.visual.active() {
             if area.width < 40 {
                 "? help"
             } else if area.width >= 60 {
@@ -2292,13 +2449,23 @@ impl App {
                 Constraint::Length(hint.len() as u16 + 2),
             ])
             .split(header);
-        let phase_text = if self.visual.active() && area.width < 40 {
+        let mut phase_text = if self.filter_editing {
+            format!(
+                "Filter /{}",
+                clipped_tail(
+                    &self.filter,
+                    usize::from(columns[0].width).saturating_sub(8)
+                )
+            )
+        } else if self.visual.active() && area.width < 40 {
             format!("Visual {}", self.visual.len())
         } else if self.visual.active() {
             format!(
                 "Visual · {} selected{}",
                 self.visual.len(),
-                if self.visual.is_pending()
+                if !self.visual_input_available() {
+                    " · Input full"
+                } else if self.visual.is_pending()
                     || self.pending_navigation.is_some()
                     || self.range_requested
                     || !self.visual_intents.is_empty()
@@ -2314,6 +2481,9 @@ impl App {
         } else {
             self.queue_view.status.clone()
         };
+        if !self.filter_editing && !self.filter.is_empty() {
+            let _ = write!(phase_text, " · /{}", self.filter);
+        }
         let phase = phase_text.as_str();
         let path_budget =
             usize::from(columns[0].width).saturating_sub(Line::from(phase).width() + 3);
@@ -2327,6 +2497,12 @@ impl App {
             format!("{path}  {phase}")
         };
         let header_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+        if self.filter_editing && self.modal.is_none() && columns[0].width > 0 {
+            let x = Line::from(label.as_str())
+                .width()
+                .min(usize::from(columns[0].width - 1));
+            frame.set_cursor_position((columns[0].x + x as u16, columns[0].y));
+        }
         frame.render_widget(Paragraph::new(label).style(header_style), columns[0]);
         frame.render_widget(
             Paragraph::new(hint)
@@ -2357,7 +2533,9 @@ impl App {
             (body, None)
         };
         self.list_area = body;
-        self.page_size = usize::from(body.height).clamp(1, VIEW_BUDGET);
+        let page_size = usize::from(body.height).clamp(1, VIEW_BUDGET);
+        let resized = self.page_size != page_size;
+        self.page_size = page_size;
         // Earlier keyboard navigation may still own self.view. Freeze the
         // physical rows under a queued press without retargeting that work.
         let held_view = self.visual_intents.iter().find_map(|intent| match intent {
@@ -2367,7 +2545,13 @@ impl App {
             _ => None,
         });
         if held_view.is_none() {
-            self.keep_selection_visible();
+            // Hover and held presses must not scroll rows away from the pointer.
+            let margin = if resized && self.mouse_press_view.is_none() && !self.has_held_mouse() {
+                SCROLL_MARGIN
+            } else {
+                0
+            };
+            self.scroll_selection(margin);
         }
         let total = self.size(self.directory);
         static SPINNER_CLOCK: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -2392,7 +2576,13 @@ impl App {
             lines.push(self.row(id, total, body.width, self.selected == Some(id), spinner));
         }
         if lines.is_empty() {
-            let message = if self
+            let message = if !self.filter.is_empty() {
+                if Arc::ptr_eq(&self.view, &self.empty) {
+                    "Filtering…"
+                } else {
+                    "No matching entries."
+                }
+            } else if self
                 .model
                 .has_children(self.directory, false, self.config.show_hidden)
             {
@@ -2423,17 +2613,17 @@ impl App {
                 preview_area.height,
             );
             let mut rows = vec![
-                Line::from("Subdirectories").style(
+                Line::from("Contents").style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
-            for &id in self.preview.view.directory_ids.iter().take(1024) {
+            for &id in self.preview.view.ids.iter().take(1024) {
                 if rows.len() >= usize::from(pane.height) {
                     break;
                 }
-                if !self.eligible(id) || self.model.node(id).kind != NodeKind::Directory {
+                if !self.eligible(id) {
                     continue;
                 }
                 rows.push(self.row(
@@ -2450,7 +2640,7 @@ impl App {
                     .node(hovered.expect("preview has a hovered directory"));
                 let message = if self.model.has_children(
                     hovered.expect("preview has a hovered directory"),
-                    true,
+                    false,
                     self.config.show_hidden,
                 ) {
                     "Ordering entries…"
@@ -2459,7 +2649,7 @@ impl App {
                 } else if !self.model.listing_complete(hovered.unwrap()) {
                     "Waiting for scan…"
                 } else {
-                    "No subdirectories."
+                    "No child entries."
                 };
                 rows.push(Line::from(message).style(Style::default().fg(Color::DarkGray)));
             }
@@ -2661,23 +2851,31 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: &mut Modal, queue: &mut 
             );
         }
         Modal::Quit { reviewable } => {
-            let popup = centered(area, width, area.height.min(7));
+            let popup = centered(area, width, area.height.min(8));
             let block = border("Deletions in progress");
             let inner = block.inner(popup);
-            *reviewable = inner.width >= 32 && inner.height >= 4;
+            *reviewable = inner.width >= 32 && inner.height >= 6;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
+            let progress = if queue.status.is_empty() {
+                "Waiting for confirmed deletions.".to_owned()
+            } else {
+                queue.status.clone()
+            };
             let lines = if *reviewable {
                 vec![
-                    Line::from("Cancel all deletions and quit?"),
-                    Line::from("Wait for the worker to stop.")
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Line::from("Finishing deletions. Scanning stopped."),
+                    Line::from(progress).style(Style::default().fg(Color::Cyan)),
+                    Line::from("Quits when deletion finishes."),
+                    controls("Ctrl-C", ": cancel all and quit"),
                     controls("q / Enter", ": cancel all and quit"),
                     controls("n / Esc", ": keep browsing"),
                 ]
             } else {
                 vec![
-                    Line::from("Resize to review"),
+                    controls("Ctrl-C", ": cancel all and quit"),
+                    Line::from("Scanning stopped."),
+                    Line::from(progress),
                     controls("n / Esc", ": keep browsing"),
                 ]
             };
@@ -2701,15 +2899,18 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: &mut Modal, queue: &mut 
             );
         }
         Modal::Stopping => {
-            let popup = centered(area, width, area.height.min(5));
+            let popup = centered(area, width, area.height.min(6));
             let block = border("Stopping deletions");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             frame.render_widget(
-                Paragraph::new("Cancelling; waiting for the worker to stop…")
-                    .wrap(Wrap { trim: false })
-                    .style(style),
+                Paragraph::new(vec![
+                    Line::from("Cancelling deletions; exiting shortly."),
+                    Line::from(queue.status.clone()).style(Style::default().fg(Color::Cyan)),
+                    controls("Ctrl-C", ": quit now"),
+                ])
+                .style(style),
                 inner,
             );
         }
@@ -2788,6 +2989,16 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: &mut Modal, queue: &mut 
                 .lines()
                 .map(|line| {
                     if *title == "Help" {
+                        if matches!(
+                            line,
+                            "Normal mode" | "Visual mode" | "Common keys" | "Deletion queue"
+                        ) {
+                            return Line::from(line.to_owned()).style(
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            );
+                        }
                         if let Some((keys, action)) = line.split_once("    ") {
                             return Line::from(vec![
                                 Span::styled(
@@ -2841,11 +3052,32 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, modal: &mut Modal, queue: &mut 
     }
 }
 
-const HELP: &str = "↑/k ↓/j            Move selection
-→/l/Enter          Open directory
-←/h/Backspace/<    Parent directory
+const NORMAL_HELP: &str = "Normal mode
+Shift+↑/↓          Move one page
+Enter              Open directory
+d                  Delete current entry; confirm with y/Enter
+D                  Deletion queue
+v / V              Enter visual mode";
+
+const VISUAL_HELP: &str = "Visual mode
+Shift+↑/↓          Extend selection
+Shift+Home/End     Select to first/last entry
+Shift+PgUp/PgDown  Extend by one page
+Enter              Select/deselect current entry
+Click / drag       Toggle / add range; hold edge to scroll
+Shift-click/drag   Extend / invert range
+d / D / Delete     Confirm selected deletions
+v / V / Esc        Leave visual mode; Esc clears an active filter first";
+
+const COMMON_HELP: &str = "Common keys
+↑/k ↓/j            Move cursor without selecting
 Home/End           First/last entry
 PageUp/PageDown    Move one page
+→/l                Open directory
+←/h/Backspace/<    Parent directory
+/                  Filter file/folder names here; no subdirectory search
+Enter / Esc        Finish filter input / clear filter
+Backspace / Ctrl-U  Delete filter character / clear input
 n/s/C              Sort by name/size/items; repeat to reverse
 a                  Allocated/apparent sizes
 t                  Directories first
@@ -2853,23 +3085,21 @@ g                  Fractional bar/percentage/no graph
 c                  Item counts
 e                  Show/hide dotfiles
 i                  Entry information
-d                  Delete after y/Enter confirmation; n/Esc cancels
-v / V              Visual selection; arrows extend, Enter toggles
-Click / drag       Toggle / add a visual range; hold edge to scroll
-Shift-click/drag   Extend / invert; release Shift to keep dragging
-d / D / Delete     In visual mode confirm selected deletions
-D                  Outside visual mode, open deletion queue
-Space / d          Pause queue / cancel or remove selected queue item
-Shift+↑↓ / K/J     Reorder selected queued deletion
 r / R              Rescan selected folder / current directory
-? / Esc            Close help
-q / Ctrl-C         Quit; with deletions confirm cancellation first
+?                  Help
+q / Ctrl-C         Quit; confirm cancellation if deleting
 
-⠋ unfinished entry    ~ partial size after errors    ! read error
+Deletion queue
+Space / d          Pause waiting jobs / cancel selected job
+c / x              Cancel active job / remove waiting job
+Shift+↑↓ / K/J     Reorder waiting job
+D / Esc            Close queue
+
+⠋ unfinished entry    ~ partial size    ! read error
 Sorting includes unfinished entries.
 Near-size groups retain their previous order.
 Graph shows the share of known directory size.
-At 120+ columns, hovered directories preview their subdirectories.
+At 120+ columns, preview shows files and directories.
 Symlinks are not followed; hardlinks counted once.";
 
 struct DeleteRequest {
@@ -2943,7 +3173,7 @@ fn prepare_batch(
     if app.visual.is_empty() {
         app.modal = Some(Modal::notice(
             "Nothing selected",
-            "Mark entries with Enter or arrows.".to_owned(),
+            "Mark entries with Enter or Shift+arrows.".to_owned(),
         ));
         return;
     }
@@ -3089,6 +3319,40 @@ fn cancel_batch(
             preparation.order,
         );
         retired.push_back(preparation.worker);
+    }
+}
+
+fn cancel_unconfirmed(
+    app: &mut App,
+    batch: &mut Option<BatchPreparation>,
+    retired: &mut VecDeque<BatchCapture>,
+) {
+    app.cancel_deferred_batch();
+    app.deferred_delete = None;
+    if batch
+        .as_ref()
+        .is_some_and(|preparation| !preparation.dispatching && !preparation.confirm_pending)
+    {
+        cancel_batch(app, batch, retired);
+    }
+    // A quit warning can suspend a confirmation or a pending identity check.
+    // Keep confirmed admission intact and never replace the warning itself.
+    for modal in [&mut app.modal, &mut app.previous_modal] {
+        if matches!(modal, Some(Modal::Delete { .. }))
+            || (batch.is_none() && matches!(modal, Some(Modal::Batch { .. })))
+            || matches!(
+                modal,
+                Some(Modal::Text {
+                    title: "Selecting entries"
+                        | "Preparing selection"
+                        | "Stopping selection"
+                        | "Stopping target",
+                    ..
+                })
+            )
+        {
+            *modal = None;
+        }
     }
 }
 
@@ -3255,6 +3519,7 @@ fn pump_batch(
         done = true;
     }
     if done {
+        let confirmed = preparation.dispatching || preparation.confirm_pending;
         cancel_batch(app, batch, retired);
         for modal in [&mut app.modal, &mut app.previous_modal] {
             if matches!(modal, Some(Modal::Batch { .. } | Modal::Enqueueing)) {
@@ -3262,11 +3527,18 @@ fn pump_batch(
             }
         }
         if let Some(error) = error {
-            let notice = Modal::notice("Cannot delete", printable(OsStr::new(&error)));
-            if matches!(app.modal, Some(Modal::Quit { .. })) {
-                app.previous_modal = Some(notice);
+            let message = printable(OsStr::new(&error));
+            if confirmed && matches!(app.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
+                // Closing must report an incomplete confirmed batch after the
+                // terminal is restored, or display it once if quitting is dismissed.
+                app.delete_notice = Some(message);
             } else {
-                app.modal = Some(notice);
+                let notice = Modal::notice("Cannot delete", message);
+                if matches!(app.modal, Some(Modal::Quit { .. })) {
+                    app.previous_modal = Some(notice);
+                } else {
+                    app.modal = Some(notice);
+                }
             }
         }
     }
@@ -3465,14 +3737,34 @@ fn begin_refresh(
     true
 }
 
-fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: &mut DeleteQueue) {
-    app.cancel_deferred_batch();
-    app.deferred_delete = None;
-    queue.cancel_all();
+fn stop_scanning(scanner: &ScanHandle, scopes: &[ScopedScan]) {
     scanner.cancel();
     for scope in scopes {
         scope.handle.cancel();
     }
+}
+
+fn prioritize_deletion(scanner: &ScanHandle, scopes: &[ScopedScan], deleting: bool) {
+    scanner.set_paused(deleting);
+    for scope in scopes {
+        scope.handle.set_paused(deleting);
+    }
+}
+
+fn take_interrupt(interrupts: &AtomicUsize) -> bool {
+    // The UI is the only consumer; signal callbacks only increment the count.
+    if interrupts.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    interrupts.fetch_sub(1, Ordering::AcqRel);
+    true
+}
+
+fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: &mut DeleteQueue) {
+    app.cancel_deferred_batch();
+    app.deferred_delete = None;
+    queue.cancel_all();
+    stop_scanning(scanner, scopes);
     app.modal = Some(Modal::Stopping);
 }
 
@@ -3483,15 +3775,17 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
             "interactive browsing requires a terminal; use --json for non-interactive output",
         ));
     }
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal_stop = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal_stop.store(true, Ordering::Release))
-        .map_err(io::Error::other)?;
+    let interrupts = Arc::new(AtomicUsize::new(0));
+    let signal_interrupts = Arc::clone(&interrupts);
+    ctrlc::set_handler(move || {
+        signal_interrupts.fetch_add(1, Ordering::Release);
+    })
+    .map_err(io::Error::other)?;
     let mut app = App::new(root.clone(), size_mode)?;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.draw(|frame| app.draw(frame, false, false))?;
-    if stop.load(Ordering::Acquire) {
+    if take_interrupt(&interrupts) {
         return Ok(());
     }
     let scanner = scan::spawn(root, options.clone());
@@ -3503,13 +3797,16 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
     let mut refresh_requests = VecDeque::new();
     let mut generation = 0;
     let mut quitting = false;
+    let mut closing = false;
+    let mut scans_stopped = false;
+    let mut shutdown_deadline = None;
     let mut failure = None;
     app.started = true;
     let mut next_frame = Instant::now();
     let mut background_phase = 0;
     let mut order_backlog = true;
     let mut input_timeout = Duration::from_millis(1);
-    loop {
+    'events: loop {
         app.pump_confirmation();
         let selection_progress = app.pump_visual();
         if selection_progress && !app.visual.is_pending() {
@@ -3517,20 +3814,27 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         }
         let queue_progress = queue.pump(128);
         pump_retired_batches(&mut app, &mut retired_batches);
-        if !quitting && !stop.load(Ordering::Acquire) && failure.is_none() {
+        if !quitting && !closing && failure.is_none() {
             resume_batch(&mut app, &mut batch, &retired_batches);
         }
-        if !quitting && (stop.load(Ordering::Acquire) || failure.is_some()) {
+        if !quitting && failure.is_some() {
             quitting = true;
+            shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
             cancel_batch(&mut app, &mut batch, &mut retired_batches);
             stop_work(&mut app, &scanner, &scopes, &mut queue);
             next_frame = Instant::now();
         }
-        if quitting && queue.active().is_none() {
+        if (quitting
+            && (queue.active().is_none()
+                || shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline)))
+            || (closing && !queue.is_busy() && batch.is_none())
+        {
             break;
         }
-        let input = if quitting || !app.visual_input_available() {
-            Ok(false)
+        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
+        let interrupt = take_interrupt(&interrupts);
+        let input = if interrupt {
+            Ok(true)
         } else {
             event::poll(input_timeout)
         };
@@ -3540,11 +3844,15 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                 continue;
             }
             Ok(true) => {
-                let event = match event::read() {
-                    Ok(event) => event,
-                    Err(error) => {
-                        failure = Some(error);
-                        continue;
+                let event = if interrupt {
+                    Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                } else {
+                    match event::read() {
+                        Ok(event) => event,
+                        Err(error) => {
+                            failure = Some(error);
+                            continue;
+                        }
                     }
                 };
                 match event {
@@ -3556,9 +3864,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                                 Some(reviewable)
                             }
                             Some(Modal::Quit { reviewable })
-                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter)
-                                    || (key.code == KeyCode::Char('c')
-                                        && key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter) =>
                             {
                                 Some(reviewable)
                             }
@@ -3588,9 +3894,28 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                             }
                         }
                         let anchor = scanner.anchor.get().cloned();
-                        match app.key(key, anchor, queue.is_busy() || batch.is_some()) {
+                        match app.key(
+                            key,
+                            anchor,
+                            queue.is_busy()
+                                || batch.as_ref().is_some_and(|batch| {
+                                    batch.dispatching || batch.confirm_pending
+                                }),
+                        ) {
+                            Action::QuitWarning => {
+                                cancel_unconfirmed(&mut app, &mut batch, &mut retired_batches);
+                                closing = true;
+                                scans_stopped = true;
+                                stop_scanning(&scanner, &scopes);
+                                refresh_requests.clear();
+                            }
                             Action::Quit => {
+                                if quitting {
+                                    break 'events;
+                                }
                                 quitting = true;
+                                closing = false;
+                                shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
                                 cancel_batch(&mut app, &mut batch, &mut retired_batches);
                                 stop_work(&mut app, &scanner, &scopes, &mut queue);
                             }
@@ -3637,7 +3962,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                                     if selected_active && matches!(key.code, KeyCode::Char('d')) {
                                         queue.cancel_active();
                                     } else if let Some(entry) = queue.remove_pending(id) {
-                                        request_refresh(&mut refresh_requests, entry.node);
+                                        if !scans_stopped {
+                                            request_refresh(&mut refresh_requests, entry.node);
+                                        }
                                     }
                                 }
                             }
@@ -3651,9 +3978,13 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                             }
                             Action::Continue => {}
                         }
+                        if closing && !matches!(app.modal, Some(Modal::Quit { .. })) {
+                            closing = false;
+                        }
                         if !quitting {
                             queue.start_next();
                         }
+                        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
                         app.pump_visual();
                         app.show_delete_notice();
                         prioritize_requested(&mut app, &scanner, &scopes);
@@ -3672,7 +4003,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         }
                         next_frame = Instant::now() + FRAME_INTERVAL;
                     }
-                    Event::Mouse(mouse) => {
+                    Event::Mouse(mouse) if !quitting => {
                         app.mouse(mouse);
                         app.pump_visual();
                         app.show_delete_notice();
@@ -3725,7 +4056,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                 app.changed(changed);
             }
             match result.outcome {
-                Ok(()) => app.removed(id),
+                Ok(()) => app.deletion_succeeded(id, result.parent_metadata.is_some()),
                 Err(error) if !quitting && !cancelled => {
                     app.delete_failed(id, &error);
                 }
@@ -3741,6 +4072,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
             }
             if needs_reconcile
                 && !quitting
+                && !scans_stopped
                 && app.model.is_live(id)
                 && app.model.node(id).kind == NodeKind::Directory
             {
@@ -3773,15 +4105,16 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
             scope_retirer.try_retire(scopes)
         });
         app.repair_directory();
-        if scopes.is_empty() {
-            app.focus_after_refresh = false;
-        }
         prioritize_requested(&mut app, &scanner, &scopes);
         let scan_backlog = app.scan_entries.is_some() || !scanner.receiver.is_empty();
         if !quitting {
             // Apply a stopped worker's completion before starting the next FIFO item.
             queue.start_next();
-            let requests = refresh_requests.len();
+            let requests = if closing || queue.active().is_some() {
+                0
+            } else {
+                refresh_requests.len()
+            };
             for _ in 0..requests.min(MAX_BATCHES) {
                 let Some(id) = refresh_requests.pop_front() else {
                     break;
@@ -3799,6 +4132,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                 }
             }
         }
+        prioritize_deletion(&scanner, &scopes, queue.active().is_some());
         if !quitting && app.show_delete_notice() {
             next_frame = Instant::now();
         }
@@ -3818,8 +4152,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
             next_frame = Instant::now() + FRAME_INTERVAL;
         }
         if quitting {
-            // No join or uninterruptible terminal operation on the input thread.
-            std::thread::sleep(INPUT_INTERVAL);
+            input_timeout = INPUT_INTERVAL;
             continue;
         }
         let scope_backlog = scopes
@@ -3849,7 +4182,8 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
     for scope in &scopes {
         scope.handle.cancel();
     }
-    // Deletion has stopped. Restore the terminal before waiting for cleanup admission.
+    // A cancelled syscall may still be blocked. Restore the terminal without
+    // joining workers; process exit ends any remaining detached work.
     drop(terminal);
     drop(_guard);
     scopes.push(ScopedScan {
@@ -3860,12 +4194,20 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         entries: app.scan_entries.take(),
         finished: app.baseline_finished,
     });
-    while !scopes.is_empty() {
-        retire_scopes_with(&mut scopes, true, |scopes| scope_retirer.try_retire(scopes));
-        if !scopes.is_empty() {
-            std::thread::sleep(INPUT_INTERVAL);
-        }
+    if failure.is_none() {
+        failure = app
+            .delete_notice
+            .take()
+            .map(|message| io::Error::other(format!("Delete failed: {message}")));
     }
+    // Reclaim large models, cached views, queues and scoped state off-thread.
+    // If thread creation fails, dropping the closure must not synchronously
+    // reclaim them here: the exiting process will release those allocations.
+    let cleanup =
+        std::mem::ManuallyDrop::new((app, queue, batch, retired_batches, scopes, refresh_requests));
+    let _ = std::thread::Builder::new()
+        .name("ldu-exit".into())
+        .spawn(move || drop(std::mem::ManuallyDrop::into_inner(cleanup)));
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
@@ -4036,6 +4378,26 @@ fn human_size(bytes: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     }
 }
+fn clipped_tail(text: &str, width: usize) -> String {
+    let line = Line::from(text);
+    if line.width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut skip = line.width().saturating_sub(width - 1);
+    let mut output = String::from("…");
+    for grapheme in line.styled_graphemes(Style::default()) {
+        if skip > 0 {
+            skip = skip.saturating_sub(Span::raw(grapheme.symbol).width());
+        } else {
+            output.push_str(grapheme.symbol);
+        }
+    }
+    output
+}
+
 fn clipped(text: &str, width: usize) -> String {
     if Line::from(text).width() <= width {
         return text.to_owned();
@@ -4269,13 +4631,13 @@ mod tests {
     #[test]
     fn help_scrolls_to_final_explanation_and_zero_width_dialog_remains_safe() {
         let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
-        app.modal = Some(Modal::help());
+        app.modal = Some(Modal::help(app.visual.active()));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(38, 8)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         let first = rendered(&terminal);
-        assert!(first.contains("Move selection"));
+        assert!(first.contains("Normal mode"));
         app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), None, false);
         terminal
             .draw(|frame| app.draw(frame, false, false))
@@ -4285,7 +4647,7 @@ mod tests {
         // without treating border cells as part of a logical sentence.
         assert!(
             last.contains("Help")
-                && last.contains("subdirectories.")
+                && last.contains("directories.")
                 && last.contains("counted once.")
         );
         assert!(last.contains("Enter / Esc: close"));
@@ -4478,30 +4840,78 @@ mod tests {
     }
 
     #[test]
-    fn quit_and_ctrl_c_guard_wait_for_visible_cancel_choices() {
-        for key in [
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        ] {
+    fn quit_key_keeps_reviewability_and_warning_shows_live_delete_progress() {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(matches!(app.key(quit, None, true), Action::QuitWarning));
+        assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
+        assert!(matches!(app.key(quit, None, true), Action::Continue));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert!(matches!(
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                true
+            ),
+            Action::Continue
+        ));
+        app.queue_view.status = "Deleting · 12 removed · 3 queued".to_owned();
+        terminal.backend_mut().resize(80, 12);
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        let text = rendered(&terminal);
+        assert!(text.contains("Deletions in progress"));
+        assert!(text.contains("Finishing deletions. Scanning stopped."));
+        assert!(text.contains("12 removed · 3 queued"));
+        assert!(text.contains("Ctrl-C") && text.contains("cancel all and quit"));
+        app.queue_view.status = "Deleting · 23 removed · 2 queued".to_owned();
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert!(rendered(&terminal).contains("23 removed · 2 queued"));
+        assert!(matches!(app.key(quit, None, true), Action::Quit));
+    }
+
+    #[test]
+    fn second_ctrl_c_quits_before_first_paint_and_in_tiny_terminals() {
+        for dimensions in [None, Some((1, 1)), Some((80, 4))] {
             let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
-            assert!(matches!(app.key(key, None, true), Action::Continue));
-            assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
-            assert!(matches!(app.key(key, None, true), Action::Continue));
-            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
-            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            app.modal = Some(Modal::Enqueueing);
+            let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
             assert!(matches!(
-                app.key(
-                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                    None,
-                    true
-                ),
-                Action::Continue
+                app.key(interrupt, None, true),
+                Action::QuitWarning
             ));
-            terminal.backend_mut().resize(80, 12);
-            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
-            assert!(rendered(&terminal).contains("Deletions in progress"));
-            assert!(matches!(app.key(key, None, true), Action::Quit));
+            assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
+            assert!(matches!(app.previous_modal, Some(Modal::Enqueueing)));
+            if let Some((width, height)) = dimensions {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+                assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
+            }
+            assert!(matches!(app.key(interrupt, None, true), Action::Quit));
         }
+    }
+
+    #[test]
+    fn ctrl_c_remains_available_while_stopping() {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        app.modal = Some(Modal::Stopping);
+        assert!(matches!(
+            app.key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                None,
+                true
+            ),
+            Action::Continue
+        ));
+        assert!(matches!(
+            app.key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                None,
+                true
+            ),
+            Action::Quit
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -4910,6 +5320,119 @@ mod tests {
         queue.cancel_all();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quit_warning_retires_unconfirmed_batch_while_confirmed_queue_finishes() {
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        std::fs::create_dir(fixture.path().join("folder")).unwrap();
+        std::fs::write(fixture.path().join("root-file"), b"confirmed").unwrap();
+        let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+        let mut app = browser_fixture_at(fixture.path().to_owned());
+        app.selected = Some(1);
+        app.visual.enter(ROOT, Some(1));
+        let mut batch = None;
+        let mut retired = VecDeque::new();
+        prepare_batch(&mut app, Some(Arc::clone(&anchor)), &mut batch, &retired);
+        assert!(batch.is_some());
+        let mut queue = DeleteQueue::new().unwrap();
+        assert!(
+            queue
+                .enqueue(2, Arc::clone(&anchor), "root-file".into())
+                .inserted
+        );
+        assert!(queue.start_next());
+        assert!(matches!(
+            app.key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                None,
+                true
+            ),
+            Action::QuitWarning
+        ));
+        cancel_unconfirmed(&mut app, &mut batch, &mut retired);
+        assert!(batch.is_none());
+        assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+        assert!(app.previous_modal.is_none());
+        assert_eq!(queue.active().unwrap().node, 2);
+        assert!(!queue.is_cancelling());
+
+        let mut completed = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.is_busy() || !retired.is_empty() {
+            queue.pump(128);
+            if let Some(completion) = queue.poll() {
+                assert_eq!(completion.entry.node, 2);
+                assert!(completion.result.outcome.is_ok());
+                completed = true;
+            }
+            pump_retired_batches(&mut app, &mut retired);
+            assert!(Instant::now() < deadline, "quit preparation did not retire");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(completed);
+        assert!(
+            !queue.is_busy() && batch.is_none(),
+            "graceful closing must finish"
+        );
+        assert!(fixture.path().join("folder").is_dir());
+        assert!(!fixture.path().join("root-file").exists());
+        assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quit_warning_preserves_confirmed_admission_and_clears_later_requests() {
+        for dispatching in [false, true] {
+            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            std::fs::write(fixture.path().join("root-file"), b"retained").unwrap();
+            let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+            let mut app = browser_fixture_at(fixture.path().to_owned());
+            app.selected = Some(2);
+            app.visual.enter(ROOT, Some(2));
+            let mut batch = None;
+            let mut retired = VecDeque::new();
+            prepare_batch(&mut app, Some(Arc::clone(&anchor)), &mut batch, &retired);
+            let preparation = batch.as_mut().unwrap();
+            preparation.dispatching = dispatching;
+            preparation.confirm_pending = !dispatching;
+            app.modal = Some(Modal::Enqueueing);
+            app.waiting_batch = Some(WaitingBatch {
+                directory: ROOT,
+                epoch: app.model.node(ROOT).child_epoch,
+                anchor: Arc::clone(&anchor),
+            });
+            app.deferred_delete = Some(DeleteRequest {
+                id: 2,
+                anchor: Arc::clone(&anchor),
+                relative: "root-file".into(),
+                target: "root-file".to_owned(),
+            });
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    None,
+                    true
+                ),
+                Action::QuitWarning
+            ));
+            cancel_unconfirmed(&mut app, &mut batch, &mut retired);
+            let preparation = batch.as_ref().expect("confirmed admission was cancelled");
+            assert_eq!(preparation.dispatching, dispatching);
+            assert_eq!(preparation.confirm_pending, !dispatching);
+            assert!(retired.is_empty());
+            assert!(app.waiting_batch.is_none() && app.deferred_delete.is_none());
+            assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+            assert!(matches!(app.previous_modal, Some(Modal::Enqueueing)));
+            cancel_batch(&mut app, &mut batch, &mut retired);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !retired.is_empty() {
+                pump_retired_batches(&mut app, &mut retired);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     #[test]
     fn confirmed_batch_admission_blocks_bypass_keys_and_guards_quit_immediately() {
         for confirm in [KeyCode::Char('y'), KeyCode::Enter] {
@@ -5098,6 +5621,90 @@ mod tests {
         pump_retired_batches(&mut app, &mut retired);
         assert!(retired.is_empty());
         queue.cancel_all();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+        let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
+        for stopping in [false, true] {
+            for disconnected in [false, true] {
+                for confirm_pending in [false, true] {
+                    let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
+                    app.modal = Some(if stopping {
+                        Modal::Stopping
+                    } else {
+                        Modal::Quit { reviewable: false }
+                    });
+                    app.previous_modal = Some(Modal::Enqueueing);
+                    let message = if disconnected {
+                        "Could not finish preparing selected deletions."
+                    } else {
+                        "Confirmed batch admission failed."
+                    };
+                    let events = if disconnected {
+                        Vec::new()
+                    } else {
+                        vec![BatchEvent::Failed(message.to_owned())]
+                    };
+                    let mut batch = Some(BatchPreparation {
+                        worker: BatchCapture::finishing_after_empty(events),
+                        remaining: im::HashSet::new(),
+                        pending: None,
+                        directory: ROOT,
+                        epoch: app.model.node(ROOT).child_epoch,
+                        relative: PathBuf::new(),
+                        anchor: Arc::clone(&anchor),
+                        order: Arc::clone(&app.view),
+                        show_hidden: true,
+                        input_finished: true,
+                        dispatching: !confirm_pending,
+                        confirm_pending,
+                    });
+                    let mut queue = DeleteQueue::new().unwrap();
+                    let mut retired = VecDeque::new();
+                    for _ in 0..3 {
+                        pump_batch(
+                            &mut app,
+                            &scanner,
+                            &[],
+                            &mut queue,
+                            &mut batch,
+                            &mut retired,
+                        );
+                    }
+                    assert!(batch.is_none() && !queue.is_busy());
+                    assert_eq!(app.delete_notice.as_deref(), Some(message));
+                    assert!(app.previous_modal.is_none());
+                    assert!(!app.show_delete_notice());
+                    if stopping {
+                        assert!(matches!(app.modal, Some(Modal::Stopping)));
+                    } else {
+                        assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+                        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+                        assert!(app.show_delete_notice());
+                        assert!(matches!(
+                            app.modal,
+                            Some(Modal::Text {
+                                title: "Delete failed",
+                                ..
+                            })
+                        ));
+                        assert!(app.delete_notice.is_none());
+                        app.key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            None,
+                            false,
+                        );
+                        assert!(app.modal.is_none() && !app.show_delete_notice());
+                    }
+                    pump_retired_batches(&mut app, &mut retired);
+                    assert!(retired.is_empty());
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5301,7 +5908,7 @@ mod tests {
     #[test]
     fn deferred_delete_notice_keeps_latest_failure_and_survives_other_removal() {
         let mut app = browser_fixture();
-        app.modal = Some(Modal::help());
+        app.modal = Some(Modal::help(app.visual.active()));
         app.delete_failed(2, &io::Error::other("first failure"));
         app.delete_failed(1, &io::Error::other("latest failure"));
         app.removed(2);
@@ -5323,7 +5930,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_arrows_extend_and_enter_toggles_before_batch_confirmation() {
+    fn visual_shift_arrows_extend_and_enter_toggles_before_batch_confirmation() {
         let mut app = browser_fixture();
         app.selected = Some(1);
         app.key(
@@ -5333,7 +5940,7 @@ mod tests {
         );
         assert!(app.visual.contains(1));
         app.key(
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
             None,
             false,
         );
@@ -5499,7 +6106,7 @@ mod tests {
             app.visual
                 .begin_range(Arc::clone(&app.view), start, RangeMode::Add);
             for key in [first, second] {
-                app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false);
+                app.key(KeyEvent::new(key, KeyModifiers::SHIFT), None, false);
             }
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(expected));
@@ -5565,7 +6172,12 @@ mod tests {
         app.sync_order(true);
         assert_eq!(app.selected, Some(1));
         for code in [KeyCode::Char('v'), KeyCode::Enter, KeyCode::Down] {
-            app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+            let modifiers = if code == KeyCode::Down {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            app.key(KeyEvent::new(code, modifiers), None, false);
         }
         finish_visual(&mut app);
         assert!(!app.visual.contains(1) && app.visual.contains(2));
@@ -5580,7 +6192,7 @@ mod tests {
         wait_cache(&mut app, ROOT, &[3, 1, 2]);
         app.sync_order(true);
         app.key(
-            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
             None,
             false,
         );
@@ -5626,9 +6238,21 @@ mod tests {
                     finish_visual(&mut app);
                     assert_eq!(app.selected, Some(if backwards { 3 } else { 5 }));
                     for id in 3..=5 {
-                        assert_eq!(app.visual.contains(id), id != anchor);
+                        assert_eq!(
+                            app.visual.contains(id),
+                            id != anchor
+                                && (modifiers == KeyModifiers::SHIFT
+                                    || id == if backwards { 3 } else { 5 })
+                        );
                     }
-                    assert_eq!(app.visual.len(), 2);
+                    assert_eq!(
+                        app.visual.len(),
+                        if modifiers == KeyModifiers::SHIFT {
+                            2
+                        } else {
+                            1
+                        }
+                    );
                 }
             }
         }
@@ -5640,13 +6264,18 @@ mod tests {
             let mut app = pending_folder_selection();
             if queued_cursor {
                 app.key(
-                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
                     None,
                     false,
                 );
             }
             for code in [KeyCode::Enter, KeyCode::Enter, KeyCode::Up] {
-                app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+                let modifiers = if code == KeyCode::Up {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                app.key(KeyEvent::new(code, modifiers), None, false);
             }
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(if queued_cursor { 4 } else { 3 }));
@@ -5692,7 +6321,12 @@ mod tests {
                 app.range_requested = true;
             }
             for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
-                app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+                let modifiers = if code == KeyCode::Down {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                app.key(KeyEvent::new(code, modifiers), None, false);
             }
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(5));
@@ -5957,6 +6591,103 @@ mod tests {
         assert!(!app.has_held_mouse());
         finish_visual(&mut app);
         assert!(app.visual.contains(3) && app.visual.contains(4) && !app.visual.contains(5));
+    }
+
+    #[test]
+    fn full_visual_queue_rejects_overflow_and_preserves_coalescing() {
+        for hover in [false, true] {
+            let mut app = pending_folder_selection();
+            for index in 0..VISUAL_INTENT_LIMIT - 1 {
+                app.enqueue_visual(VisualIntent::ToggleStable(if index % 2 == 0 {
+                    3
+                } else {
+                    4
+                }));
+            }
+            if hover {
+                app.enqueue_visual(VisualIntent::CursorId(3));
+            } else {
+                app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, 1), false));
+            }
+            assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
+            assert!(!app.visual_input_available());
+            app.enqueue_visual(VisualIntent::ToggleStable(5));
+            assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
+            for (index, intent) in app
+                .visual_intents
+                .iter()
+                .take(VISUAL_INTENT_LIMIT - 1)
+                .enumerate()
+            {
+                assert!(matches!(intent, VisualIntent::ToggleStable(id)
+                    if *id == if index % 2 == 0 { 3 } else { 4 }));
+            }
+            if hover {
+                app.enqueue_visual(VisualIntent::CursorId(5));
+                assert!(matches!(
+                    app.visual_intents.back(),
+                    Some(VisualIntent::CursorId(5))
+                ));
+            } else {
+                app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, 2), false));
+                app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, -1), false));
+                assert!(
+                    matches!(app.visual_intents.back(), Some(VisualIntent::Navigate(navigation, false))
+                    if navigation.amount == 3 && navigation.end.is_none())
+                );
+            }
+            assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(rendered(&terminal).contains("Input full"));
+        }
+    }
+
+    #[test]
+    fn full_visual_queue_keeps_interrupt_escape_and_release_reachable() {
+        for deleting in [false, true] {
+            let mut app = pending_folder_selection();
+            for _ in 0..VISUAL_INTENT_LIMIT {
+                app.enqueue_visual(VisualIntent::ToggleCurrent);
+            }
+            assert!(!app.visual_input_available());
+            let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let action = app.key(interrupt, None, deleting);
+            if deleting {
+                assert!(matches!(action, Action::QuitWarning));
+                assert!(matches!(app.key(interrupt, None, true), Action::Quit));
+            } else {
+                assert!(matches!(action, Action::Quit));
+            }
+        }
+        let mut app = pending_folder_selection();
+        app.enqueue_visual(VisualIntent::Mouse(PendingMouse {
+            anchor: 3,
+            lead: 4,
+            dragged: false,
+            released: false,
+            mode: RangeMode::Invert,
+            edge: 0,
+            view: Arc::clone(&app.view),
+            offset: app.offset,
+        }));
+        for _ in 1..VISUAL_INTENT_LIMIT {
+            app.enqueue_visual(VisualIntent::ToggleCurrent);
+        }
+        assert!(!app.visual_input_available() && app.has_held_mouse());
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 35,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.has_held_mouse());
+        assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        assert!(!app.visual.active() && app.visual.is_empty());
+        assert!(app.visual_intents.is_empty() && app.visual_input_available());
     }
 
     #[test]
@@ -6246,7 +6977,6 @@ mod tests {
                         generation: app.view.generation,
                         child_epoch: app.model.node(1).child_epoch,
                         positions: ids.iter().enumerate().map(|(i, &id)| (id, i)).collect(),
-                        directory_ids: vec![5],
                         ids,
                     })
                 };
@@ -6254,6 +6984,8 @@ mod tests {
                 let newer = make_view(vec![3, 6, 5, 7, 8]);
                 app.view = original;
                 app.offset = 1;
+                // This fixture starts with an already scrolled four-row viewport.
+                app.page_size = 4;
                 app.visual.enter(1, None);
                 let mut terminal =
                     Terminal::new(ratatui::backend::TestBackend::new(80, 5)).unwrap();
@@ -6379,7 +7111,6 @@ mod tests {
                             generation: app.view.generation,
                             child_epoch: app.model.node(1).child_epoch,
                             positions: ids.iter().enumerate().map(|(i, &id)| (id, i)).collect(),
-                            directory_ids: vec![5],
                             ids,
                         })
                     };
@@ -6392,6 +7123,8 @@ mod tests {
                     let untouched = original.ids[offset + 2];
                     app.view = Arc::clone(&original);
                     app.offset = offset;
+                    // Preserve the prepared viewport before freezing its physical rows.
+                    app.page_size = 3;
                     app.selected = Some(anchor);
                     app.visual.enter(1, Some(anchor));
                     if deferred {
@@ -6455,7 +7188,6 @@ mod tests {
             generation: original.generation,
             child_epoch: original.child_epoch,
             ids: vec![3, 5, 4],
-            directory_ids: vec![5],
             positions: HashMap::from([(3, 0), (5, 1), (4, 2)]),
         });
         app.view = Arc::clone(&newer);
@@ -6660,7 +7392,7 @@ mod tests {
         assert!(app.pump_mouse_scroll(deadline));
         app.pump_visual();
         assert_eq!(app.selected, Some(283));
-        app.modal = Some(Modal::help());
+        app.modal = Some(Modal::help(app.visual.active()));
         assert!(!app.pump_mouse_scroll(deadline + Duration::from_secs(1)));
         app.modal = None;
         app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5));
@@ -6711,7 +7443,7 @@ mod tests {
     }
 
     #[test]
-    fn entering_visual_during_normal_navigation_marks_only_its_destination() {
+    fn visual_entry_and_normal_shift_page_keep_distinct_pending_navigation() {
         for shifted in [false, true] {
             let mut app = browser_fixture();
             app.directory = 1;
@@ -6736,19 +7468,20 @@ mod tests {
                 None,
                 false,
             );
-            assert!(app.visual.active() && app.visual.is_empty());
+            assert_eq!(app.visual.active(), !shifted);
+            assert!(app.visual.is_empty());
             app.view = Arc::new(CachedSnapshot {
                 generation: app.order.generation(),
                 child_epoch: old.child_epoch,
                 ids: old.ids.clone(),
-                directory_ids: old.directory_ids.clone(),
                 positions: old.positions.clone(),
             });
             app.advance_navigation();
             finish_visual(&mut app);
-            assert!(app.visual.contains(5) && !app.visual.contains(3));
-            assert_eq!(app.visual.contains(4), shifted);
-            assert_eq!(app.selected, Some(if shifted { 4 } else { 5 }));
+            assert_eq!(app.visual.active(), !shifted);
+            assert_eq!(app.visual.contains(5), !shifted);
+            assert!(!app.visual.contains(3) && !app.visual.contains(4));
+            assert_eq!(app.selected, Some(if shifted { 3 } else { 5 }));
         }
     }
 
@@ -6932,7 +7665,6 @@ mod tests {
                 generation: app.view.generation,
                 child_epoch: app.view.child_epoch,
                 ids: vec![3, 5, 4],
-                directory_ids: vec![5],
                 positions: HashMap::from([(3, 0), (5, 1), (4, 2)]),
             });
             terminal
@@ -7061,7 +7793,6 @@ mod tests {
             generation: app.view.generation,
             child_epoch: app.view.child_epoch,
             ids: vec![2, 1],
-            directory_ids: vec![1],
             positions: HashMap::from([(2, 0), (1, 1)]),
         });
         app.mouse(MouseEvent {
@@ -7174,6 +7905,59 @@ mod tests {
     }
 
     #[test]
+    fn successful_delete_without_parent_metadata_marks_totals_without_restarting_scan() {
+        for parent in [ROOT, 1] {
+            for parent_metadata_available in [false, true] {
+                let mut app = browser_fixture();
+                apply(&mut app, ScanEvent::DirectoryDone { id: 5, error: None });
+                apply(&mut app, ScanEvent::DirectoryDone { id: 1, error: None });
+                apply(
+                    &mut app,
+                    ScanEvent::DirectoryDone {
+                        id: ROOT,
+                        error: None,
+                    },
+                );
+                apply(&mut app, ScanEvent::Finished { cancelled: false });
+                let target = if parent == ROOT { 2 } else { 3 };
+                let removed_bytes = app.size(target);
+                let total = app.size(ROOT);
+                let epoch = app.model.node(parent).child_epoch;
+                assert!(app.model.node(ROOT).complete && app.model.finished);
+                app.deletion_succeeded(target, parent_metadata_available);
+                assert!(!app.model.is_live(target));
+                assert_eq!(app.size(ROOT), total - removed_bytes);
+                assert_eq!(app.model.node(parent).child_epoch, epoch);
+                assert!(app.model.node(parent).complete && app.model.node(ROOT).complete);
+                assert_eq!(app.model.node(ROOT).error_count, 0);
+                assert!(app.model.last_error.is_none() && app.delete_notice.is_none());
+                assert_eq!(
+                    app.model.has_partial_totals(parent),
+                    !parent_metadata_available
+                );
+                assert_eq!(
+                    app.model.has_partial_totals(ROOT),
+                    !parent_metadata_available
+                );
+                let row = app
+                    .row(parent, app.size(ROOT), 80, false, spinner_frame(0))
+                    .to_string();
+                assert_eq!(row.contains('~'), !parent_metadata_available);
+                assert!(!row.contains(spinner_frame(0)));
+                app.selected = Some(parent);
+                assert_eq!(
+                    app.info().contains("Partial total"),
+                    !parent_metadata_available
+                );
+                if !parent_metadata_available {
+                    assert_eq!(app.phase(false, false), "Partial totals");
+                }
+                assert!(app.modal.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn incremental_delete_preserves_folder_neighbor_and_live_scan_without_success_dialog() {
         let mut app = browser_fixture();
         app.directory = 1;
@@ -7222,7 +8006,7 @@ mod tests {
                         capture: None,
                     },
                     1 => Modal::info("old target".into()),
-                    2 => Modal::help(),
+                    2 => Modal::help(app.visual.active()),
                     _ => Modal::notice("Delete failed", "unrelated failure".into()),
                 });
                 if suspended {
@@ -7287,7 +8071,15 @@ mod tests {
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         let screen = rendered(&terminal);
-        assert!(screen.contains("Subdirectories") && screen.contains("child-folder/"));
+        let preview_rows: Vec<_> = screen
+            .lines()
+            .filter_map(|line| line.split_once('│').map(|(_, row)| row))
+            .collect();
+        assert!(preview_rows[0].contains("Contents"));
+        assert!(preview_rows[1].trim_end().ends_with(" remove-me"));
+        assert!(preview_rows[2].trim_end().ends_with(" survivor"));
+        assert!(preview_rows[3].trim_end().ends_with(" child-folder/"));
+        assert!(preview_rows[1].chars().any(|ch| "▏▎▍▌▋▊▉█".contains(ch)));
         assert!(!screen.contains("folder/…") && !screen.contains('≥'));
         assert!((0..10).any(|tick| screen.contains(&format!("{} folder/", spinner_frame(tick)))));
         let buffer = terminal.backend().buffer();
@@ -7301,16 +8093,16 @@ mod tests {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(!rendered(&terminal).contains("Subdirectories"));
+        assert!(!rendered(&terminal).contains("Contents"));
         terminal.backend_mut().resize(120, 12);
         app.selected = Some(2);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(!rendered(&terminal).contains("Subdirectories"));
+        assert!(!rendered(&terminal).contains("Contents"));
     }
     #[test]
-    fn preview_rejects_a_cached_directory_after_its_live_kind_changes() {
+    fn preview_uses_live_entry_kinds_in_a_warmed_snapshot() {
         for kind in [NodeKind::File, NodeKind::Symlink] {
             let mut app = browser_fixture();
             app.selected = Some(1);
@@ -7328,15 +8120,15 @@ mod tests {
                 },
             );
             app.changed(changed);
-            assert_eq!(cached.directory_ids, vec![5]);
+            assert!(cached.positions.contains_key(&5));
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
             assert!(Arc::ptr_eq(&cached, &app.preview.view));
             let screen = rendered(&terminal);
-            assert!(screen.contains("Subdirectories"));
-            assert!(!screen.contains("child-folder"));
+            assert!(screen.contains("Contents") && screen.contains("child-folder"));
+            assert!(!screen.contains("child-folder/"));
         }
     }
 
@@ -7393,7 +8185,9 @@ mod tests {
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         assert!(Arc::ptr_eq(&cached, &app.preview.view));
-        assert!(rendered(&terminal).contains("child-folder/"));
+        let screen = rendered(&terminal);
+        assert!(screen.contains("remove-me") && screen.contains("survivor"));
+        assert!(screen.contains("child-folder/"));
         assert!(!rendered(&terminal).contains("Loading"));
         app.key(
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
@@ -7403,7 +8197,7 @@ mod tests {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(!rendered(&terminal).contains("Subdirectories"));
+        assert!(!rendered(&terminal).contains("Contents"));
         app.key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
             None,
@@ -7413,7 +8207,9 @@ mod tests {
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         assert!(Arc::ptr_eq(&cached, &app.preview.view));
-        assert!(rendered(&terminal).contains("child-folder/"));
+        let screen = rendered(&terminal);
+        assert!(screen.contains("remove-me") && screen.contains("survivor"));
+        assert!(screen.contains("child-folder/"));
     }
 
     #[test]
@@ -7487,7 +8283,6 @@ mod tests {
             child_epoch: app.model.node(app.directory).child_epoch,
             generation: app.order.generation(),
             ids: vec![4, 5, 3],
-            directory_ids: vec![5],
             positions: HashMap::from([(4, 0), (5, 1), (3, 2)]),
         });
         app.offset = app.selection_index().unwrap() - old_row;
@@ -7498,43 +8293,47 @@ mod tests {
 
     #[test]
     fn stale_empty_snapshots_cannot_hide_known_main_or_preview_children() {
-        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
-        apply(
-            &mut app,
-            ScanEvent::Entries {
-                parent: ROOT,
-                entries: vec![entry(1, "parent", NodeKind::Directory, 0)],
-            },
-        );
-        apply(
-            &mut app,
-            ScanEvent::Entries {
-                parent: 1,
-                entries: vec![entry(2, "child", NodeKind::Directory, 0)],
-            },
-        );
-        apply(&mut app, ScanEvent::DirectoryDone { id: 2, error: None });
-        apply(&mut app, ScanEvent::DirectoryDone { id: 1, error: None });
-        apply(
-            &mut app,
-            ScanEvent::DirectoryDone {
-                id: ROOT,
-                error: None,
-            },
-        );
-        app.selected = Some(1);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, false, false))
-            .unwrap();
-        let screen = rendered(&terminal);
-        assert!(screen.contains("Ordering entries…"));
-        assert!(!screen.contains("No child entries.") && !screen.contains("No subdirectories."));
-        app.removed(2);
-        terminal
-            .draw(|frame| app.draw(frame, false, false))
-            .unwrap();
-        assert!(rendered(&terminal).contains("No subdirectories."));
+        for kind in [NodeKind::Directory, NodeKind::File] {
+            let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+            apply(
+                &mut app,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: vec![entry(1, "parent", NodeKind::Directory, 0)],
+                },
+            );
+            apply(
+                &mut app,
+                ScanEvent::Entries {
+                    parent: 1,
+                    entries: vec![entry(2, "child", kind, 0)],
+                },
+            );
+            if kind == NodeKind::Directory {
+                apply(&mut app, ScanEvent::DirectoryDone { id: 2, error: None });
+            }
+            apply(&mut app, ScanEvent::DirectoryDone { id: 1, error: None });
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: ROOT,
+                    error: None,
+                },
+            );
+            app.selected = Some(1);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let screen = rendered(&terminal);
+            assert!(screen.contains("Ordering entries…"));
+            assert!(!screen.contains("No child entries."));
+            app.removed(2);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(rendered(&terminal).contains("No child entries."));
+        }
     }
 
     #[test]
@@ -7610,13 +8409,428 @@ mod tests {
     }
 
     #[test]
+    fn navigation_scroll_margin_tracks_both_edges_and_relaxes_at_list_ends() {
+        let mut app = navigation_fixture(40, 41..=41);
+        app.edge_selection(false);
+        app.move_selection(6);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(7), 0, Some(6))
+        );
+        app.move_selection(1);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(8), 1, Some(6))
+        );
+        app.move_selection(6);
+        app.move_selection(-4);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(10), 6, Some(3))
+        );
+        app.edge_selection(true);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(40), 30, Some(9))
+        );
+        for (id, row) in [(39, 8), (38, 7), (37, 6)] {
+            app.move_selection(-1);
+            assert_eq!(
+                (app.selected, app.offset, app.selection_screen_row()),
+                (Some(id), 30, Some(row))
+            );
+        }
+        app.edge_selection(false);
+        app.move_selection(-1);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(1), 0, Some(0))
+        );
+    }
+
+    #[test]
+    fn navigation_scroll_margin_fits_tiny_viewports() {
+        let mut app = navigation_fixture(40, 41..=41);
+        for height in 1..=7 {
+            app.page_size = height;
+            let margin = 3.min((height - 1) / 2);
+            app.edge_selection(false);
+            app.move_selection(20);
+            assert_eq!(app.selected, Some(21));
+            assert_eq!(
+                app.selection_screen_row(),
+                Some(height - 1 - margin),
+                "height={height}"
+            );
+            app.move_selection(-1);
+            assert_eq!(app.selection_screen_row(), Some(margin), "height={height}");
+            app.edge_selection(true);
+            assert_eq!(
+                app.selection_screen_row(),
+                Some(height - 1),
+                "height={height}"
+            );
+            app.edge_selection(false);
+            assert_eq!((app.offset, app.selection_screen_row()), (0, Some(0)));
+        }
+    }
+
+    #[test]
+    fn navigation_scroll_margin_counts_eligible_rows_and_bounds_stale_hidden_spans() {
+        for deleted in [false, true] {
+            let mut app = navigation_fixture(40, 2..=5);
+            app.config.show_hidden = false;
+            if deleted {
+                app.removed(9);
+            }
+            app.edge_selection(false);
+            app.move_selection(7);
+            assert_eq!(app.selected, Some(if deleted { 13 } else { 12 }));
+            assert_eq!(app.selection_screen_row(), Some(6));
+            assert_eq!(app.screen_rows().next().map(|(_, id)| id), Some(6));
+            app.move_selection(-4);
+            assert_eq!(
+                (app.selected, app.selection_screen_row()),
+                (Some(8), Some(3))
+            );
+            assert_eq!(app.screen_rows().next().map(|(_, id)| id), Some(1));
+        }
+        let count = (VIEW_BUDGET * 2 + 5) as NodeId;
+        let mut app = navigation_fixture(count, 2..=count - 4);
+        app.config.show_hidden = false;
+        app.selected = Some(count);
+        app.offset = 0;
+        app.scroll_selection(3);
+        assert_eq!(app.selection_screen_row(), Some(3));
+        assert!(app.selection_index().unwrap() - app.offset < VIEW_BUDGET);
+    }
+
+    #[test]
+    fn navigation_scroll_margin_keeps_successors_inside_the_raw_paint_budget() {
+        let count = (VIEW_BUDGET + 3) as NodeId;
+        for (hidden_end, selected) in [
+            ((VIEW_BUDGET - 1) as NodeId, VIEW_BUDGET as NodeId),
+            (VIEW_BUDGET as NodeId, 7),
+        ] {
+            let mut app = navigation_fixture(count, 8..=hidden_end);
+            app.config.show_hidden = false;
+            app.selected = Some(selected);
+            app.offset = 0;
+            app.scroll_selection(3);
+            let rows: Vec<_> = app.screen_rows().map(|(_, id)| id).collect();
+            let cursor = rows.iter().position(|&id| id == selected).unwrap();
+            assert!(cursor >= 3);
+            assert_eq!(
+                &rows[cursor + 1..],
+                &[
+                    (VIEW_BUDGET + 1) as NodeId,
+                    (VIEW_BUDGET + 2) as NodeId,
+                    count
+                ]
+            );
+            assert_eq!(app.offset, 3);
+        }
+    }
+
+    #[test]
+    fn normal_shift_arrows_move_one_page_without_entering_visual_mode() {
+        for (key, expected, reverse) in [
+            (KeyCode::Up, 10, KeyCode::Down),
+            (KeyCode::Down, 30, KeyCode::Up),
+        ] {
+            let mut app = navigation_fixture(40, 41..=41);
+            app.selected = Some(20);
+            app.offset = 10;
+            app.key(KeyEvent::new(key, KeyModifiers::SHIFT), None, false);
+            assert_eq!(app.selected, Some(expected));
+            assert!(!app.visual.active() && app.visual.is_empty());
+            assert!(!app.range_requested);
+            app.key(KeyEvent::new(reverse, KeyModifiers::SHIFT), None, false);
+            assert_eq!(app.selected, Some(20));
+            assert!(!app.visual.active() && app.visual.is_empty());
+        }
+    }
+
+    #[test]
+    fn visual_plain_arrows_preserve_marks_and_reanchor_the_next_shift_range() {
+        for pending in [false, true] {
+            for (key, cursor, endpoint, skipped) in
+                [(KeyCode::Down, 12, 13, 11), (KeyCode::Up, 8, 7, 9)]
+            {
+                let mut app = navigation_fixture(20, 21..=21);
+                app.selected = Some(10);
+                app.visual.enter(ROOT, Some(10));
+                app.visual.toggle(2);
+                app.visual.reanchor(10);
+                if pending {
+                    app.visual
+                        .begin_range(Arc::clone(&app.view), 10, RangeMode::Add);
+                }
+                for _ in 0..2 {
+                    app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false);
+                }
+                if !pending {
+                    assert_eq!(app.selected, Some(cursor));
+                    assert_eq!(app.visual.len(), 2);
+                    assert!(app.visual.contains(2) && app.visual.contains(10));
+                    assert!(!app.visual.contains(cursor) && !app.visual.contains(skipped));
+                }
+                app.key(KeyEvent::new(key, KeyModifiers::SHIFT), None, false);
+                finish_visual(&mut app);
+                assert_eq!(app.selected, Some(endpoint));
+                assert_eq!(app.visual.len(), 4);
+                assert!(
+                    [2, 10, cursor, endpoint]
+                        .into_iter()
+                        .all(|id| app.visual.contains(id))
+                );
+                assert!(!app.visual.contains(skipped));
+            }
+        }
+    }
+
+    #[test]
+    fn visual_hover_reanchors_shift_ranges_but_same_row_keeps_enter_deselection() {
+        for deferred in [false, true] {
+            let mut app = navigation_fixture(20, 21..=21);
+            app.selected = Some(1);
+            app.visual.enter(ROOT, Some(1));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 21)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let hover = |row| MouseEvent {
+                kind: MouseEventKind::Moved,
+                row,
+                column: 35,
+                modifiers: KeyModifiers::NONE,
+            };
+            if deferred {
+                app.visual
+                    .begin_range(Arc::clone(&app.view), 1, RangeMode::Add);
+            }
+            app.mouse(hover(10));
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                None,
+                false,
+            );
+            finish_visual(&mut app);
+            assert_eq!(app.selected, Some(11));
+            assert_eq!(app.visual.len(), 3);
+            assert!([1, 10, 11].into_iter().all(|id| app.visual.contains(id)));
+            assert!((2..10).all(|id| !app.visual.contains(id)));
+
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false,
+            );
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(!app.visual.contains(11));
+            if deferred {
+                app.visual
+                    .begin_range(Arc::clone(&app.view), 11, RangeMode::Add);
+            }
+            app.mouse(hover(11));
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                None,
+                false,
+            );
+            finish_visual(&mut app);
+            assert_eq!(app.selected, Some(12));
+            assert_eq!(app.visual.len(), 3);
+            assert!([1, 10, 12].into_iter().all(|id| app.visual.contains(id)));
+            assert!(!app.visual.contains(11));
+        }
+    }
+
+    #[test]
+    fn visual_enter_deselection_survives_shift_and_plain_boundary_noops() {
+        for boundary_noop in [false, true] {
+            for (start, edge, movement, endpoint) in [
+                (1, KeyCode::Up, KeyCode::Down, 2),
+                (5, KeyCode::Down, KeyCode::Up, 4),
+            ] {
+                let mut app = navigation_fixture(5, 6..=6);
+                app.selected = Some(start);
+                app.visual.enter(ROOT, Some(start));
+                app.key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+                assert!(app.visual.is_empty());
+                if boundary_noop {
+                    app.key(KeyEvent::new(edge, KeyModifiers::NONE), None, false);
+                    assert_eq!(app.selected, Some(start));
+                    assert!(app.visual.is_empty());
+                }
+                app.key(KeyEvent::new(movement, KeyModifiers::SHIFT), None, false);
+                finish_visual(&mut app);
+                assert_eq!(app.selected, Some(endpoint));
+                assert!(!app.visual.contains(start) && app.visual.contains(endpoint));
+                assert_eq!(app.visual.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn help_describes_the_active_navigation_mode() {
+        for visual in [false, true] {
+            let mut app = browser_fixture();
+            if visual {
+                app.visual.enter(ROOT, app.selected);
+            }
+            app.key(
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                None,
+                false,
+            );
+            let Some(Modal::Text { title, text, .. }) = app.modal.as_ref() else {
+                panic!("help did not open");
+            };
+            assert_eq!(*title, "Help");
+            assert!(text.contains(COMMON_HELP));
+            assert!(text.contains(if visual { VISUAL_HELP } else { NORMAL_HELP }));
+            assert!(!text.contains(if visual { NORMAL_HELP } else { VISUAL_HELP }));
+        }
+    }
+
+    #[test]
+    fn visual_keyboard_ranges_keep_scroll_margin_and_all_selected_ids() {
+        let mut app = navigation_fixture(40, 41..=41);
+        app.key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        app.key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        for _ in 0..8 {
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                None,
+                false,
+            );
+        }
+        finish_visual(&mut app);
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(9), 2, Some(6))
+        );
+        assert_eq!(app.visual.len(), 9);
+        assert!((1..=9).all(|id| app.visual.contains(id)));
+        assert!(!app.visual.contains(10));
+    }
+
+    #[test]
+    fn stationary_hover_preserves_rows_then_keyboard_and_resize_restore_margin() {
+        let mut app = navigation_fixture(40, 41..=41);
+        app.edge_selection(false);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        for _ in 0..3 {
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 35,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert_eq!(
+                (app.selected, app.offset, app.selection_screen_row()),
+                (Some(10), 0, Some(9))
+            );
+        }
+        app.key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(11), 4, Some(6))
+        );
+        terminal.backend_mut().resize(80, 7);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(
+            (app.selected, app.page_size, app.selection_screen_row()),
+            (Some(11), 6, Some(3))
+        );
+        terminal.backend_mut().resize(80, 11);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(
+            (app.selected, app.offset, app.selection_screen_row()),
+            (Some(11), 7, Some(3))
+        );
+    }
+
+    #[test]
+    fn resizing_held_mouse_presses_preserves_the_pressed_viewport() {
+        for deferred in [false, true] {
+            let mut app = navigation_fixture(40, 41..=41);
+            app.selected = Some(11);
+            app.offset = 10;
+            app.visual.enter(ROOT, Some(11));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let pressed_view = Arc::clone(&app.painted_view);
+            if deferred {
+                app.visual
+                    .begin_range(Arc::clone(&app.view), 11, RangeMode::Add);
+            }
+            let mouse = |kind, row| MouseEvent {
+                kind,
+                row,
+                column: 35,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+            assert_eq!(app.has_held_mouse(), deferred);
+            terminal.backend_mut().resize(80, 7);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(Arc::ptr_eq(&app.painted_view, &pressed_view));
+            assert_eq!(app.painted_offset, 10);
+            assert_eq!(app.painted_rows, vec![11, 12, 13, 14, 15, 16]);
+            app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+            finish_visual(&mut app);
+            assert_eq!(app.selected, Some(12));
+            assert_eq!(app.visual.len(), 2);
+            assert!(app.visual.contains(11) && app.visual.contains(12));
+        }
+    }
+
+    #[test]
     fn page_movement_counts_visible_rows_and_does_not_scroll_past_visible_selection() {
         let mut app = navigation_fixture(16, 2..=5);
         app.config.show_hidden = false;
         app.selected = Some(1);
         app.move_selection(10);
         assert_eq!(app.selected, Some(15));
-        assert_eq!(app.selection_screen_row(), Some(9));
+        assert_eq!(app.selection_screen_row(), Some(8));
         app.selected = Some(10);
         app.offset = 0;
         app.keep_selection_visible();
@@ -8066,6 +9280,535 @@ mod tests {
                 app.offset, 0,
                 "explicit edge navigation fills a short viewport"
             );
+        }
+    }
+    fn enter_filter_query(app: &mut App, query: &str) {
+        if !app.filter_editing {
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::Continue
+            ));
+        }
+        app.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+            false,
+        );
+        for character in query.chars() {
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::Continue
+            ));
+        }
+        assert!(app.filter_editing);
+        assert_eq!(app.filter, query);
+    }
+
+    fn wait_filtered_rows(app: &mut App, ids: &[NodeId]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.pump_order();
+            app.sync_order(true);
+            if app
+                .current_snapshot()
+                .is_some_and(|view| view.ids == ids && Arc::ptr_eq(&view, &app.view))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "current filter did not publish {ids:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn filter_focus_survives_empty_results_and_prioritizes_later_matches_once() {
+        let mut app = browser_fixture();
+        assert!(!app.prioritize_requested && !app.focus_after_selection);
+        assert_eq!(app.selected, Some(1));
+        enter_filter_query(&mut app, "future");
+        wait_filtered_rows(&mut app, &[]);
+        assert!(app.prioritize_requested && app.focus_after_selection);
+        assert_eq!(app.scan_focus(), None);
+        app.prioritize_requested = false;
+        for _ in 0..8 {
+            app.sync_order(true);
+        }
+        assert!(!app.prioritize_requested && app.focus_after_selection);
+
+        // The first ready result was empty; discovery supplies a match later.
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(6, "future-folder", NodeKind::Directory, 1)],
+            },
+        );
+        wait_filtered_rows(&mut app, &[6]);
+        assert_eq!(app.selected, Some(6));
+        assert_eq!(app.scan_focus(), Some(6));
+        assert!(app.prioritize_requested && !app.focus_after_selection);
+        app.prioritize_requested = false;
+        for _ in 0..8 {
+            app.pump_order();
+            app.sync_order(true);
+        }
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(!app.prioritize_requested && !app.focus_after_selection);
+
+        enter_filter_query(&mut app, "absent");
+        wait_filtered_rows(&mut app, &[]);
+        assert_eq!(app.selected, None);
+        assert_eq!(app.scan_focus(), None);
+        assert!(app.prioritize_requested && app.focus_after_selection);
+        app.prioritize_requested = false;
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        wait_filtered_rows(&mut app, &[1, 2, 6]);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scan_focus(), Some(1));
+        assert!(app.prioritize_requested && !app.focus_after_selection);
+    }
+
+    #[test]
+    fn hidden_selection_and_cold_directory_entry_keep_delayed_focus() {
+        for hidden in [false, true] {
+            let mut app = browser_fixture();
+            if hidden {
+                apply(
+                    &mut app,
+                    ScanEvent::Entries {
+                        parent: ROOT,
+                        entries: vec![entry(6, ".hidden-folder", NodeKind::Directory, 1)],
+                    },
+                );
+                wait_cache(&mut app, ROOT, &[1, 2, 6]);
+                app.sync_order(true);
+                app.selected = Some(6);
+                app.key(
+                    KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+            } else {
+                // No children of this directory have been discovered yet.
+                app.directory = 1;
+                app.selected = Some(5);
+                app.reset_order(false);
+                app.key(
+                    KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+                assert_eq!(app.directory, 5);
+                assert!(app.prioritize_requested && app.focus_after_selection);
+                assert_eq!(app.scan_focus(), Some(5));
+                app.prioritize_requested = false;
+                apply(
+                    &mut app,
+                    ScanEvent::Entries {
+                        parent: 5,
+                        entries: vec![entry(6, "late-child", NodeKind::Directory, 1)],
+                    },
+                );
+            }
+            if hidden && app.selected.is_none() {
+                assert!(app.focus_after_selection);
+                app.prioritize_requested = false;
+            }
+            let expected = if hidden { 1 } else { 6 };
+            wait_cache(
+                &mut app,
+                if hidden { ROOT } else { 5 },
+                if hidden { &[1, 2] } else { &[6] },
+            );
+            app.sync_order(true);
+            assert_eq!(app.selected, Some(expected));
+            assert_eq!(app.scan_focus(), Some(expected));
+            assert!(app.prioritize_requested && !app.focus_after_selection);
+            app.prioritize_requested = false;
+            for _ in 0..8 {
+                app.sync_order(true);
+            }
+            assert!(!app.prioritize_requested);
+        }
+    }
+
+    #[test]
+    fn live_fuzzy_filter_matches_immediate_basenames_for_files_and_directories() {
+        let mut app = browser_fixture();
+        for (query, ids) in [
+            ("fldr", vec![1]),
+            ("rtfl", vec![2]),
+            ("rm", vec![]),      // remove-me exists only inside folder.
+            ("fixture", vec![]), // The scan root is not part of a basename.
+        ] {
+            enter_filter_query(&mut app, query);
+            wait_filtered_rows(&mut app, &ids);
+            assert_eq!(app.directory, ROOT);
+        }
+        enter_filter_query(&mut app, "fldr");
+        wait_filtered_rows(&mut app, &[1]);
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(6, "folder-file", NodeKind::File, 2),
+                    entry(7, "folder-two", NodeKind::Directory, 0),
+                ],
+            },
+        );
+        wait_filtered_rows(&mut app, &[1, 6, 7]);
+        assert!(
+            app.filter_editing,
+            "live updates must not finish filter input"
+        );
+        assert_eq!(app.order.snapshot(ROOT).unwrap().ids, vec![1, 2, 6, 7]);
+    }
+
+    #[test]
+    fn rapid_filter_edits_publish_only_the_latest_query_and_escape_restores_rows() {
+        let mut app = browser_fixture();
+        for query in ["fldr", "no-such-entry", "rtfl"] {
+            enter_filter_query(&mut app, query);
+        }
+        assert!(
+            app.current_snapshot()
+                .is_none_or(|view| view.ids == vec![2])
+        );
+        wait_filtered_rows(&mut app, &[2]);
+        for _ in 0..16 {
+            app.pump_order();
+            app.sync_order(true);
+            assert_eq!(app.view.ids, vec![2]);
+        }
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter, "rtfl");
+        assert_eq!(app.directory, ROOT);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        assert!(app.filter.is_empty());
+        wait_filtered_rows(&mut app, &[1, 2]);
+        enter_filter_query(&mut app, "fldr");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        assert!(!app.filter_editing && app.filter.is_empty());
+        wait_filtered_rows(&mut app, &[1, 2]);
+    }
+
+    #[test]
+    fn filter_editing_backspace_removes_unicode_characters_and_ctrl_u_clears_input() {
+        let mut app = browser_fixture();
+        enter_filter_query(&mut app, "aé界");
+        app.key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.filter, "aé");
+        app.key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.filter, "a");
+        app.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+            false,
+        );
+        assert!(app.filter.is_empty() && app.filter_editing);
+        app.key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(app.filter.is_empty() && app.filter_editing);
+        wait_filtered_rows(&mut app, &[1, 2]);
+    }
+
+    #[test]
+    fn directory_navigation_clears_the_applied_filter_in_both_directions() {
+        let mut app = browser_fixture();
+        enter_filter_query(&mut app, "fldr");
+        wait_filtered_rows(&mut app, &[1]);
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.directory, ROOT, "Enter first finishes the query");
+        app.key(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.directory, 1);
+        assert!(!app.filter_editing && app.filter.is_empty());
+        wait_filtered_rows(&mut app, &[3, 4, 5]);
+        enter_filter_query(&mut app, "chfldr");
+        wait_filtered_rows(&mut app, &[5]);
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        app.key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert_eq!(app.directory, ROOT);
+        assert!(!app.filter_editing && app.filter.is_empty());
+        wait_filtered_rows(&mut app, &[1, 2]);
+    }
+
+    #[test]
+    fn filter_changes_clear_visual_marks_and_pending_input_without_leaving_visual_mode() {
+        let mut app = browser_fixture();
+        app.key(
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        app.key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        app.key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            None,
+            false,
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(app.painted_rows, vec![1, 2]);
+        enter_filter_query(&mut app, "fldr");
+        assert!(app.visual.active() && app.visual.is_empty());
+        assert!(!app.visual.is_pending() && app.visual_intents.is_empty());
+        assert!(app.pending_navigation.is_none() && app.mouse_press_view.is_none());
+        assert!(
+            app.painted_rows.is_empty(),
+            "the old frame must not remain clickable"
+        );
+        let selected = app.selected;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 35,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, selected);
+        assert!(app.visual.is_empty());
+        wait_filtered_rows(&mut app, &[1]);
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(app.visual.active() && app.visual.is_empty());
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(app.visual.contains(1));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        assert!(app.filter.is_empty() && app.visual.active() && app.visual.is_empty());
+        wait_filtered_rows(&mut app, &[1, 2]);
+    }
+
+    #[test]
+    fn filter_q_is_text_during_deletion_but_ctrl_c_still_uses_the_quit_guard() {
+        for deleting in [false, true] {
+            let mut app = browser_fixture();
+            app.key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                None,
+                deleting,
+            );
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    None,
+                    deleting
+                ),
+                Action::Continue
+            ));
+            assert_eq!(app.filter, "q");
+            assert!(app.filter_editing && app.modal.is_none());
+            let action = app.key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                None,
+                deleting,
+            );
+            if deleting {
+                assert!(matches!(action, Action::QuitWarning));
+                assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+                assert!(matches!(
+                    app.key(
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                        None,
+                        true
+                    ),
+                    Action::Quit
+                ));
+            } else {
+                assert!(matches!(action, Action::Quit));
+            }
+        }
+    }
+
+    #[test]
+    fn counted_interrupts_remain_available_for_both_quit_steps() {
+        let pending = AtomicUsize::new(2);
+        assert!(take_interrupt(&pending));
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        assert!(take_interrupt(&pending));
+        assert!(!take_interrupt(&pending));
+        pending.fetch_add(1, Ordering::Release);
+        assert!(take_interrupt(&pending));
+        assert!(!take_interrupt(&pending));
+    }
+
+    #[test]
+    fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
+        for ancestor in [false, true] {
+            let mut app = browser_fixture();
+            app.directory = 1;
+            app.reset_order(false);
+            app.filter = "sur".to_owned();
+            app.filter_editing = true;
+            app.update_filter();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.pump_order();
+                app.sync_order(true);
+                if app.view.ids == [4] && app.selected == Some(4) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "initial filter did not converge");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            app.visual.enter(1, Some(4));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                row: 1,
+                column: 35,
+                modifiers: KeyModifiers::SHIFT,
+            });
+            assert!(app.mouse_press_view.is_some() && app.mouse_dragging);
+            app.enqueue_visual(VisualIntent::Navigate(Navigation::new(None, 1), true));
+
+            let scope = if ancestor { ROOT } else { 1 };
+            app.begin_model_refresh(scope, 1);
+            assert_eq!(app.directory, scope);
+            assert_eq!(app.filter, if ancestor { "" } else { "sur" });
+            assert_eq!(app.filter_editing, !ancestor);
+            assert_eq!(app.selected, None);
+            assert!(app.pending_navigation.is_none());
+            assert!(app.visual.is_empty() && app.visual_intents.is_empty());
+            assert!(!app.range_requested && !app.mouse_dragging && !app.has_held_mouse());
+            assert!(app.mouse_press_view.is_none() && app.drag_scroll.is_none());
+            if ancestor {
+                assert!(app.order.filtered_snapshot(1).is_none());
+            }
+
+            // Neither a delayed press nor the release may reuse the old painted ID.
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.mouse(MouseEvent {
+                    kind,
+                    row: 1,
+                    column: 35,
+                    modifiers: KeyModifiers::NONE,
+                });
+                assert_eq!(app.selected, None);
+                assert!(app.visual.is_empty() && app.visual_intents.is_empty());
+                assert!(app.mouse_press_view.is_none());
+            }
+
+            let changed = app.model.apply_scoped(
+                scope,
+                1,
+                ScanEvent::RootInfo {
+                    kind: NodeKind::Directory,
+                    sizes: Default::default(),
+                    error: None,
+                    file_identity: None,
+                },
+            );
+            app.changed(changed);
+            let first = app.model.len() as NodeId;
+            let changed = app.model.apply_scoped(
+                scope,
+                1,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: vec![
+                        entry(1, "outside", NodeKind::File, 9),
+                        entry(2, "survivor-new", NodeKind::File, 7),
+                    ],
+                },
+            );
+            app.changed(changed);
+            let expected = if ancestor {
+                vec![first, first + 1]
+            } else {
+                vec![first + 1]
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.pump_order();
+                app.sync_order(true);
+                if app.view.ids == expected
+                    && app.view_directory == scope
+                    && app.view.child_epoch == app.model.node(scope).child_epoch
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "refreshed filter did not converge"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(app.selected, expected.first().copied());
+            assert!(app.selected.is_some_and(|id| app.model.is_live(id)));
+            assert!(!app.model.is_live(4));
+            assert!(app.visual.is_empty() && !app.visual_busy());
+            assert_eq!(app.filter, if ancestor { "" } else { "sur" });
         }
     }
 }

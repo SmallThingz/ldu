@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -55,6 +55,12 @@ impl ScanHandle {
         self.control.wake();
     }
 
+    /// Suspend new scan I/O while foreground deletion owns filesystem priority.
+    /// Already started I/O and its bounded name batch may still finish.
+    pub fn set_paused(&self, paused: bool) {
+        self.control.set_paused(paused);
+    }
+
     /// Stop this path and all its descendants without interrupting other branches.
     /// Exclusions remain in effect for this handle, including tasks not yet started.
     pub fn exclude(&self, relative: &Path) {
@@ -97,6 +103,9 @@ impl Drop for FinishedGuard {
 
 #[derive(Default)]
 struct ScanControl {
+    paused: AtomicBool,
+    pause_lock: Mutex<()>,
+    pause_wake: Condvar,
     state: RwLock<ControlState>,
     has_exclusions: AtomicBool,
     focus_request: Mutex<Option<FocusRequest>>,
@@ -204,6 +213,43 @@ impl ControlState {
 }
 
 impl ScanControl {
+    fn set_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::AcqRel) != paused {
+            self.wake();
+        }
+    }
+
+    fn wait_unpaused(
+        &self,
+        cancel: &AtomicBool,
+        task_cancel: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        let cancelled = || {
+            cancel.load(Ordering::Acquire)
+                || task_cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire))
+        };
+        if self.paused.load(Ordering::Acquire) {
+            let mut guard = self
+                .pause_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while self.paused.load(Ordering::Acquire) && !cancelled() {
+                // Cancellation flags can also be set by channel disconnects.
+                // A timed wait covers those paths and a notification racing sleep.
+                guard = self
+                    .pause_wake
+                    .wait_timeout(guard, SEND_INTERVAL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+            }
+        }
+        if cancelled() {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn prioritize(&self, relative: &Path) {
         if relative.components().any(|component| {
             matches!(
@@ -241,6 +287,7 @@ impl ScanControl {
     }
 
     fn wake(&self) {
+        self.pause_wake.notify_all();
         if let Some(sender) = self.wake_sender.get() {
             let _ = sender.try_send(());
         }
@@ -780,10 +827,11 @@ fn run(
         hardlinks: Arc::clone(&hardlinks),
     }));
 
-    if !cancel.load(Ordering::Acquire) {
+    if control.wait_unpaused(&cancel, None).is_ok() {
         let (relative, metadata) = match root {
             ScanRoot::Open(root) => {
-                let metadata = RootAnchor::open(&root).and_then(|anchor| {
+                let metadata = RootAnchor::open_cancellable(&root, &cancel).and_then(|anchor| {
+                    control.wait_unpaused(&cancel, None)?;
                     let metadata = anchor.metadata()?;
                     let _ = anchor_slot.set(Arc::new(anchor));
                     Ok(metadata)
@@ -791,7 +839,7 @@ fn run(
                 (PathBuf::new(), metadata)
             }
             ScanRoot::Anchored { anchor, relative } => {
-                let metadata = anchored_metadata(&anchor, &relative);
+                let metadata = anchored_metadata(&anchor, &relative, &cancel, &control);
                 (relative, metadata)
             }
         };
@@ -919,7 +967,10 @@ fn run_scheduler(
                 FocusRequest::Clear => None,
             };
         }
-        while scheduler.active() < options.threads && !cancel.load(Ordering::Acquire) {
+        while scheduler.active() < options.threads
+            && !cancel.load(Ordering::Acquire)
+            && !control.paused.load(Ordering::Acquire)
+        {
             let Some(task) = scheduler.take() else { break };
             let worker_anchor = Arc::clone(&anchor);
             let worker_emitter = Arc::clone(&emitter);
@@ -1010,7 +1061,12 @@ fn send_worker(
     }
 }
 
-fn anchored_metadata(anchor: &RootAnchor, relative: &Path) -> io::Result<EntryMetadata> {
+fn anchored_metadata(
+    anchor: &RootAnchor,
+    relative: &Path,
+    cancel: &AtomicBool,
+    control: &ScanControl,
+) -> io::Result<EntryMetadata> {
     if relative.components().any(|component| {
         matches!(
             component,
@@ -1022,12 +1078,14 @@ fn anchored_metadata(anchor: &RootAnchor, relative: &Path) -> io::Result<EntryMe
             "scan path must stay beneath its root",
         ));
     }
+    control.wait_unpaused(cancel, None)?;
     if relative.as_os_str().is_empty() {
         return anchor.metadata();
     }
     #[cfg(target_os = "linux")]
     {
-        let parent = anchor.open_parent(relative)?;
+        let parent = anchor.open_parent_cancellable(relative, cancel)?;
+        control.wait_unpaused(cancel, None)?;
         backend::MetadataReader::Native(parent).metadata(relative.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "scan path has no final entry")
         })?)
@@ -1080,41 +1138,48 @@ fn scan_directory_emit(
     let result = if active.cancel.load(Ordering::Acquire) {
         Ok(())
     } else {
-        backend::enumerate_anchored(
-            anchor,
-            &task.path,
-            options.backend,
-            options.buffer_size,
-            options.batch_size,
-            &active.cancel,
-            |names, reader| {
-                if cancel.load(Ordering::Acquire) || active.cancel.load(Ordering::Acquire) {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
-                }
-                // Include files and failed metadata checks in the batch's effort.
-                let checked = names.len();
-                // Nested Rayon jobs use the same bounded pool, including for a single wide directory.
-                let discovered = names
-                    .into_par_iter()
-                    .map(|name| {
-                        let metadata = if cancel.load(Ordering::Acquire)
-                            || active.cancel.load(Ordering::Acquire)
-                            || control.excludes_child(&task.path, &name)
-                        {
-                            Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"))
-                        } else {
-                            reader.metadata(&name)
-                        };
-                        (name, metadata)
-                    })
-                    .collect();
-                let directories = emitter
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entries(task, discovered, cancel, control)?;
-                emit_directories(directories, checked)
-            },
-        )
+        control
+            .wait_unpaused(cancel, Some(&active.cancel))
+            .and_then(|()| {
+                backend::enumerate_anchored(
+                    anchor,
+                    &task.path,
+                    options.backend,
+                    options.buffer_size,
+                    options.batch_size,
+                    &active.cancel,
+                    |names, reader| {
+                        control.wait_unpaused(cancel, Some(&active.cancel))?;
+                        // Include files and failed metadata checks in the batch's effort.
+                        let checked = names.len();
+                        // Nested Rayon jobs use the same bounded pool, including for a single wide directory.
+                        let discovered = names
+                            .into_par_iter()
+                            .map(|name| {
+                                let metadata = control
+                                    .wait_unpaused(cancel, Some(&active.cancel))
+                                    .and_then(|()| {
+                                        if control.excludes_child(&task.path, &name) {
+                                            Err(io::Error::new(
+                                                io::ErrorKind::Interrupted,
+                                                "scan cancelled",
+                                            ))
+                                        } else {
+                                            reader.metadata(&name)
+                                        }
+                                    });
+                                (name, metadata)
+                            })
+                            .collect();
+                        let directories = emitter
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .entries(task, discovered, cancel, control)?;
+                        emit_directories(directories, checked)?;
+                        control.wait_unpaused(cancel, Some(&active.cancel))
+                    },
+                )
+            })
     };
     if cancel.load(Ordering::Acquire) {
         return;
@@ -1425,6 +1490,87 @@ mod tests {
             receiver.try_iter().last(),
             Some(ScanEvent::DirectoryDone { id: 0, error: None })
         ));
+    }
+
+    #[test]
+    fn paused_directory_batches_resume_and_cancellation_releases_waiters() {
+        for backend in [Backend::Std, Backend::Auto] {
+            for finish in 0..3 {
+                let fixture = Fixture::new();
+                for index in 0..8 {
+                    fs::write(fixture.0.join(format!("file-{index}")), b"payload").unwrap();
+                }
+                let anchor = RootAnchor::open(&fixture.0).unwrap();
+                let control = Arc::new(ScanControl::default());
+                let cancel = Arc::new(AtomicBool::new(false));
+                let (sender, receiver) = bounded(16);
+                let emitter = Mutex::new(Emitter {
+                    sender,
+                    next_id: 1,
+                    hardlinks: Arc::new(HardlinkRegistry::default()),
+                });
+                let (paused_sender, paused_receiver) = bounded(1);
+                let (done_sender, done_receiver) = bounded(1);
+                let worker_control = Arc::clone(&control);
+                let worker_cancel = Arc::clone(&cancel);
+                let worker = thread::spawn(move || {
+                    let mut options = options();
+                    options.backend = backend;
+                    options.batch_size = 2;
+                    let mut first = true;
+                    scan_directory_emit(
+                        &task(0, ""),
+                        &anchor,
+                        &options,
+                        &emitter,
+                        &worker_cancel,
+                        &worker_control,
+                        |_, _| {
+                            if first {
+                                first = false;
+                                worker_control.set_paused(true);
+                                paused_sender.send(()).unwrap();
+                            }
+                            Ok(())
+                        },
+                    );
+                    done_sender.send(()).unwrap();
+                });
+                paused_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                assert!(control.paused.load(Ordering::Acquire));
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ScanEvent::Entries { entries, .. } if entries.len() == 2
+                ));
+                // This checks the paused condition, not a throughput threshold.
+                assert!(matches!(
+                    done_receiver.recv_timeout(SEND_INTERVAL * 2),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                ));
+                assert!(receiver.is_empty());
+                match finish {
+                    0 => control.set_paused(false),
+                    1 => {
+                        cancel.store(true, Ordering::Release);
+                        control.cancel_active();
+                        control.wake();
+                    }
+                    _ => control.exclude(Path::new("")),
+                }
+                done_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                worker.join().unwrap();
+                let remaining = receiver
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        ScanEvent::Entries { entries, .. } => Some(entries.len()),
+                        _ => None,
+                    })
+                    .sum::<usize>();
+                assert_eq!(remaining, if finish == 0 { 6 } else { 0 });
+            }
+        }
     }
 
     #[test]

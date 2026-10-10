@@ -3,7 +3,7 @@
 //! are retained inside each group, so growing near-ties do not churn.
 use crate::model::{Model, Node};
 use crate::types::{NodeId, NodeKind, SizeMode, Sizes, SortMode};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::{
     cmp::Ordering,
@@ -22,6 +22,7 @@ use std::{
 const COMMAND_CAPACITY: usize = 8;
 const SORT_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DRAIN: usize = 64;
+const FILTER_BATCH: usize = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderConfig {
@@ -72,7 +73,6 @@ impl OrderRow {
 
 struct SortedRows {
     ids: Vec<NodeId>,
-    directory_ids: Vec<NodeId>,
     positions: HashMap<NodeId, usize>,
 }
 
@@ -111,22 +111,14 @@ impl State {
             stabilize_size_groups(&mut ranked, config);
         }
         let mut ids = Vec::with_capacity(ranked.len());
-        let mut directory_ids = Vec::new();
         let mut positions = HashMap::with_capacity(ranked.len());
         for (rank, state) in ranked.into_iter().enumerate() {
             state.rank = NonZeroUsize::new(rank + 1);
             ids.push(state.row.id);
             positions.insert(state.row.id, rank);
-            if state.row.kind == NodeKind::Directory {
-                directory_ids.push(state.row.id);
-            }
         }
         self.dirty = false;
-        SortedRows {
-            ids,
-            directory_ids,
-            positions,
-        }
+        SortedRows { ids, positions }
     }
 }
 
@@ -225,11 +217,11 @@ pub struct CachedSnapshot {
     pub generation: u64,
     pub child_epoch: u64,
     pub ids: Vec<NodeId>,
-    pub directory_ids: Vec<NodeId>,
     pub positions: HashMap<NodeId, usize>,
 }
 
 enum CacheCommand {
+    Wake,
     Configure {
         generation: u64,
         config: OrderConfig,
@@ -248,6 +240,194 @@ enum CacheCommand {
 type PublishedCache = im::HashMap<NodeId, Arc<CachedSnapshot>>;
 type SharedCache = Arc<ArcSwap<PublishedCache>>;
 
+struct FilterRequest {
+    revision: u64,
+    directory: NodeId,
+    query: Arc<str>,
+    directories_only: bool,
+}
+
+struct FilteredSnapshot {
+    revision: u64,
+    source: Arc<CachedSnapshot>,
+    view: Arc<CachedSnapshot>,
+}
+
+struct FilterMailbox {
+    request: ArcSwapOption<FilterRequest>,
+    snapshot: ArcSwapOption<FilteredSnapshot>,
+}
+
+impl FilterMailbox {
+    fn new() -> Self {
+        Self {
+            request: ArcSwapOption::empty(),
+            snapshot: ArcSwapOption::empty(),
+        }
+    }
+
+    fn publish(&self, snapshot: Option<Arc<FilteredSnapshot>>, state: &mut CacheState) {
+        if let Some(previous) = self.snapshot.swap(snapshot) {
+            // The input thread can release a large result immediately: the
+            // ordering worker remains responsible for its eventual destruction.
+            state.retire(Arc::clone(&previous.view));
+        }
+    }
+}
+
+struct FilterTask {
+    request: Arc<FilterRequest>,
+    source: Arc<CachedSnapshot>,
+    query: String,
+    next: usize,
+    ids: Vec<NodeId>,
+    positions: HashMap<NodeId, usize>,
+}
+
+#[derive(Default)]
+struct FilterState {
+    request: Option<Arc<FilterRequest>>,
+    task: Option<FilterTask>,
+}
+
+impl FilterState {
+    fn pump(&mut self, state: &mut CacheState, mailbox: &FilterMailbox) {
+        let request = mailbox.request.load_full();
+        if self.request.as_ref().map(|request| request.revision)
+            != request.as_ref().map(|request| request.revision)
+        {
+            self.task = None;
+            self.request = request;
+            mailbox.publish(None, state);
+        }
+        let Some(request) = self.request.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let Some(source) = state
+            .published
+            .get(&request.directory)
+            .cloned()
+            .filter(|source| {
+                source.generation == state.generation
+                    && source.child_epoch
+                        == state
+                            .parents
+                            .get(&request.directory)
+                            .map_or(0, |parent| parent.child_epoch)
+                    && !state.is_removed(request.directory)
+            })
+        else {
+            self.task = None;
+            mailbox.publish(None, state);
+            return;
+        };
+        if self.task.as_ref().is_some_and(|task| {
+            task.source.generation != source.generation
+                || task.source.child_epoch != source.child_epoch
+        }) {
+            self.task = None;
+            mailbox.publish(None, state);
+        }
+        if self.task.is_none() {
+            if mailbox.snapshot.load().as_ref().is_some_and(|snapshot| {
+                snapshot.revision == request.revision && Arc::ptr_eq(&snapshot.source, &source)
+            }) {
+                return;
+            }
+            self.task = Some(FilterTask {
+                query: request.query.chars().flat_map(char::to_lowercase).collect(),
+                request,
+                source,
+                next: 0,
+                ids: Vec::new(),
+                positions: HashMap::new(),
+            });
+        }
+        let task = self.task.as_mut().expect("a filter task was started");
+        let end = task
+            .next
+            .saturating_add(FILTER_BATCH)
+            .min(task.source.ids.len());
+        if let Some(directory) = state.directories.get(&task.request.directory) {
+            for &id in &task.source.ids[task.next..end] {
+                let Some(row) = directory.order.rows.get(&id).map(|state| &state.row) else {
+                    continue;
+                };
+                if state.removed.contains(&id)
+                    || (task.request.directories_only && row.kind != NodeKind::Directory)
+                    || !fuzzy_matches(&row.name, &task.query)
+                {
+                    continue;
+                }
+                task.positions.insert(id, task.ids.len());
+                task.ids.push(id);
+            }
+        }
+        task.next = end;
+        if end != task.source.ids.len() {
+            return;
+        }
+        let task = self.task.take().expect("a completed filter task exists");
+        // A newer keystroke can arrive while this batch is running. Never
+        // publish its predecessor under the newest query's identity.
+        if mailbox
+            .request
+            .load()
+            .as_ref()
+            .is_none_or(|latest| latest.revision != task.request.revision)
+        {
+            return;
+        }
+        let view = Arc::new(CachedSnapshot {
+            generation: task.source.generation,
+            child_epoch: task.source.child_epoch,
+            ids: task.ids,
+            positions: task.positions,
+        });
+        mailbox.publish(
+            Some(Arc::new(FilteredSnapshot {
+                revision: task.request.revision,
+                source: task.source,
+                view,
+            })),
+            state,
+        );
+    }
+}
+
+/// Case-insensitive subsequence matching keeps the directory's existing order.
+/// The query is folded once when a background task starts.
+fn fuzzy_matches(name: &OsStr, query: &str) -> bool {
+    if query.is_ascii() && name.as_encoded_bytes().is_ascii() {
+        let mut wanted = query.bytes();
+        let Some(mut next) = wanted.next() else {
+            return true;
+        };
+        for &byte in name.as_encoded_bytes() {
+            if byte.to_ascii_lowercase() == next {
+                let Some(following) = wanted.next() else {
+                    return true;
+                };
+                next = following;
+            }
+        }
+        return false;
+    }
+    let mut wanted = query.chars();
+    let Some(mut next) = wanted.next() else {
+        return true;
+    };
+    for ch in name.to_string_lossy().chars().flat_map(char::to_lowercase) {
+        if ch == next {
+            let Some(following) = wanted.next() else {
+                return true;
+            };
+            next = following;
+        }
+    }
+    false
+}
+
 pub struct CachedOrderWorker {
     sender: Sender<CacheCommand>,
     cache: SharedCache,
@@ -255,6 +435,8 @@ pub struct CachedOrderWorker {
     stop: Arc<AtomicBool>,
     generation: u64,
     pending_config: Option<(OrderConfig, bool)>,
+    filter: Arc<FilterMailbox>,
+    filter_revision: u64,
 }
 
 impl CachedOrderWorker {
@@ -266,10 +448,18 @@ impl CachedOrderWorker {
         let worker_cache = Arc::clone(&cache);
         let worker_priorities = Arc::clone(&priorities);
         let worker_stop = Arc::clone(&stop);
+        let filter = Arc::new(FilterMailbox::new());
+        let worker_filter = Arc::clone(&filter);
         let _ = thread::Builder::new()
             .name("ldu-order-cache".into())
             .spawn(move || {
-                run_cache(commands, worker_cache, worker_priorities, worker_stop);
+                run_cache(
+                    commands,
+                    worker_cache,
+                    worker_priorities,
+                    worker_stop,
+                    worker_filter,
+                );
             })?;
         Ok(Self {
             sender,
@@ -278,6 +468,8 @@ impl CachedOrderWorker {
             stop,
             generation: 0,
             pending_config: None,
+            filter,
+            filter_revision: 0,
         })
     }
 
@@ -315,6 +507,35 @@ impl CachedOrderWorker {
             .get(&directory)
             .filter(|view| view.generation == self.generation)
             .cloned()
+    }
+
+    /// Replace the current basename query without queueing earlier keystrokes.
+    /// Normal directory snapshots remain warm and are never filtered in place.
+    pub fn set_filter(&mut self, directory: NodeId, query: &str, directories_only: bool) {
+        self.filter_revision = self.filter_revision.wrapping_add(1);
+        self.filter.request.store(Some(Arc::new(FilterRequest {
+            revision: self.filter_revision,
+            directory,
+            query: Arc::from(query),
+            directories_only,
+        })));
+        let _ = self.sender.try_send(CacheCommand::Wake);
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter.request.store(None);
+        let _ = self.sender.try_send(CacheCommand::Wake);
+    }
+
+    /// Only completed results for the current query and sort generation qualify.
+    pub fn filtered_snapshot(&self, directory: NodeId) -> Option<Arc<CachedSnapshot>> {
+        let request = self.filter.request.load_full()?;
+        if request.directory != directory {
+            return None;
+        }
+        let snapshot = self.filter.snapshot.load_full()?;
+        (snapshot.revision == request.revision && snapshot.view.generation == self.generation)
+            .then(|| Arc::clone(&snapshot.view))
     }
 
     pub fn try_upsert(&mut self, rows: Vec<CachedRow>) -> Result<(), Vec<CachedRow>> {
@@ -742,12 +963,11 @@ impl CacheState {
             generation: self.generation,
             child_epoch: self.parents.get(&id).map_or(0, |link| link.child_epoch),
             ids: snapshot.ids,
-            directory_ids: snapshot.directory_ids,
             positions: snapshot.positions,
         });
         directory.published = Some(Instant::now());
         directory.published_has_rows = !view.ids.is_empty();
-        directory.published_has_directories = !view.directory_ids.is_empty();
+        directory.published_has_directories = directory.directory_count != 0;
         let previous = self.published.insert(id, view);
         self.publish_index(cache);
         if let Some(old) = previous {
@@ -816,10 +1036,14 @@ fn run_cache(
     cache: SharedCache,
     priorities: Arc<[AtomicU32; 2]>,
     stop: Arc<AtomicBool>,
+    filter: Arc<FilterMailbox>,
 ) {
     let mut state = CacheState::new();
+    let mut filtering = FilterState::default();
     while !stop.load(AtomicOrdering::Acquire) {
-        let timeout = if state.dirty.is_empty()
+        let timeout = if filtering.task.is_some() {
+            Duration::ZERO
+        } else if state.dirty.is_empty()
             && state.cleanup.is_empty()
             && state.retired_rows.is_empty()
             && state.retired.len() <= MAX_DRAIN
@@ -849,6 +1073,7 @@ fn run_cache(
                 break;
             }
         }
+        filtering.pump(&mut state, &filter);
         state.cleanup(&cache);
     }
 }
@@ -940,7 +1165,7 @@ mod tests {
         state.publish(2, &cache);
         let views = cache.load_full();
         assert_eq!(views[&0].ids, vec![2, 3, 1]);
-        assert_eq!(views[&0].directory_ids, vec![2, 1]);
+        assert_eq!(state.directories[&ROOT].directory_count, 2);
         assert_eq!(views[&0].positions[&1], 2);
         assert_eq!(views[&1].ids, vec![4]);
         assert!(views[&2].ids.is_empty());
@@ -1136,6 +1361,8 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             generation: 0,
             pending_config: None,
+            filter: Arc::new(FilterMailbox::new()),
+            filter_revision: 0,
         };
         let config = OrderConfig {
             sort_mode: SortMode::Name,
@@ -1174,7 +1401,6 @@ mod tests {
             generation: 0,
             child_epoch: 0,
             ids: vec![9],
-            directory_ids: Vec::new(),
             positions: HashMap::from([(9, 0)]),
         });
         let mut index = PublishedCache::new();
@@ -1194,7 +1420,6 @@ mod tests {
                         generation: 0,
                         child_epoch: 0,
                         ids: Vec::new(),
-                        directory_ids: Vec::new(),
                         positions: HashMap::new(),
                     }),
                 );
@@ -1437,11 +1662,9 @@ mod tests {
         put(&mut state, vec![small, large, hidden, row(4, "file", 2000)]);
         let snapshot = state.snapshot();
         assert_eq!(snapshot.ids, vec![4, 2, 1]);
-        assert_eq!(snapshot.directory_ids, vec![2, 1]);
         state.rows.remove(&2);
         let snapshot = state.snapshot();
         assert_eq!(snapshot.ids, vec![4, 1]);
-        assert_eq!(snapshot.directory_ids, vec![1]);
     }
 
     fn epoch_row(
@@ -1627,5 +1850,236 @@ mod tests {
         finish_cache_cleanup(&mut state, &cache);
         assert!(state.retired_rows.is_empty());
         assert!(!state.is_removed(0));
+    }
+
+    fn filter_request(mailbox: &FilterMailbox, revision: u64, query: &str, directories_only: bool) {
+        mailbox.request.store(Some(Arc::new(FilterRequest {
+            revision,
+            directory: ROOT,
+            query: Arc::from(query),
+            directories_only,
+        })));
+    }
+
+    fn finish_filter(
+        filtering: &mut FilterState,
+        state: &mut CacheState,
+        mailbox: &FilterMailbox,
+    ) -> Arc<CachedSnapshot> {
+        for _ in 0..16 {
+            filtering.pump(state, mailbox);
+            if filtering.task.is_none() {
+                if let Some(snapshot) = mailbox.snapshot.load_full() {
+                    return Arc::clone(&snapshot.view);
+                }
+            }
+        }
+        panic!("filter did not finish");
+    }
+
+    #[test]
+    fn fuzzy_subsequences_fold_unicode_and_keep_literal_spaces() {
+        for (name, query, matches) in [
+            ("Alpha Notes.txt", "ANT", true),
+            ("alpha beta", "a b", true),
+            ("beta alpha", "ab", false),
+            ("abc", "acb", false),
+            ("Éclair", "ÉCR", true),
+            ("İSTANBUL", "i", true),
+            ("İSTANBUL", "İs", true),
+            ("Kelvin", "k", true),
+            ("anything", "", true),
+        ] {
+            let query: String = query.chars().flat_map(char::to_lowercase).collect();
+            assert_eq!(
+                fuzzy_matches(OsStr::new(name), &query),
+                matches,
+                "{name}: {query}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = OsStr::from_bytes(b"a\xffb");
+            assert!(fuzzy_matches(raw, "ab"));
+            assert!(fuzzy_matches(raw, "\u{fffd}"));
+        }
+    }
+
+    #[test]
+    fn filtering_keeps_normal_order_and_matches_only_current_directory_names() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(None, ROOT, "root", 0, NodeKind::Directory),
+                    cache_row(Some(ROOT), 1, "Alpha Notes.txt", 100, NodeKind::File),
+                    cache_row(Some(ROOT), 2, "Annual", 90, NodeKind::Directory),
+                    cache_row(Some(ROOT), 3, "Beta", 80, NodeKind::File),
+                    cache_row(Some(2), 4, "AN nested", 1000, NodeKind::Directory),
+                ],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        state.publish(2, &cache);
+        let normal = Arc::clone(&state.published[&ROOT]);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "AN", false);
+        let view = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert_eq!(view.ids, [1, 2]);
+        assert_eq!(view.positions[&2], 1);
+        assert!(Arc::ptr_eq(&normal, &state.published[&ROOT]));
+        assert_eq!(normal.ids, [1, 2, 3]);
+        filter_request(&mailbox, 2, "AN", true);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [2]);
+        filter_request(&mailbox, 3, "", false);
+        assert_eq!(
+            finish_filter(&mut filtering, &mut state, &mailbox).ids,
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn filter_batches_cancel_superseded_queries_and_retire_results_on_worker() {
+        let (mut state, cache) = cache_state();
+        let mut rows = vec![cache_row(None, ROOT, "root", 0, NodeKind::Directory)];
+        rows.extend((1..=FILTER_BATCH as NodeId + 5).map(|id| {
+            cache_row(
+                Some(ROOT),
+                id,
+                &format!("match-{id}"),
+                u64::from(id),
+                NodeKind::File,
+            )
+        }));
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows,
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "match", false);
+        filtering.pump(&mut state, &mailbox);
+        assert_eq!(filtering.task.as_ref().unwrap().next, FILTER_BATCH);
+        assert!(mailbox.snapshot.load().is_none());
+        filter_request(&mailbox, 2, "missing", false);
+        let empty = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert!(empty.ids.is_empty());
+        assert_eq!(mailbox.snapshot.load().as_ref().unwrap().revision, 2);
+        filter_request(&mailbox, 3, "match", false);
+        let held = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert_eq!(held.ids.len(), FILTER_BATCH + 5);
+        mailbox.request.store(None);
+        filtering.pump(&mut state, &mailbox);
+        assert!(mailbox.snapshot.load().is_none());
+        assert!(state.retired.iter().any(|view| Arc::ptr_eq(view, &held)));
+        assert!(Arc::strong_count(&held) > 1);
+    }
+
+    #[test]
+    fn filtering_refreshes_after_scan_growth_sort_changes_and_child_epochs() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(None, ROOT, "root", 0, NodeKind::Directory),
+                    cache_row(Some(ROOT), 1, "same-z", 10, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "same", false);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [1]);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 2, "same-a", 5, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        assert_eq!(
+            finish_filter(&mut filtering, &mut state, &mailbox).ids,
+            [1, 2]
+        );
+        state.apply(
+            CacheCommand::Configure {
+                generation: 2,
+                config: OrderConfig {
+                    sort_mode: SortMode::Name,
+                    descending: false,
+                    ..OrderConfig::default()
+                },
+                clear: false,
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let view = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert_eq!(view.generation, 2);
+        assert_eq!(view.ids, [2, 1]);
+        let mut refreshed = cache_row(None, ROOT, "root", 0, NodeKind::Directory);
+        refreshed.child_epoch = 1;
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 2,
+                rows: vec![refreshed],
+            },
+            &cache,
+        );
+        filtering.pump(&mut state, &mailbox);
+        assert!(mailbox.snapshot.load().is_none());
+        state.publish(ROOT, &cache);
+        let view = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert_eq!(view.child_epoch, 1);
+        assert!(view.ids.is_empty());
+    }
+
+    #[test]
+    fn filter_lookup_rejects_previous_queries_and_sort_generations_immediately() {
+        let (sender, _commands) = bounded(COMMAND_CAPACITY);
+        let filter = Arc::new(FilterMailbox::new());
+        let mut worker = CachedOrderWorker {
+            sender,
+            cache: Arc::new(ArcSwap::from_pointee(PublishedCache::new())),
+            priorities: Arc::new([AtomicU32::new(ROOT), AtomicU32::new(NodeId::MAX)]),
+            stop: Arc::new(AtomicBool::new(false)),
+            generation: 1,
+            pending_config: None,
+            filter: Arc::clone(&filter),
+            filter_revision: 0,
+        };
+        worker.set_filter(ROOT, "first", false);
+        let view = Arc::new(CachedSnapshot {
+            generation: 1,
+            child_epoch: 0,
+            ids: vec![1],
+            positions: HashMap::from([(1, 0)]),
+        });
+        filter.snapshot.store(Some(Arc::new(FilteredSnapshot {
+            revision: 1,
+            source: Arc::clone(&view),
+            view,
+        })));
+        assert!(worker.filtered_snapshot(ROOT).is_some());
+        assert!(worker.filtered_snapshot(1).is_none());
+        worker.generation = 2;
+        assert!(worker.filtered_snapshot(ROOT).is_none());
+        worker.generation = 1;
+        worker.set_filter(ROOT, "second", false);
+        assert!(worker.filtered_snapshot(ROOT).is_none());
+        worker.clear_filter();
+        assert!(worker.filtered_snapshot(ROOT).is_none());
     }
 }

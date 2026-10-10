@@ -2,7 +2,7 @@
 
 Completion requires two consecutive adversarial review passes, each using all six reviewer slots, with no valid findings. A valid finding and its fix reset the clean-pass count. Tests and measurements are separate evidence and do not count as review passes.
 
-Current consecutive clean passes: **2**. Qualified effort-first source `2afcfe273c5d87ffbf4b89f0db19e36e737d715412a3652b5452d921ac3f66db` passed consecutive saturated Passes 31 and 32 unchanged. Publication is authorized.
+Current consecutive clean passes: **2**. Navigation margins, separate visual controls, current-directory fuzzy filtering, full contents previews, deletion priority and bounded shutdown passed qualification on source `62720dd653c2de083290fc6955966b8d49d7e7da240fcf9c7f572454d8569e1f`. Passes 36 and 37 were clean on the same source, with all six reviewer slots occupied in each round and assignments rotated between rounds.
 
 | Pass | Reviewers | Result | Status |
 | --- | --- | --- | --- |
@@ -36,7 +36,12 @@ Current consecutive clean passes: **2**. Qualified effort-first source `2afcfe27
 | 29 | 6 of 6 | No findings | Clean; streak 1 |
 | 30 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
 | 31 | 6 of 6 | No findings | Clean; streak 1 |
-| 32 | 6 of 6 | No findings | Clean; streak 2; current revision qualified |
+| 32 | 6 of 6 | No findings | Clean; streak 2; published baseline qualified |
+| 33 | 6 of 6 | One finding; five reviewers reported none | Fixed and requalified; streak 0 |
+| 34 | 6 of 6 | No findings | Clean; streak 1, reset by Pass 35 |
+| 35 | 6 of 6 | One finding; five reviewers reported none | Fixed and requalified; streak 0 |
+| 36 | 6 of 6 | No findings | Clean; streak 1 |
+| 37 | 6 of 6 | No findings | Clean; streak 2; current source qualified |
 
 Pass 1 findings, now closed:
 
@@ -370,3 +375,21 @@ The paired benchmark attempt collected no timings: unrelated host work kept the 
 Fresh six-agent adversarial review on the same qualified source is preparing at the READY barrier.
 
 All six fresh Pass 32 reviewers were verified running simultaneously after READY and before RELEASE on the same qualified source as Pass 31. All six independently reported **NO FINDINGS**. Source remained frozen through both passes and still matches the qualification digest. Clean streak is **2**. Working, staged and committed source bytes are checked against that digest before publication.
+
+
+Pass 33 reviewed frozen source `ca7e6f09b333feaef181c5f6d31dc55c2c963596b941292bae00f3a04af977ab` after qualification. One finding resets the clean streak to **0**: cancellation immediately after the final successful unlink can skip parent metadata while still reporting a complete total. The correction must preserve successful target removal and mark the unrefreshed parent total partial without suppressing its ongoing scan or rescanning it.
+
+The Pass 33 correction is complete. Metadata uncertainty uses a spare node flag and existing ancestor counters; it does not suppress scanner contributions, add node fields, create an error, or schedule a rescan. Fresh metadata clears its token even when inode sizes are unchanged. Completed rows show a partial total without a spinner. Regression coverage includes final unlink cancellation, continued scanning, idempotence, overlapping markers, and update/rescan/removal cleanup.
+
+The corrected source was frozen as `4af2b4b6b6fc3a0390ffb69cc73738896ffed47a853bc45063e0d321fdd9ba36` and qualified with 255 unit tests, 7 filesystem tests, formatting, Linux Clippy, macOS compilation, a release build, 135 scroll-margin PTY states, the full PTY suite plus three reused corpora, and nine native/std/auto JSON comparisons. The release binary is 2,054,864 bytes, SHA-256 `140e9c8d6394404f04ec1089978b653bc8e3480d5fea59f1f04868788c40450e`. The macOS check retains three existing test-only warnings; no macOS runtime claim is made. Formal Pass 34 completed with all six reviewers reporting **NO FINDINGS**. The clean streak is **1**. Pass 35 is reviewing the same source with rotated assignments.
+
+
+Pass 35 reviewed the same frozen source and found one focus gap: a delayed filter result could select another unfinished directory without updating scanner priority. The previous directory retained priority until explicit navigation or hover. The correction must request focus after actual selection changes and handle empty/cleared queries without repeatedly reprioritizing unchanged snapshots. This resets the clean streak to **0**; Pass 34 no longer contributes to completion.
+
+The Pass 35 correction is complete. A deferred focus flag survives empty ordering results and requests scan priority when a user-driven replacement selection arrives. It covers filtering, hiding a selected entry, directory entry and refresh while preserving startup scheduling fairness. Two grouped regressions cover delayed matches, query clearing, replacement selection and unchanged snapshots.
+
+Qualification passed on source `62720dd653c2de083290fc6955966b8d49d7e7da240fcf9c7f572454d8569e1f`: 257 unit tests, 7 filesystem tests, formatting, warnings-denied Linux Clippy, macOS compilation, the release build, 135 scroll-margin PTY checks, the full PTY suite and three reused corpora, and nine native/std/auto JSON comparisons. The binary is 2055040 bytes, SHA-256 `1982d552382d52fa661e14df429e737803d83da9a2f496d09d4d74b5aafa38b6`. The three existing macOS test-only warnings remain; macOS runtime was not tested. Evidence: `.tmp/final-input.log`, `.tmp/qualification-input.log`, `.tmp/qualified-input.json`.
+
+Pass 36 used all six reviewer slots, verified running together at the READY barrier before RELEASE. The reviewers independently covered shutdown/deletion priority, filesystem/accounting, navigation/selection/focus, ordering/filter/preview, contract/regressions, and resource/scheduler behavior. All six reported **NO FINDINGS**. Qualified source and release binary hashes are unchanged. Clean streak: **1**.
+
+Pass 37 used all six reviewer slots, verified running together at the READY barrier before RELEASE. Assignments rotated across ordering/filter/preview, contract and terminal evidence, shutdown/deletion, navigation/selection/focus, filesystem/accounting, and combined interaction/resource behavior. All six reported **NO FINDINGS**. The qualified source and binary stayed unchanged through both rounds and their hashes were checked again after the final report. Consecutive clean passes: **2**. Publication checks compare the working tree, staged files and commit against the qualification digest before pushing.

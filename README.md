@@ -10,7 +10,7 @@ Terminal disk-usage browser written in Rust. Browse folder sizes while a paralle
 
 - Live totals with scan work balanced by entries checked
 - Gray Braille spinners beside folders still scanning
-- Cached sorted directory views, with matching subfolder previews on wide terminals
+- Cached sorted directory views, with matching contents previews on wide terminals
 - Fractional block bars for size distribution
 - Cancellable FIFO deletion queue that updates totals without restarting the scan
 - Scoped refresh of the selected folder or current directory
@@ -55,29 +55,57 @@ With no path, `ldu` scans the current directory. Run it in an interactive termin
 
 ## Keys
 
+Help groups shortcuts into Normal mode, Visual mode and Common keys.
+
+### Normal mode
+
 | Key | Action |
 | --- | --- |
-| Up / `k`, Down / `j` | Move |
-| Right / Enter / `l` | Open directory |
+| Up / `k`, Down / `j` | Move cursor |
+| Shift-Up / Shift-Down | Move by a page |
+| Enter | Open directory |
+| `v` / `V` | Select current row and enter visual mode |
+| `d` | Confirm deletion of the current entry |
+| `D` | Open queue |
+
+### Visual mode
+
+| Key | Action |
+| --- | --- |
+| Up / `k`, Down / `j` | Move cursor without changing selection |
+| Shift-Up / Shift-Down | Add a range to selection |
+| Enter | Toggle current row |
+| `d`, `D`, Delete | Confirm batch deletion |
+| `v` / `V` | Clear selection and leave visual mode |
+| Escape | Clear an active filter; otherwise clear selection and leave visual mode |
+
+### Common keys
+
+| Key | Action |
+| --- | --- |
+| Right / `l` | Open directory |
 | Left / `h` / `<` / Backspace | Parent directory |
+| Home / End, PageUp / PageDown | Move to an end or by a page |
+| `/` | Edit the current directory filter |
 | `n`, `s`, `C` | Sort by name, size, or item count; repeat to reverse |
 | `a`, `g` | Change size mode or graph |
 | `e`, `t` | Toggle hidden entries or directories first |
-| `d` | Confirm deletion of the current entry; batch deletion in visual mode |
-| `v` / `V` | Toggle visual selection |
-| `D` | Open queue; confirm batch deletion in visual mode |
 | `r`, `R` | Refresh selected folder or current directory |
 | `?`, `q` / Ctrl-C | Help, quit |
 
-Press `v` or `V` to select the current row. In visual mode, arrows and Shift-arrows extend selection; Enter toggles the current row, preserving that choice on the next move. `d`, `D` or Delete opens batch confirmation, waiting for any pending selection work. Before confirming, cancel with `n` or Escape to keep the selection.
+Press `/` to filter file and folder names in the current directory using fuzzy matching. It does not search subdirectories. Results update as you type. Backspace removes the last character, Ctrl-U clears the query, Enter finishes typing, and Escape clears the filter. In visual mode, changing or clearing the query clears the marks and keeps visual mode active. Entering a directory or going to its parent clears the filter.
 
-In visual mode, click to toggle a row, or drag to add a range. Shift-click adds a range; Shift-drag reverses its marks. Dragging at the list edges scrolls through more entries. `v`, `V` or Escape leaves visual mode. Blue rows are selected; `›` marks the cursor and `✓` marks other selected rows. The header shows the selected count and current controls as space allows.
+Press `v` or `V` to select the current row. In visual mode, Up/Down and `j`/`k` move the cursor without changing selection. Shift-Up/Down adds a range; Enter toggles the current row. `d`, `D` or Delete opens batch confirmation, waiting for any pending selection work. Before confirming, cancel with `n` or Escape to keep the selection.
 
-After batch confirmation, an `Enqueueing selection` dialog stays open until the entries join the queue. `n` or Escape stops adding the remaining entries; already queued deletions continue. `q` or Ctrl-C opens confirmation to cancel all work and quit.
+In visual mode, click to toggle a row, or drag to add a range. Shift-click adds a range; Shift-drag reverses its marks. Dragging at the list edges scrolls through more entries. `v` or `V` leaves visual mode; Escape does so when no filter is active. Blue rows are selected; `›` marks the cursor and `✓` marks other selected rows. The header shows the selected count and current controls as space allows.
 
-In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down or `K`/`J` reorders, and `d` removes the selected waiting job or cancels the active job. `c` cancels the active job. Quitting with deletions queued requires confirmation and cancels the remaining work.
+After batch confirmation, an `Enqueueing selection` dialog stays open until the entries join the queue. `n` or Escape stops adding the remaining entries; already queued deletions continue. `q` or Ctrl-C opens a warning while confirmed deletions finish.
 
-Allocated disk usage is the default. Scanning and finished entries sort together; the selected entry stays selected as totals change. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, hovering over a directory shows its subdirectories beside the main list.
+In the deletion queue, Space pauses waiting jobs, `j`/`k` selects, Shift-Up/Down or `K`/`J` reorders, and `d` removes the selected waiting job or cancels the active job. `c` cancels the active job. Scanning pauses while deletion is active and resumes afterward.
+
+With confirmed deletions pending, the first `q` or Ctrl-C stops scans and waits for deletion to finish, then exits. A deletion error hidden by the warning is reported after the terminal is restored. Queue pause still applies. A second Ctrl-C cancels all deletions and quits. `n` or Escape keeps browsing; stopped scans stay stopped until you refresh with `r` or `R`.
+
+Allocated disk usage is the default. Scanning and finished entries sort together; the selected entry stays selected as totals change. Hovering over or entering an unfinished folder gives its scan priority. At 120 columns or wider, the selected directory's files and folders appear in a Contents preview beside the main list.
 
 [Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md) · [Review results](REVIEW.md)
 

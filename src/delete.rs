@@ -339,11 +339,9 @@ fn remove_linux(
     state: &WorkerState,
     expected: Option<ConfirmedTarget>,
 ) -> io::Result<Removal> {
-    use std::fs;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
 
-    let parent = match anchor.open_parent(relative) {
+    let parent = match anchor.open_parent_cancellable(relative, &state.cancel) {
         Ok(parent) => parent,
         // Another queued deletion may have removed this target's parent.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -353,14 +351,14 @@ fn remove_linux(
     };
     state.check_cancel()?;
     let parent_path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
-    let held = rustix::fs::fstat(&parent).map_err(io::Error::from)?;
+    let held = retry_operation(state, || rustix::fs::fstat(&parent))?;
     if expected.is_some_and(|expected| expected.parent != Some(FileIdentity::from_stat(&held))) {
         return Err(changed_target());
     }
-    let visible = fs::metadata(&parent_path)?;
-    if !visible.is_dir()
-        || visible.dev() != held.st_dev as u64
-        || visible.ino() != held.st_ino as u64
+    let visible = retry_operation(state, || rustix::fs::stat(&parent_path))?;
+    if rustix::fs::FileType::from_raw_mode(visible.st_mode) != rustix::fs::FileType::Directory
+        || visible.st_dev != held.st_dev
+        || visible.st_ino != held.st_ino
     {
         return Err(io::Error::other(
             "the anchored parent is unavailable through /proc/self/fd",
@@ -373,26 +371,35 @@ fn remove_linux(
         )
     })?;
     let outcome = remove_from_parent(&parent, basename, state, expected);
-    // Retain parent metadata even after cooperative cancellation or partial
-    // failure. A scoped refresh reconciles surviving descendants in the model.
-    let (parent_metadata, metadata_error) = match rustix::fs::fstat(&parent) {
-        Ok(stat) => (
-            Some(ParentMetadata {
-                relative: relative.parent().unwrap_or(Path::new("")).to_path_buf(),
-                sizes: Sizes {
-                    apparent: u64::try_from(stat.st_size).unwrap_or(0),
-                    allocated: u64::try_from(stat.st_blocks)
-                        .unwrap_or(0)
-                        .saturating_mul(512),
-                },
-            }),
-            None,
-        ),
-        Err(error) => (
-            None,
-            Some(format!("could not refresh parent metadata: {error}")),
-        ),
-    };
+    // Cancellation must not start more filesystem work just to refresh totals.
+    // The caller can reconcile surviving descendants with a scoped refresh.
+    if state.cancel.load(Ordering::Relaxed) {
+        return Ok(Removal {
+            outcome,
+            parent_metadata: None,
+            metadata_error: None,
+        });
+    }
+    let (parent_metadata, metadata_error) =
+        match retry_operation(state, || rustix::fs::fstat(&parent)) {
+            Ok(stat) => (
+                Some(ParentMetadata {
+                    relative: relative.parent().unwrap_or(Path::new("")).to_path_buf(),
+                    sizes: Sizes {
+                        apparent: u64::try_from(stat.st_size).unwrap_or(0),
+                        allocated: u64::try_from(stat.st_blocks)
+                            .unwrap_or(0)
+                            .saturating_mul(512),
+                    },
+                }),
+                None,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (None, None),
+            Err(error) => (
+                None,
+                Some(format!("could not refresh parent metadata: {error}")),
+            ),
+        };
     Ok(Removal {
         outcome,
         parent_metadata,
@@ -690,7 +697,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cancellation_between_unlinks_retains_progress_and_parent_metadata() {
+    fn cancellation_between_unlinks_retains_progress_without_more_metadata() {
         let work = fixture();
         std::fs::create_dir(work.path().join("target")).unwrap();
         for n in 0..8 {
@@ -712,14 +719,7 @@ mod tests {
                 .count(),
             6
         );
-        assert!(
-            removal
-                .parent_metadata
-                .unwrap()
-                .relative
-                .as_os_str()
-                .is_empty()
-        );
+        assert!(removal.parent_metadata.is_none());
         assert!(removal.metadata_error.is_none());
         let resumed = WorkerState::default();
         remove_confirmed(&anchor, Path::new("target"), &resumed)
@@ -728,6 +728,29 @@ mod tests {
             .unwrap();
         assert!(!work.path().join("target").exists());
         assert_eq!(resumed.snapshot().removed_entries, 7);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_after_final_unlink_preserves_success_without_parent_metadata() {
+        for directory in [false, true] {
+            let work = fixture();
+            let target = work.path().join("target");
+            if directory {
+                std::fs::create_dir(&target).unwrap();
+            } else {
+                std::fs::write(&target, b"remove").unwrap();
+            }
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let state = WorkerState::default();
+            state.cancel_after.store(1, Ordering::Relaxed);
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(removal.outcome.is_ok());
+            assert!(!target.exists());
+            assert_eq!(state.snapshot().removed_entries, 1);
+            assert_eq!(state.snapshot().removed_directories, u64::from(directory));
+            assert!(removal.parent_metadata.is_none() && removal.metadata_error.is_none());
+        }
     }
 
     #[cfg(target_os = "linux")]

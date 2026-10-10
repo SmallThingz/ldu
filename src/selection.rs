@@ -472,7 +472,6 @@ mod tests {
             generation: 1,
             child_epoch: 0,
             ids: ids.to_vec(),
-            directory_ids: Vec::new(),
             positions: ids
                 .iter()
                 .enumerate()

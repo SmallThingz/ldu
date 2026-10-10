@@ -6,9 +6,11 @@ The terminal opens before scanning starts. Available workers favor subtrees with
 
 Scanning and completed entries share the same sort. Near-size groups retain their previous order to reduce movement. Each group spans at most 2%; nearby entries in different groups can still exchange places. Selection tracks the entry by its ID as live totals change.
 
-Gray Braille spinners mark folders still being scanned. Bars use fractional block glyphs. The main list has one path header with compact `v select` and `? help` hints, with no frame. Narrow terminals shorten the hints. Visual mode shows the selected count and deletion controls in that header. At widths of at least 120 columns, the selected directory's subdirectories appear in a side preview using the current sorting, size, graph and hidden-entry settings. Files are omitted from the preview.
+Gray Braille spinners mark folders still being scanned. Bars use fractional block glyphs. The main list has one path header with compact `v select` and `? help` hints, with no frame. Narrow terminals shorten the hints. Visual mode shows the selected count and deletion controls in that header. At widths of at least 120 columns, the selected directory's files and folders appear in a Contents preview using the current sorting, size, graph and hidden-entry settings.
 
-Hidden entries are visible initially. Hiding dotfiles changes the listing, not the totals. Sizes remain partial while scanning or after read errors. A changing filesystem is not a consistent snapshot.
+Keyboard and wheel movement leave up to three visible rows above and below the cursor. The margin shrinks at the ends of the list and in short terminals. Mouse hovering keeps the viewport still; live resorts preserve the cursor row.
+
+Hidden entries are visible initially. Hiding dotfiles changes the listing, not the totals. Sizes remain partial while scanning, after read errors, or after deletion if refreshing the parent's metadata was interrupted. A changing filesystem is not a consistent snapshot.
 
 ## Options
 
@@ -25,12 +27,38 @@ JSON includes both apparent and allocated sizes. Exit status is 0 for a complete
 
 ## Keys and dialogs
 
+Help groups shortcuts into Normal mode, Visual mode and Common keys.
+
+### Normal mode
+
 | Key | Action |
 | --- | --- |
-| Up / `k`, Down / `j` | Move selection |
-| Right / Enter / `l` | Open selected directory |
+| Up / `k`, Down / `j` | Move cursor |
+| Shift-Up / Shift-Down | Move by a page |
+| Enter | Open selected directory |
+| `v` / `V` | Select current row and enter visual mode |
+| `d` | Confirm and queue deletion of the current entry |
+| `D` | Open the queue |
+
+### Visual mode
+
+| Key | Action |
+| --- | --- |
+| Up / `k`, Down / `j` | Move cursor without changing selection |
+| Shift-Up / Shift-Down | Add a range to selection |
+| Enter | Toggle current row |
+| `d`, `D`, Delete | Confirm batch deletion |
+| `v` / `V` | Clear selection and leave visual mode |
+| Escape | Clear an active filter; otherwise clear selection and leave visual mode |
+
+### Common keys
+
+| Key | Action |
+| --- | --- |
+| Right / `l` | Open selected directory |
 | Left / `h` / `<` / Backspace | Go to parent |
 | Home / End, PageUp / PageDown | Move to an end or by a page |
+| `/` | Edit the current directory filter |
 | `n`, `s`, `C` | Sort by name, size or recursive item count; repeat to reverse |
 | `a` | Toggle allocated disk usage and apparent size |
 | `t` | Toggle directories before files |
@@ -40,34 +68,34 @@ JSON includes both apparent and allocated sizes. Exit status is 0 for a complete
 | `i` | Open selected entry information |
 | `r` | Refresh the selected folder |
 | `R` | Refresh the current directory |
-| `d` | Confirm and queue deletion of the current entry; batch deletion in visual mode |
-| `v` / `V` | Toggle visual selection |
-| `D` | Open the queue, or confirm batch deletion in visual mode |
-| Delete | Confirm batch deletion in visual mode |
 | `?` | Open help |
 | `q`, Ctrl-C | Quit |
 
-Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and ordinary notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. With deletions queued or active, `q` and Ctrl-C open a quit confirmation: `q`, Enter or a second Ctrl-C cancels the queue and active worker, then waits for active removal to stop before restoring the terminal. Cancelled metadata capture retires in the background and does not delay terminal restoration. `n` or Escape keeps browsing. Confirmation stays disabled until the quit choices fit on screen.
+Press `/` to filter file and folder names in the current directory using fuzzy matching. It does not search subdirectories. Results update as you type. Backspace removes the last character, Ctrl-U clears the query, Enter finishes typing, and Escape clears the filter. In visual mode, changing or clearing the query clears the marks and keeps visual mode active. Entering a directory or going to its parent clears the filter.
+
+Dialogs have thin, sharp borders and highlighted keys and actions. Help, information and ordinary notices scroll with Up/`k`, Down/`j`, PageUp/PageDown and Home/End. Enter, Escape, `q` or `i` closes them. `?` closes help or opens it from information and notices. With confirmed deletions pending, the first `q` or Ctrl-C stops all scans and pending refreshes, opens a warning, and lets deletions finish before exiting. A deletion error hidden by the warning is reported after terminal restoration with exit status 1. Queue pause still applies. `n` or Escape dismisses the warning and keeps browsing; stopped scans do not restart automatically, so use `r` or `R` to refresh.
+
+A second Ctrl-C cancels all deletions and quits, even when the terminal is too small to show the choices. `q` or Enter also confirms cancellation when the choices are visible. Cancellation waits up to one second before restoring the terminal, even if filesystem work is blocked; another Ctrl-C exits immediately during that wait. SIGINT follows the same sequence.
 
 `r` refreshes only a selected directory; selecting a file has no effect. `R` refreshes the directory currently being browsed. Both preserve the current path, retain unrelated entries and update ancestor totals. Requests are coalesced and wait while a queued deletion overlaps their scope. Hardlink accounting remains shared across the original scan and refreshed subtrees. Fresh hardlink metadata updates its global owner even when that owner lies outside the refreshed folder. Shell spawning is unavailable.
 
-`v` or `V` starts visual selection by marking the current row. Arrows and Shift-arrows add a range. Enter toggles the current row and starts a new range from it; moving afterward preserves an explicit deselection of that row. A `›` marks the cursor; `✓` marks other selected rows. Blue backgrounds indicate selection. An unselected cursor has a gray background. The header shows the selection count and controls as space allows. Selection tracks stable entry IDs as sorting changes; each range retains the ordering from when it began. `v`, `V` or Escape clears selection and leaves visual mode. Navigating to another directory also clears it.
+`v` or `V` starts visual selection by marking the current row. Up/Down and `j`/`k` move the cursor without changing selection. Shift-Up/Down adds a range. Enter toggles the current row and starts a new range from it; extending that range with Shift preserves an explicit deselection of its starting row. A `›` marks the cursor; `✓` marks other selected rows. Blue backgrounds indicate selection. An unselected cursor has a gray background. The header shows the selection count and controls as space allows. Selection tracks stable entry IDs as sorting changes; each range retains the ordering from when it began. `v` or `V` clears selection and leaves visual mode; Escape does so when no filter is active. Navigating to another directory also clears it.
 
-In visual mode, a plain click toggles a row and a plain drag adds a range. Shift-click adds a range from the selection anchor; Shift-drag reverses selected membership across the drag range. The modifiers at mouse press determine the gesture even if Shift changes during the drag. Dragging at the top or bottom of the list scrolls to include offscreen entries.
+In visual mode, a plain click toggles a row and a plain drag adds a range. Shift-click adds a range from the selection anchor; Shift-drag reverses selected membership across the drag range. The modifiers at mouse press determine the gesture even if Shift changes during the drag. Dragging at the top or bottom of the list scrolls to include offscreen entries. If pending visual input fills the queue, the header shows `Input full`; new gestures may be ignored until it catches up. Escape and Ctrl-C remain available.
 
 In visual mode, `d`, `D` or Delete requests batch deletion. If a range or earlier selection input is still being processed, a `Selecting entries` notice stays open until it finishes. Enter is ignored throughout selection-preparation waits. `n` or Escape cancels the pending request and preserves the selection. Identity checking then runs in the background before the confirmation dialog enables `y` or Enter. Cancelling that dialog also preserves the selection.
 
-Confirming leaves visual mode and opens `Enqueueing selection` while the selected entries are added to the queue in their displayed order. Browsing and further confirmations wait until this finishes; already queued deletions continue. `n` or Escape stops adding the remaining entries, while entries already queued keep their place and may continue deleting. This does not restore visual selection. `q` or Ctrl-C opens the guarded quit dialog; confirming quit cancels the remaining additions and all queued or active deletions. Cancelling quit returns to enqueueing if it is still underway. The enqueueing dialog closes automatically when all entries have been added; queue pause, ordering, overlap and cancellation rules apply to those entries.
+Confirming leaves visual mode and opens `Enqueueing selection` while the selected entries are added to the queue in their displayed order. Browsing and further confirmations wait until this finishes; already queued deletions continue. `n` or Escape stops adding the remaining entries, while entries already queued keep their place and may continue deleting. This does not restore visual selection. `q` or Ctrl-C stops scans and opens the warning while confirmed deletions continue, including entries still being added. Confirming cancellation stops the remaining additions and all queued or active deletions. `n` or Escape returns to enqueueing if it is still underway. The enqueueing dialog closes automatically when all entries have been added; queue pause, ordering, overlap and cancellation rules apply to those entries.
 
 ## Deletion
 
-Outside visual mode, `d` opens confirmation for the current entry. `n` or Escape cancels; `y` or Enter adds the target to the deletion queue. Further entries can be confirmed while removal runs. `?` is ignored in the deletion confirmation. `q` is ignored while no deletion is queued; with queued or active work it opens the guarded quit dialog. Confirmation waits for the identity snapshot and stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
+Outside visual mode, `d` opens confirmation for the current entry. `n` or Escape cancels; `y` or Enter adds the target to the deletion queue. Further entries can be confirmed while removal runs. `?` is ignored in the deletion confirmation. `q` is ignored while no deletion is queued; with queued or active work it opens the warning while deletions finish. Confirmation waits for the identity snapshot and stays disabled until the rendered dialog has at least 18 inner columns, a visible target row and visible confirmation choices. Resize the terminal to enable confirmation; `n` or Escape can always cancel. The scan root cannot be deleted.
 
 Outside visual mode, `D` opens the styled queue. One worker removes entries in FIFO order. The queue shows the active target, removal progress and waiting targets. Up/Down or `k`/`j` selects a row; Shift-Up/Down or `K`/`J` moves a waiting target. Space or `p` pauses and resumes waiting work. The active worker continues while the queue is paused. `d` removes a selected waiting target or cancels a selected active target; `x` or Delete removes a waiting target, and `c` cancels the active worker. `D` or Escape closes the queue.
 
 Confirming an already queued target, or an entry inside a queued ancestor, does not add a duplicate. A newly queued ancestor replaces its waiting descendants. An active descendant finishes or stops before a queued ancestor starts. Removing a waiting target leaves its files untouched.
 
-Queued branches stop contributing new scan work and related scan errors while deletion is pending. Unrelated scanning continues. Successful deletion updates the listing and ancestor totals incrementally, without a full rescan or success dialog. Cancellation is cooperative between removal steps: already removed entries stay removed, while remaining entries survive. Cancelled or failed directory deletion requests a scoped refresh of the surviving target; an overlapping queued deletion delays that refresh. A failure preserves open dialogs and shows a brief notice after they close. The latest waiting failure replaces earlier waiting notices.
+Queued branches stop contributing new scan work and related scan errors while deletion is pending. While a deletion is active, all scanning pauses to give removal priority; an in-flight batch may finish. Scanning resumes after the active job ends unless a quit request stopped it. Successful deletion updates the listing and ancestor totals incrementally, without a full rescan or success dialog. Cancellation is cooperative between removal steps: already removed entries stay removed, while remaining entries survive. Cancelled or failed directory deletion requests a scoped refresh of the surviving target unless a quit request stopped scans; an overlapping queued deletion delays that refresh. A failure preserves open dialogs and shows a brief notice after they close. The latest waiting failure replaces earlier waiting notices.
 
 Deletion requires Linux and accessible procfs. An asynchronous snapshot resolves the parent beneath a held root anchor before confirmation. The queue retains the parent and target identities; removal compares them before changing the filesystem and rejects replacement parents or targets. A missing target at snapshot time cannot authorize a replacement that appears later. Symlink ancestors are refused, and target identities are rechecked during traversal. These checks do not provide an atomic guarantee against concurrent inode reuse, renames or filesystem changes. A final symlink is unlinked without following its target. A target already absent when its queued turn arrives succeeds. Other platforms report deletion as unsupported.
 
