@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RangeMode {
     Add,
+    Remove,
     Invert,
 }
 
@@ -151,8 +152,20 @@ impl VisualSelection {
         true
     }
 
-    /// Restore the persistent baseline captured at mouse press before deciding
-    /// whether the gesture is an additive click or an inverse drag.
+    /// Explicit deselection changes one row without treating it as deleted.
+    /// Preserve that choice when a later additive range starts at this anchor.
+    pub fn deselect(&mut self, id: NodeId) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.reanchor(id);
+        self.preserve_anchor = true;
+        self.selected.remove(&id);
+        true
+    }
+
+    /// Restore the persistent baseline captured at mouse press before applying
+    /// a drag, so its result does not depend on an earlier click update.
     pub fn restore_snapshot(&mut self, selected: HashSet<NodeId>, anchor: NodeId) {
         self.clear_pending_range();
         self.preserve_anchor = false;
@@ -230,8 +243,8 @@ impl VisualSelection {
     }
 
     /// The first snapshot fixes a gesture's row order. Later resorts cannot
-    /// retarget a range to unrelated IDs. Additive and inverse gestures both
-    /// restore their original baseline when the endpoint reverses.
+    /// retarget a range to unrelated IDs. Every gesture restores its original
+    /// baseline when the endpoint reverses.
     pub fn begin_range(
         &mut self,
         snapshot: Arc<CachedSnapshot>,
@@ -382,6 +395,7 @@ impl VisualSelection {
             let selected = if entering && !(index == range.anchor && range.preserve_anchor) {
                 match range.mode {
                     RangeMode::Add => true,
+                    RangeMode::Remove => false,
                     RangeMode::Invert => !baseline,
                 }
             } else {
@@ -524,6 +538,74 @@ mod tests {
         assert!(selection.contains(2));
         assert!(selection.contains(3));
         assert!(!selection.contains(4));
+    }
+
+    #[test]
+    fn subtractive_range_is_bounded_and_restores_its_frozen_sparse_baseline() {
+        let mut selection = VisualSelection::new(0).unwrap();
+        selection.enter(0, None);
+        let ids: Vec<_> = (1..=700).collect();
+        for id in ids.iter().copied().filter(|id| id % 2 == 1) {
+            selection.toggle(id);
+        }
+        selection.reanchor(3);
+        let original = view(&ids);
+        selection.begin_range(Arc::clone(&original), 697, RangeMode::Remove);
+        selection.pump(256);
+        assert!(selection.is_pending());
+        assert!(!selection.contains(3));
+        assert!(selection.contains(259));
+        finish(&mut selection);
+        assert_eq!(selection.snapshot(), [1u32, 699].into_iter().collect());
+
+        // A resort cannot change the subtraction interval, and contraction
+        // restores only the rows that were marked before this gesture.
+        let reversed: Vec<_> = ids.iter().copied().rev().collect();
+        selection.begin_range(view(&reversed), 5, RangeMode::Remove);
+        finish(&mut selection);
+        for id in &ids {
+            assert_eq!(
+                selection.contains(*id),
+                id % 2 == 1 && !(3..=5).contains(id)
+            );
+        }
+        selection.remove(697);
+        selection.begin_range(Arc::clone(&original), 697, RangeMode::Remove);
+        finish(&mut selection);
+        selection.begin_range(original, 5, RangeMode::Remove);
+        finish(&mut selection);
+        assert!(!selection.contains(697));
+        assert!(selection.contains(695) && selection.contains(699));
+        assert!(!selection.contains(696) && !selection.contains(698));
+    }
+
+    #[test]
+    fn subtractive_segments_preserve_boundaries_and_explicit_deselection() {
+        let mut selection = VisualSelection::new(0).unwrap();
+        selection.enter(0, Some(1));
+        for id in [3, 4, 5] {
+            selection.toggle(id);
+        }
+        selection.reanchor(1);
+        selection.begin_range(view(&[1, 2, 3]), 3, RangeMode::Remove);
+        finish(&mut selection);
+        let extended = view(&[1, 2, 3, 4, 5]);
+        selection.begin_range(Arc::clone(&extended), 5, RangeMode::Remove);
+        finish(&mut selection);
+        assert!(selection.is_empty());
+        selection.begin_range(Arc::clone(&extended), 4, RangeMode::Remove);
+        finish(&mut selection);
+        assert_eq!(selection.snapshot(), [5u32].into_iter().collect());
+
+        selection.deselect(5);
+        selection.deselect(5);
+        assert!(
+            selection.is_empty(),
+            "deselecting an unmarked row must not add it"
+        );
+        selection.begin_range(extended, 2, RangeMode::Add);
+        finish(&mut selection);
+        assert_eq!(selection.snapshot(), [2u32, 3, 4].into_iter().collect());
     }
 
     #[test]
@@ -902,7 +984,7 @@ mod tests {
                         next.reverse();
                         let next_mode = match mode {
                             RangeMode::Add => RangeMode::Invert,
-                            RangeMode::Invert => RangeMode::Add,
+                            RangeMode::Invert | RangeMode::Remove => RangeMode::Add,
                         };
                         assert!(selection.begin_range(view(&next), lead, next_mode));
                         assert_eq!(selection.snapshot(), baseline);

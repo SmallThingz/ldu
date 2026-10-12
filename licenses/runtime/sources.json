@@ -1,0 +1,26 @@
+{
+  "musl-COPYRIGHT.txt": {
+    "url": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5",
+    "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+  },
+  "compiler-builtins-LICENSE.txt": {
+    "url": "https://raw.githubusercontent.com/rust-lang/rust/1.99.0/library/compiler-builtins/LICENSE.txt",
+    "sha256": "ab6eec6caf0fa5775e411c7a8bc6a45c4ef2956b0980b157ab74fc5cd62a928b"
+  },
+  "libm-LICENSE.txt": {
+    "url": "https://raw.githubusercontent.com/rust-lang/rust/1.99.0/library/compiler-builtins/libm/LICENSE.txt",
+    "sha256": "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+  },
+  "libunwind-LICENSE.txt": {
+    "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/libunwind/LICENSE.TXT",
+    "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+  },
+  "compiler-rt-LICENSE.txt": {
+    "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/LICENSE.TXT",
+    "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d"
+  },
+  "compiler-rt-CREDITS.txt": {
+    "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/CREDITS.TXT",
+    "sha256": "a9901f47a089da41e4690682d00ce4cedaa2baf41fedbe79beee366d43ac2461"
+  }
+}

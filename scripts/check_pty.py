@@ -6,20 +6,26 @@ from contextlib import contextmanager
 import errno
 import fcntl
 import json
+import io
 import math
 import os
 from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import signal
+import shutil
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import termios
 import time
+import zipfile
+import zlib
 
 
 def printable(value):
@@ -46,7 +52,7 @@ def path_in_header(screen, path):
     if not os.path.isabs(raw_path):
         raw_path = os.path.join(os.getcwd(), raw_path)
     label = re.sub(r"\s+(?:v select\s+)?(?:D queue\s+)?\? help\s*$", "",
-                   screen.text(header=True))
+                   screen.text(header=True).removeprefix("←─").removeprefix("‹ "))
     phase = re.search(r"  Scan complete(?: with errors)?$", label)
     return (screen.help_at_edge() and phase is not None
             and label[:phase.start()] == printable(raw_path))
@@ -290,7 +296,7 @@ def check_printable_names():
 
 
 class Session:
-    def __init__(self, binary, root, threads):
+    def __init__(self, binary, root, threads, env=None):
         self.master, self.slave = pty.openpty()
         self.saved = termios.tcgetattr(self.slave)
         self.screen = Screen()
@@ -312,7 +318,7 @@ class Session:
         self.child = subprocess.Popen(
             command,
             stdin=self.slave, stdout=self.slave, stderr=self.slave,
-            env={**os.environ, "TERM": "xterm-256color"},
+            env={**os.environ, **(env or {}), "TERM": "xterm-256color"},
             preexec_fn=own_terminal,
         )
 
@@ -329,13 +335,17 @@ class Session:
             except OSError as exc:
                 if exc.errno != errno.EIO:
                     raise
-                return
+                return False
+            if not data:
+                return False
             self.raw.extend(data)
             self.screen.feed(data)
             if self.observe is not None:
                 self.observe(self.screen)
             if self.first_frame_ms is None and b"Waiting to scan" in self.raw:
                 self.first_frame_ms = (time.perf_counter() - self.started) * 1000
+            return True
+        return False
 
     def wait(self, predicate, description, timeout=15):
         deadline = time.monotonic() + timeout
@@ -368,7 +378,10 @@ class Session:
         if sig is not None:
             self.child.send_signal(sig)
         self.wait(lambda: self.child.poll() is not None, "process did not quit", timeout=5)
-        self.pump(0)
+        # PTY reads may return small chunks even after the child has exited.
+        # Keep draining buffered shutdown reports before checking the transcript.
+        while self.pump(0):
+            pass
         assert self.child.returncode == expected_exit, (self.child.returncode, expected_exit, self.screen.text())
         assert termios.tcgetattr(self.slave) == self.saved, "terminal attributes were not restored"
         assert b"\x1b[?1049l" in self.raw, "alternate screen was not restored"
@@ -605,9 +618,16 @@ def check_hidden_and_delete(session, root):
 def fixture_selection(session, name, directory=False):
     """Select one fully visible owned-fixture row without relying on its sort."""
     suffix = " " + printable(name) + ("/" if directory else "")
+    # An already-selected first row does not acknowledge Home or a pending
+    # reorder/resize frame. Use the existing End/Home roundtrip before reading
+    # row positions, so a partially received list cannot choose the key count.
     session.key(b"\x1b[H")
-    session.wait(lambda: session.screen.selected_row() == 1,
-                 "Home did not select the first fixture row")
+    visible = lambda: any(line.rstrip().endswith(suffix)
+                         for line in session.screen.main_rows())
+    session.wait(lambda: session.screen.selected_row() == 1 and visible(),
+                 f"owned fixture row did not become visible: {name}")
+    multiple = any(line.strip() for line in list(session.screen.main_rows())[1:])
+    settled_home(session, visible, f"owned fixture row did not settle: {name}", multiple)
     row = next((index for index, line in enumerate(session.screen.main_rows(), 1)
                 if line.rstrip().endswith(suffix)), None)
     assert row is not None, f"owned fixture row missing: {name}\n{session.screen.text()}"
@@ -627,7 +647,7 @@ def fixture_directory(session, path):
     # These fixture paths contain no spaces and are fully visible. Queue status
     # replaces Scan complete in the header while paused jobs remain queued.
     return (session.screen.help_at_edge()
-            and session.screen.text(header=True).startswith(printable(path.absolute()) + "  "))
+            and session.screen.text(header=True).removeprefix("←─").removeprefix("‹ ").startswith(printable(path.absolute()) + "  "))
 
 
 def queue_rows(session):
@@ -782,6 +802,429 @@ def check_owned_queue(binary, work, threads):
                 "quit_ms": elapsed, "input": []}
     finally:
         session.close()
+
+
+def check_owned_queue_resize(binary, work, threads):
+    root = work / "queue-resize"
+    root.mkdir()
+    names = ["alpha", "beta", "gamma"]
+    for name in names:
+        (root / name).write_bytes(b"queued resize fixture")
+    session = Session(binary, root, threads)
+    samples = []
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "queue resize fixture scan did not complete")
+        pause_empty_queue(session)
+        for name in names:
+            enqueue_fixture(session, name)
+
+        # A narrow browser has no asynchronous preview publication that could
+        # accidentally repair queue rows after their geometry has changed.
+        session.resize(9, 80)
+        samples.append(stationary_sample(
+            session, lambda: session.screen.normal_view()
+            and deletion_marks(session, names) == dict.fromkeys(names, True)
+            and not preview_rows(session), "narrow paused browser before queue resize"))
+        session.key(b"D")
+
+        def queue_ready(paths, selected):
+            return (session.screen.has_modal_title("Deletion queue")
+                    and "Pending paused" in session.screen.words()
+                    and "Updating queue" not in session.screen.words()
+                    and queue_paths(session) == paths
+                    and queue_selected(session) == selected)
+
+        samples.append(stationary_sample(
+            session, lambda: queue_ready(["alpha"], "alpha"),
+            "short paused queue before resize"))
+        session.resize(20, 80)
+        samples.append(stationary_sample(
+            session, lambda: queue_ready(names, "alpha"),
+            "grown paused queue without input"))
+        session.key(b"\x1b[F")
+        samples.append(stationary_sample(
+            session, lambda: queue_ready(names, "gamma"),
+            "last selected paused job before shrink"))
+        session.resize(9, 80)
+        samples.append(stationary_sample(
+            session, lambda: queue_ready(["gamma"], "gamma"),
+            "shrunk paused queue keeps selection without input"))
+        assert all((root / name).is_file() for name in names), \
+            "resizing a paused queue started deletion"
+        session.key(b" ")
+        session.wait(lambda: all(not (root / name).exists() for name in names)
+                     and "No deletions queued" in session.screen.words(),
+                     "resized queue did not finish after resuming")
+        close_queue(session)
+        elapsed = session.finish(key=b"q")
+        return {"case": "stationary-paused-queue-resize",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed,
+                "input": [], "idle": samples}
+    finally:
+        session.close()
+
+
+def check_owned_error_queue(binary, work, threads):
+    root = work / "errors"
+    root.mkdir()
+    for name in ("alpha", "beta", "done"):
+        (root / name).write_bytes(b"original")
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "error queue fixture scan did not complete")
+        pause_empty_queue(session)
+        for name in ("alpha", "beta", "done"):
+            enqueue_fixture(session, name)
+        # Retain the old inodes so replacement cannot accidentally reuse them.
+        for name in ("alpha", "beta"):
+            (root / name).rename(work / ("saved-" + name))
+            (root / name).write_bytes(b"replacement")
+        open_queue(session, ["alpha", "beta", "done"])
+        session.key(b" ")
+        session.wait(lambda: not (root / "done").exists()
+                     and "No deletions queued" in session.screen.words(),
+                     "failed targets blocked the rest of the deletion queue", timeout=20)
+        assert session.screen.has_modal_title("Deletion queue"), \
+            "deletion error replaced an open queue dialog"
+        session.key(b"\x1b")
+        for name in ("alpha", "beta"):
+            path = printable(str((root / name).absolute()))
+            session.wait(lambda: session.screen.has_modal_title("Delete failed")
+                         and path in session.screen.text(),
+                         f"queued failure did not show the full {name} path")
+            assert (root / name).read_bytes() == b"replacement", \
+                "deletion changed an unconfirmed replacement"
+            session.key(b"\r")
+        session.wait(lambda: session.screen.normal_view(),
+                     "Enter did not dismiss exactly the two queued error reports")
+        elapsed = session.finish(key=b"q")
+        return {"case": "queued-deletion-errors", "first_frame_ms": session.first_frame_ms,
+                "quit_ms": elapsed, "input": []}
+    finally:
+        session.close()
+
+
+def write_preview_rar(path):
+    """One stored RAR4 member; no archive creation utility is required."""
+    def block(kind, flags, body):
+        header = struct.pack("<BHH", kind, flags, 7 + len(body)) + body
+        return struct.pack("<H", zlib.crc32(header) & 0xffff) + header
+
+    name, data = b"inside-rar.txt", b"ARCHIVE_PAYLOAD_MUST_NOT_APPEAR"
+    body = struct.pack("<IIBIIBBHI", len(data), len(data), 3,
+                       zlib.crc32(data), 0, 20, 0x30, len(name), 0o100644) + name
+    path.write_bytes(b"Rar!\x1a\x07\x00" + block(0x73, 0, b"\0" * 6)
+                     + block(0x74, 0x8000, body) + data + block(0x7b, 0, b""))
+
+
+def write_preview_pdf(path):
+    """Small valid owned PDF, without depending on a PDF creation utility."""
+    stream = b"BT /F1 12 Tf 72 720 Td (PDF preview available) Tj ET\n"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"endstream",
+    ]
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, body in enumerate(objects, 1):
+        offsets.append(len(data))
+        data.extend(f"{index} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref = len(data)
+    data.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        data.extend(f"{offset:010d} 00000 n \n".encode())
+    data.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    path.write_bytes(data)
+
+
+def check_owned_helper_shutdown(binary, work, threads):
+    # Linux procfs supplies observation identities; retained pidfds make
+    # emergency cleanup independent of numeric PID reuse.
+    if not sys.platform.startswith("linux"):
+        return []
+    root = work / "helper-shutdown"
+    root.mkdir()
+    with zipfile.ZipFile(root / "owned.zip", "w") as archive:
+        archive.writestr("inside.txt", "owned helper fixture")
+    bindir = work / "helper-shutdown-bin"
+    bindir.mkdir()
+    pidfile = (work / "owned-helper.pids").resolve()
+    helper = bindir / "bsdtar"
+    helper.write_text("#!/bin/sh\n/bin/sleep 30 &\nchild=$!\n"
+                      "printf '%s %s\\n' \"$$\" \"$child\" > "
+                      + shlex.quote(str(pidfile)) + "\nwait\n")
+    helper.chmod(0o700)
+
+    def identity(pid):
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+            return fields[0], fields[19]
+        except FileNotFoundError:
+            return None
+
+    metrics = []
+    for label, key, sig in (("q", b"q", None), ("ctrl-c", b"\x03", None),
+                            ("sigterm", None, signal.SIGTERM)):
+        pidfile.unlink(missing_ok=True)
+        session = Session(binary, root, threads, env={"PATH": str(bindir.resolve())})
+        owned = {}
+        pidfds = []
+        try:
+            session.resize(28, 160)
+
+            def started():
+                return (pidfile.exists() and len(pidfile.read_text().split()) == 2
+                        and all(word.isdigit() for word in pidfile.read_text().split()))
+
+            session.wait(started, "owned preview helper and descendant did not start")
+            for pid in map(int, pidfile.read_text().split()):
+                initial = identity(pid)
+                assert initial is not None and initial[0] not in "ZX"
+                owned[pid] = initial[1]
+                if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+                    fd = os.pidfd_open(pid)
+                    current = identity(pid)
+                    if current is not None and current[1] == initial[1]:
+                        pidfds.append(fd)
+                    else:
+                        os.close(fd)
+            elapsed = session.finish(key=key, sig=sig)
+
+            def alive():
+                return [pid for pid, start in owned.items()
+                        if (current := identity(pid)) is not None
+                        and current[1] == start and current[0] not in "ZX"]
+
+            deadline = time.monotonic() + 0.5
+            while alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not alive(), f"{label} left owned preview processes running: {alive()}"
+            metrics.append({"case": "preview-helper-shutdown-" + label,
+                            "first_frame_ms": session.first_frame_ms,
+                            "quit_ms": elapsed, "input": []})
+        finally:
+            session.close()
+            for fd in pidfds:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                finally:
+                    os.close(fd)
+    return metrics
+
+
+def check_owned_special_previews(binary, work, threads):
+    root = work / "special-previews"
+    root.mkdir()
+    outside = work / "preview-targets"
+    outside.mkdir()
+    (outside / "file").write_text("LINK_FILE_CONTENT_MUST_NOT_APPEAR")
+    (outside / "directory").mkdir()
+    (outside / "directory" / "LINK_DIRECTORY_CONTENT_MUST_NOT_APPEAR").touch()
+    links = {
+        "link-file": "../preview-targets/file",
+        "link-directory": "../preview-targets/directory",
+        "link-dangling": "missing-target/leaf",
+        "link-escaped": "missing\n\x1b[31m-target",
+        "link-long": "../" + "long-component/" * 8 + "destination-tail",
+    }
+    for name, target in links.items():
+        (root / name).symlink_to(target)
+    with zipfile.ZipFile(root / "--owned.zip", "w") as archive:
+        archive.writestr("inside-zip.txt", "ARCHIVE_PAYLOAD_MUST_NOT_APPEAR")
+    with tarfile.open(root / "owned.tar.gz", "w:gz") as archive:
+        data = b"ARCHIVE_PAYLOAD_MUST_NOT_APPEAR"
+        entry = tarfile.TarInfo("inside-tar.txt")
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+    write_preview_rar(root / "owned.rar")
+    write_preview_pdf(root / "owned.pdf")
+    (root / "unknown.bin").write_bytes(b"\0UNKNOWN_BINARY_PAYLOAD")
+    session = Session(binary, root, threads)
+    samples = []
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "special preview fixture scan did not finish")
+
+        def pane():
+            return "\n".join(preview_rows(session))
+
+        for name, target in links.items():
+            fixture_selection(session, name)
+            expected = printable(target)
+            samples.append(stationary_sample(
+                session, lambda: "Links to" in pane()
+                and expected in "".join(row.strip() for row in preview_rows(session)),
+                f"symlink destination {name}"))
+            assert "LINK_FILE_CONTENT_MUST_NOT_APPEAR" not in pane()
+            assert "LINK_DIRECTORY_CONTENT_MUST_NOT_APPEAR" not in pane()
+            assert path_in_header(session.screen, root), "preview followed a symlink"
+        archive_cases = [
+            ("--owned.zip", "inside-zip.txt", ("bsdtar", "zipinfo", "unzip", "7zz", "7z")),
+            ("owned.tar.gz", "inside-tar.txt", ("bsdtar", "tar", "7zz", "7z")),
+            ("owned.rar", "inside-rar.txt", ("bsdtar", "7zz", "7z")),
+        ]
+        for name, entry, helpers in archive_cases:
+            fixture_selection(session, name)
+            if any(shutil.which(helper) for helper in helpers):
+                samples.append(stationary_sample(
+                    session, lambda: "Archive contents" in pane() and entry in pane(),
+                    f"installed archive helper {name}"))
+            else:
+                samples.append(stationary_sample(
+                    session, lambda: ("Size" in pane() and "Disk" in pane())
+                    or ("Archive contents" in pane() and entry in pane()),
+                    f"optional archive preview {name}"))
+            assert "ARCHIVE_PAYLOAD_MUST_NOT_APPEAR" not in pane()
+        fixture_selection(session, "owned.pdf")
+        if shutil.which("pdftotext"):
+            samples.append(stationary_sample(
+                session, lambda: "PDF preview available" in pane(), "installed PDF helper"))
+        else:
+            samples.append(stationary_sample(
+                session, lambda: "PDF" in pane() and "Size" in pane(), "PDF without helper"))
+        fixture_selection(session, "unknown.bin")
+        samples.append(stationary_sample(
+            session, lambda: "Binary" in pane() and "Size" in pane(), "unsupported binary details"))
+        assert "UNKNOWN_BINARY_PAYLOAD" not in pane()
+        elapsed = session.finish(key=b"q")
+        result = {"case": "symlink-and-system-tool-previews", "first_frame_ms": session.first_frame_ms,
+                  "quit_ms": elapsed, "input": [], "idle": samples}
+    finally:
+        session.close()
+    # Availability is per process; no global PATH mutation or installed tools
+    # are needed to verify the no-helper behavior.
+    empty_path = work / "empty-preview-tool-path"
+    empty_path.mkdir()
+    session = Session(binary, root, threads, env={"PATH": str(empty_path.resolve())})
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "no-helper preview fixture scan did not finish")
+        for name in ("--owned.zip", "owned.tar.gz", "owned.rar", "owned.pdf"):
+            fixture_selection(session, name)
+            samples.append(stationary_sample(
+                session, lambda: "Size" in "\n".join(preview_rows(session))
+                and "Disk" in "\n".join(preview_rows(session)),
+                f"no-helper details {name}"))
+            contents = "\n".join(preview_rows(session))
+            assert all(entry not in contents for entry in ("inside-zip.txt", "inside-tar.txt", "inside-rar.txt"))
+            assert "PDF preview available" not in contents
+        session.finish(key=b"q")
+    finally:
+        session.close()
+    return result
+
+
+def check_owned_mouse_navigation(binary, work, threads):
+    root = work / "mouse-navigation"
+    branch = root / "branch"
+    (branch / "inner").mkdir(parents=True)
+    (root / "plain").touch()
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "mouse navigation fixture scan incomplete")
+        fixture_selection(session, "branch", directory=True)
+        row = session.screen.selected_row()
+        click = f"\x1b[<0;35;{row + 1}M\x1b[<0;35;{row + 1}m".encode()
+        session.key(b"v")
+        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
+        session.key(click)
+        wait_visual(session, ["branch/"], [], cursor="branch/")
+        assert fixture_directory(session, root), "visual click entered a directory"
+        session.key(click)
+        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
+        assert fixture_directory(session, root), "visual click entered a directory"
+        session.key(b"v")
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "visual mode did not exit before normal click")
+        session.key(click)
+        session.wait(lambda: path_in_header(session.screen, branch),
+                     "normal directory click did not open the pressed directory")
+        normal_style = session.screen.attributes[0][1]
+        session.key(b"\x1b[<35;2;1M")
+        session.wait(lambda: session.screen.attributes[0][1] != normal_style,
+                     "second back-arrow cell did not highlight")
+        assert session.screen.attributes[0][0] == session.screen.attributes[0][1], \
+            "back-arrow cells did not highlight together"
+        assert path_in_header(session.screen, branch), "back hover navigated"
+        session.key(b"\x1b[<0;2;1M\x1b[<0;2;1m")
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "second back-arrow cell did not navigate")
+        elapsed = session.finish(key=b"q")
+        return {"case": "mouse-click-navigation-and-visual-selection",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed, "input": []}
+    finally:
+        session.close()
+
+
+def check_owned_mouse_header(binary, work, threads):
+    root = work / "mouse-header"
+    branch = root / "branch"
+    branch.mkdir(parents=True)
+    names = [f"f{index:03d}" for index in range(80)]
+    for name in names:
+        (branch / name).touch()
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 119)
+        session.wait(lambda: path_in_header(session.screen, root), "mouse header scan incomplete")
+        assert session.screen.text(header=True).startswith("←─"), "back control missing"
+        assert "v select" not in session.screen.text(header=True), "select hint remained"
+        assert "[D]" not in session.screen.text(header=True), "idle deletion shortcut remained"
+        fixture_selection(session, "branch", directory=True)
+        session.key(b"l")
+        session.wait(lambda: path_in_header(session.screen, branch), "branch did not open")
+        session.key(b"n")
+        settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
+                     "mouse wheel fixture ordering incomplete")
+        session.key(b"\x1b[<35;20;8M")
+        session.wait(lambda: session.screen.selected_row() == 7, "hover did not set pointer row")
+        before = first_row(session)
+        session.key(b"\x1b[<65;20;8M")
+        session.wait(lambda: first_row(session) != before and session.screen.selected_row() == 7,
+                     "wheel moved highlight instead of the viewport")
+        scrolled = first_row(session)
+        session.key(b"\x1b[<35;20;8M")
+        session.pump(0.15)
+        assert first_row(session) == scrolled and session.screen.selected_row() == 7, \
+            "hover after wheel moved the viewport or highlight"
+        normal_style = session.screen.attributes[0][0]
+        session.key(b"\x1b[<35;1;1M")
+        session.wait(lambda: session.screen.attributes[0][0] != normal_style,
+                     "back control did not highlight on hover")
+        assert path_in_header(session.screen, branch), "hover navigated without a click"
+        session.key(b"\x1b[<0;1;1M\x1b[<0;1;1m")
+        session.wait(lambda: path_in_header(session.screen, root), "back click did not navigate")
+        elapsed = session.finish(key=b"q")
+    finally:
+        session.close()
+    long_root = root / ("long-prefix-" + "p" * 100) / "visible-tail"
+    long_root.mkdir(parents=True)
+    session = Session(binary, long_root, threads)
+    try:
+        session.resize(28, 60)
+        session.wait(lambda: "Scan complete" in session.screen.text(header=True)
+                     and "visible-tail" in session.screen.text(header=True),
+                     "long header hid the trailing path component")
+        assert session.screen.text(header=True).startswith("←─.."), "long path lacked leading omission"
+        session.finish(key=b"q")
+    finally:
+        session.close()
+    return {"case": "mouse-wheel-back-and-path-header", "first_frame_ms": session.first_frame_ms,
+            "quit_ms": elapsed, "input": []}
 
 
 def check_owned_cancellation(binary, work, threads):
@@ -989,9 +1432,16 @@ def check_owned_quit_completion(binary, work, threads, replacement_error=False):
                 assert (original.st_dev, original.st_ino) == (confirmed[name].st_dev, confirmed[name].st_ino), \
                     "queued deletion changed a retained original inode"
             restored = session.raw.rfind(b"\x1b[?1049l")
-            error_output = bytes(session.raw[restored:]).lower()
-            assert b"ldu: delete failed:" in error_output and b"target changed" in error_output, \
-                "target replacement error was not reported after terminal restoration"
+            assert restored >= 0, "terminal restoration did not precede deletion errors"
+            error_output = bytes(session.raw[restored:])
+            normalized_error_output = error_output.lower()
+            assert (b"ldu: deletion failed:" in normalized_error_output
+                    and b"target changed" in normalized_error_output), \
+                f"target replacement error was not reported after terminal restoration: {error_output!r}"
+            for name in names:
+                full_path = printable(str((root / name).absolute())).encode().lower()
+                assert full_path in normalized_error_output, \
+                    f"completed shutdown omitted the full path for {name}: {error_output!r}"
         else:
             assert all(not (root / name).exists() for name in names), "first interrupt cancelled confirmed work"
         return {"case": "quit-after-target-replacement-error" if replacement_error else "quit-after-confirmed-work-finishes",
@@ -1147,6 +1597,333 @@ def check_owned_refresh(binary, work, threads):
         session.close()
 
 
+def check_owned_refresh_after_quit(binary, work, threads):
+    root = work / "refresh-after-quit"
+    victim = root / "victim"
+    victim.mkdir(parents=True)
+    (victim / "removed").write_bytes(b"r" * 32768)
+    (victim / "surviving").write_bytes(b"s" * 4096)
+    guard = root / "guard"
+    guard.write_bytes(b"paused quit guard")
+    session = Session(binary, root, threads)
+    samples = []
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "refresh-after-quit fixture scan did not complete")
+        pause_empty_queue(session)
+        enqueue_fixture(session, "guard")
+        session.key(b"q")
+        wait_quit_warning(session, paused=True)
+        session.key(b"n")
+        session.wait(lambda: session.screen.normal_view(),
+                     "n did not keep browsing after the quit warning")
+        open_queue(session, ["guard"])
+        session.key(b"d")
+        session.wait(lambda: queue_paths(session) == []
+                     and "No deletions queued" in session.screen.words(),
+                     "quit-warning guard did not leave the waiting queue")
+        close_queue(session)
+        assert guard.is_file(), "removing the paused quit guard deleted its file"
+
+        # Discovering this new entry acknowledges the explicit refresh itself;
+        # an already-complete header cannot satisfy the observation on its own.
+        (root / "refresh-ack").write_bytes(b"manual refresh resumed scanning")
+        refresh_fixture(session, b"R", root)
+        samples.append(stationary_sample(
+            session, lambda: path_in_header(session.screen, root)
+            and visible_paths(session, ["refresh-ack"]) == ["refresh-ack"],
+            "manual refresh after cancelled quit"))
+
+        enqueue_fixture(session, "victim", directory=True)
+        # Simulate survivors deterministically. Removing a waiting target uses
+        # the same scans-stopped gate as completion of a cancelled deletion.
+        (victim / "removed").unlink()
+        (victim / "surviving").write_bytes(b"s" * 131072)
+        (victim / "added").write_bytes(b"a" * 65536)
+        expected = filesystem_snapshot(victim)
+        open_queue(session, ["victim"])
+        session.key(b"d")
+        session.wait(lambda: queue_paths(session) == []
+                     and "No deletions queued" in session.screen.words(),
+                     "surviving directory did not leave the waiting queue")
+        close_queue(session)
+        fixture_selection(session, "victim", directory=True)
+        session.key(b"l")
+        samples.append(stationary_sample(
+            session, lambda: path_in_header(session.screen, victim)
+            and set(visible_paths(session, ["removed", "surviving", "added"]))
+            == {"surviving", "added"},
+            "automatic survivor refresh after manual scanning restart"))
+        session.key(b"h")
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "reconciled directory did not return to its parent")
+        fixture_selection(session, "victim", directory=True)
+        apparent, allocated, items = snapshot_totals(expected)
+        session.key(b"i")
+        session.wait(lambda: session.screen.has_modal_title("Info")
+                     and f"Allocated: {displayed_size(allocated)} Apparent: {displayed_size(apparent)}"
+                     in session.screen.words()
+                     and f"Directory · {items} items · 0 errors" in session.screen.words()
+                     and "Complete" in session.screen.words(),
+                     "restarted reconciliation did not repair survivor totals")
+        session.key(b"\x1b")
+        session.wait(lambda: session.screen.normal_view(),
+                     "reconciled directory information did not close")
+        assert guard.is_file() and (victim / "surviving").is_file(), \
+            "removing paused jobs deleted their surviving files"
+        elapsed = session.finish(key=b"q")
+        return {"case": "refresh-restarts-deletion-reconciliation",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed,
+                "input": [], "idle": samples}
+    finally:
+        session.close()
+
+
+def process_cpu_ticks(pid):
+    """Optional Linux observation; never use host scheduling as a pass criterion."""
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def stationary_sample(session, ready, label, seconds=1.0):
+    """Wait for the expected screen and one uninterrupted interval without output."""
+    observed = len(session.raw)
+    started = time.monotonic()
+    initial_ticks = process_cpu_ticks(session.child.pid)
+
+    def quiet():
+        nonlocal observed, started, initial_ticks
+        if len(session.raw) != observed or not ready():
+            # Allow late ordering/preview results, but never accept periodic redraws.
+            observed = len(session.raw)
+            started = time.monotonic()
+            initial_ticks = process_cpu_ticks(session.child.pid)
+            return False
+        return (session.child.poll() is None
+                and time.monotonic() - started >= seconds
+                and not select.select([session.master], [], [], 0)[0])
+
+    session.wait(quiet, f"{label} did not reach the expected stationary screen", timeout=15)
+    sample = {"phase": label, "seconds": time.monotonic() - started,
+              "output_bytes": len(session.raw) - observed,
+              "columns": session.screen.cols,
+              "header": session.screen.text(header=True).rstrip()}
+    assert sample["output_bytes"] == 0, f"{label} emitted output while stationary"
+    final_ticks = process_cpu_ticks(session.child.pid)
+    if initial_ticks is not None and final_ticks is not None:
+        sample["cpu_ticks"] = final_ticks - initial_ticks
+        sample["ticks_per_second"] = os.sysconf("SC_CLK_TCK")
+    return sample
+
+
+def check_owned_idle(binary, work, threads):
+    root = work / "idle"
+    tree, empty = root / "tree", root / "empty"
+    tree.mkdir(parents=True)
+    empty.mkdir()
+    for index in range(64):
+        (tree / f"item-{index:03d}").write_bytes(b"i" * 4096)
+    (root / "preview.txt").write_text("Idle preview arrived\nsecond idle line\n")
+    victim = root / "victim"
+    victim.mkdir()
+    (victim / "leaf").write_bytes(b"v" * 8192)
+    names = ["tree/", "empty/", "preview.txt", "victim/", "added"]
+    samples, metrics = [], []
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 140)
+
+        def complete(directory=root):
+            return (path_in_header(session.screen, directory)
+                    and not session.screen.has_modal_border())
+
+        def text_ready():
+            return ("Idle preview arrived" in preview_text(session)
+                    and "second idle line" in preview_text(session))
+
+        samples.append(stationary_sample(
+            session, lambda: complete() and "item-000" in preview_text(session),
+            "initial scan with directory preview"))
+        fixture_selection(session, "preview.txt")
+        samples.append(stationary_sample(
+            session, lambda: complete() and text_ready(), "asynchronous text preview"))
+
+        session.key(b"/preview")
+        samples.append(stationary_sample(
+            session, lambda: "Filter /preview" in session.screen.text(header=True)
+            and visible_paths(session, names) == ["preview.txt"] and text_ready(),
+            "filtered text preview"))
+        session.key(b"\x15zzznomatch")
+        samples.append(stationary_sample(
+            session, lambda: "Filter /zzznomatch" in session.screen.text(header=True)
+            and "No matching entries." in session.screen.text()
+            and session.screen.selected_row() is None,
+            "filter with no matches"))
+        session.key(b"\x1b")
+        session.wait(lambda: complete() and len(visible_paths(session, names)) == 4,
+                     "clearing idle filter did not restore the entries")
+        session.resize(28, 95)
+        samples.append(stationary_sample(
+            session, lambda: complete() and not preview_rows(session), "narrow browser"))
+
+        (root / "added").write_bytes(b"a" * 16384)
+        refresh_fixture(session, b"R", root)
+        samples.append(stationary_sample(
+            session, lambda: complete() and "added" in visible_paths(session, names),
+            "current-directory refresh"))
+        fixture_selection(session, "empty", directory=True)
+        session.key(b"l")
+        samples.append(stationary_sample(
+            session, lambda: complete(empty) and session.screen.selected_row() is None,
+            "empty directory navigation"))
+        session.key(b"h")
+        session.wait(lambda: complete(), "empty directory did not return to idle root")
+
+        pause_empty_queue(session)
+        enqueue_fixture(session, "victim", directory=True)
+        open_queue(session, ["victim"])
+        samples.append(stationary_sample(
+            session, lambda: session.screen.has_modal_title("Deletion queue")
+            and "Pending paused" in session.screen.words()
+            and queue_paths(session) == ["victim"],
+            "paused deletion queue"))
+        assert victim.exists(), "stationary paused queue deleted its target"
+        close_queue(session)
+        fixture_selection(session, "victim", directory=True)
+        # Queue status hides the Refreshing phase. The following ordered modal
+        # roundtrip acknowledges r before observing the blocked refresh at rest.
+        session.key(b"r?")
+        session.wait(lambda: session.screen.has_modal_title("Help"),
+                     "help did not acknowledge refresh input for the queued directory")
+        session.key(b"\x1b")
+        session.wait(lambda: session.screen.normal_view(),
+                     "help did not return to the paused refresh browser")
+        samples.append(stationary_sample(
+            session, lambda: session.screen.normal_view()
+            and "Paused" in session.screen.text(header=True)
+            and "[D]" in session.screen.text(header=True)
+            and deletion_marks(session, ("victim/",)) == {"victim/": True},
+            "refresh blocked by paused queued directory"))
+        assert (victim / "leaf").exists(), "paused overlapping refresh deleted its target"
+        open_queue(session, ["victim"])
+        assert "Pending paused" in session.screen.words(), \
+            "refresh unexpectedly resumed the paused queue"
+        session.key(b" ")
+        session.wait(lambda: not victim.exists() and queue_paths(session) == []
+                     and "Updating queue" not in session.screen.words(),
+                     "resuming idle queue did not complete deletion")
+        close_queue(session)
+        samples.append(stationary_sample(
+            session, lambda: complete() and "victim/" not in visible_paths(session, names),
+            "successful deletion"))
+        session.resize(28, 140)
+        session.wait(lambda: complete(), "wide browser did not redraw after deletion")
+        fixture_selection(session, "preview.txt")
+        samples.append(stationary_sample(
+            session, lambda: complete() and text_ready(), "restored wide text preview"))
+        elapsed = session.finish(key=b"q")
+        metrics.append({"case": "stationary-after-scan-refresh-delete",
+                        "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed,
+                        "input": [], "idle": samples})
+    finally:
+        session.close()
+
+    empty_root = work / "idle-empty"
+    empty_root.mkdir()
+    session = Session(binary, empty_root, threads)
+    try:
+        samples = []
+        for columns in (140, 95):
+            session.resize(28, columns)
+            samples.append(stationary_sample(
+                session, lambda: path_in_header(session.screen, empty_root)
+                and session.screen.selected_row() is None
+                and not session.screen.has_modal_border(),
+                "empty root"))
+        elapsed = session.finish(key=b"q")
+        metrics.append({"case": "stationary-empty-root", "first_frame_ms": session.first_frame_ms,
+                        "quit_ms": elapsed, "input": [], "idle": samples})
+    finally:
+        session.close()
+    return metrics
+
+
+def check_owned_leaf_root_idle(binary, work, threads):
+    regular = work / "idle-file-root"
+    regular.write_bytes(b"Owned regular-file root\n")
+    target = work / "idle-link-target"
+    target.mkdir()
+    sentinel = target / "must-not-follow-root-link"
+    sentinel.write_bytes(b"Owned symlink target sentinel\n")
+    symlink = work / "idle-symlink-root"
+    symlink.symlink_to(target.name, target_is_directory=True)
+    cases = (("file", regular, "File"), ("symlink", symlink, "Symlink"),
+             ("missing", work / "idle-missing-root", "Unknown"))
+    metrics = []
+    for label, root, kind in cases:
+        session = Session(binary, root, threads)
+        samples = []
+        try:
+            session.resize(28, 140)
+            body = ("Partial listing; press i for details." if label == "missing"
+                    else "No child entries.")
+
+            def complete():
+                return (path_in_header(session.screen, root)
+                        and session.screen.selected_row() is None
+                        and not session.screen.has_modal_border()
+                        and body in session.screen.main_line(1)
+                        and ("Scan complete with errors" in session.screen.text(header=True))
+                        == (label == "missing"))
+
+            session.wait(complete, f"{label} leaf root did not complete without children")
+            session.key(b"i")
+            session.wait(lambda: session.screen.has_modal_title("Info")
+                         and f"{kind} · 0 items" in session.screen.words(),
+                         f"{label} root information did not retain its leaf kind")
+            if label == "missing":
+                session.wait(
+                    lambda: "Latest scan error:" in session.screen.words(),
+                    "missing root information omitted the scanner error")
+            assert sentinel.name not in session.screen.text(), \
+                "symlink root exposed its target's child"
+            session.key(b"\x1b")
+            samples.append(stationary_sample(
+                session, complete, f"{label} root after information dismissal"))
+
+            session.key(b"v")
+            samples.append(stationary_sample(
+                session, lambda: "Visual" in session.screen.text(header=True)
+                and "0 selected" in session.screen.text(header=True)
+                and session.screen.selected_row() is None
+                and not session.screen.has_modal_border()
+                and body in session.screen.main_line(1),
+                f"{label} root with empty visual selection"))
+            session.key(b"\x1b")
+            session.wait(complete, f"{label} root did not leave empty visual mode")
+
+            # Leaf roots have no folder to refresh. Help acknowledges both keys
+            # before measuring the unchanged leaf/error state again.
+            session.key(b"rR?")
+            session.wait(lambda: session.screen.has_modal_title("Help"),
+                         f"{label} root did not acknowledge refresh input")
+            session.key(b"\x1b")
+            samples.append(stationary_sample(
+                session, complete, f"{label} root after refresh input"))
+            elapsed = session.finish(key=b"q")
+            metrics.append({"case": "stationary-" + label + "-root",
+                            "first_frame_ms": session.first_frame_ms,
+                            "quit_ms": elapsed, "input": [], "idle": samples})
+        finally:
+            session.close()
+    assert symlink.is_symlink() and sentinel.read_bytes() == b"Owned symlink target sentinel\n"
+    return metrics
+
+
 def visual_paths(session, names):
     paths = []
     for row, line in enumerate(session.screen.main_rows(), 1):
@@ -1203,6 +1980,62 @@ def open_batch_confirmation(session, count=2, key=b"D"):
 def visual_count(session):
     match = re.search(r"Visual · (\d+) selected", session.screen.text(header=True))
     return int(match[1]) if match else None
+
+
+def check_owned_drag_modes(binary, work, threads, include_control=True):
+    """Exercise separate mouse reports with actual painted pauses between them."""
+    root = work / "drag-modes"
+    root.mkdir()
+    names = [f"item-{index:02d}" for index in range(8)]
+    for name in names:
+        (root / name).touch()
+    session = Session(binary, root, threads)
+    samples = []
+    try:
+        session.resize(15, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "drag fixture scan did not finish")
+        session.key(b"n")
+        settled_home(session, lambda: visible_paths(session, names) == names,
+                     "drag fixture name order did not settle")
+        session.key(b"v")
+        wait_visual(session, names, names[:1], cursor=names[0])
+
+        def event(code, index, released, selected, label):
+            # Header is terminal row one; index zero is SGR row two.
+            suffix = "m" if released else "M"
+            session.key(f"\x1b[<{code};35;{index + 2}{suffix}".encode())
+            expected = [names[i] for i in selected]
+            samples.append(stationary_sample(
+                session, lambda: "Visual" in session.screen.text(header=True)
+                and visible_paths(session, names) == names
+                and visual_count(session) == len(expected)
+                and visual_paths(session, names) == expected
+                and cursor_path(session, names) == names[index], label))
+
+        # A frame and quiet interval separate every report. In particular, a
+        # held plain press must retain its baseline after its toggle is drawn.
+        event(0, 2, False, [0, 2], "plain held press")
+        event(32, 5, False, [0, 2, 3, 4, 5], "plain drag extends")
+        event(32, 3, False, [0, 2, 3], "plain drag reverses")
+        event(0, 3, True, [0, 2, 3], "plain drag releases")
+        if include_control:
+            # Start on an unmarked row: subtraction must never add that row.
+            event(16, 1, False, [0, 2, 3], "Ctrl held unmarked press")
+            event(48, 3, False, [0], "Ctrl drag subtracts")
+            event(48, 2, False, [0, 3], "Ctrl reversal restores baseline")
+            # The mode belongs to the press, even when Ctrl is released early.
+            event(32, 4, False, [0], "Ctrl drag keeps press modifier")
+            event(0, 4, True, [0], "Ctrl drag releases")
+            event(16, 5, False, [0], "Ctrl click unmarked press")
+            event(0, 5, True, [0], "Ctrl click unmarked release")
+            event(16, 0, False, [], "Ctrl click marked press")
+            event(0, 0, True, [], "Ctrl click marked release")
+        elapsed = session.finish(key=b"q")
+        return {"case": "visual-drag-modes", "first_frame_ms": session.first_frame_ms,
+                "quit_ms": elapsed, "input": [], "idle": samples}
+    finally:
+        session.close()
 
 
 def check_owned_visual(binary, work, threads):
@@ -1530,6 +2363,76 @@ def check_owned_batch_queue(binary, work, threads):
         session.close()
 
 
+
+def check_owned_completion_input(binary, work, threads):
+    root = work / "completion-input"
+    root.mkdir()
+    names = [f"item-{index:03d}" for index in range(128)]
+    victims = [root / name for name in names]
+    for victim in victims:
+        victim.write_bytes(b"confirmed completion fixture")
+    query = "abcdefghijklmnopqrstuvwxyz0123456789"
+    survivor = root / ("zz-" + query)
+    survivor.write_bytes(b"unselected input sentinel")
+    session = Session(binary, root, threads)
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "completion/input fixture scan did not complete")
+        pause_empty_queue(session)
+        session.key(b"n")
+        settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
+                     "completion/input name ordering did not settle")
+        session.key(b"v\x1b[1;2F")
+        session.wait(lambda: visual_count(session) == len(names) + 1
+                     and cursor_path(session, [survivor.name]) == survivor.name,
+                     "completion/input did not select the full fixture")
+        session.key(b"\r")
+        session.wait(lambda: visual_count(session) == len(names),
+                     "completion/input did not exclude its retained sentinel")
+        open_batch_confirmation(session, count=len(names), key=b"d")
+        session.key(b"y")
+        session.wait(lambda: session.screen.normal_view() and visual_count(session) is None,
+                     "completion/input did not finish admitting its paused batch")
+        assert all(victim.is_file() for victim in victims), "paused completion/input batch started early"
+        session.key(b"D")
+        session.wait(lambda: session.screen.has_modal_title("Deletion queue")
+                     and f"{len(names)} queued" in session.screen.words()
+                     and "Pending paused" in session.screen.words(),
+                     "completion/input did not retain every paused target")
+        # Input is already buffered when deletion starts. There are more jobs
+        # than twice the key count, so per-event dispatch cannot exhaust the
+        # queue before the burst is handled. Every query character must survive
+        # completion wakes, and the remaining jobs must finish without input.
+        with stopped_child(session):
+            keys = b" D/" + query.encode("ascii")
+            session.key(keys)
+            session.wait(lambda: queued_input_bytes(session) == len(keys),
+                         "completion/input burst did not reach the stopped child's PTY")
+        session.wait(lambda: queued_input_bytes(session) == 0
+                     and f"Filter /{query}" in session.screen.text(header=True)
+                     and visible_paths(session, [survivor.name]) == [survivor.name],
+                     "deletion completion wakes lost buffered filter input")
+        session.wait(lambda: all(not victim.exists() for victim in victims)
+                     and f"Filter /{query}" in session.screen.text(header=True),
+                     "queued deletions stopped after buffered input drained", timeout=20)
+        assert survivor.read_bytes() == b"unselected input sentinel", \
+            "completion/input deleted or changed the unselected sentinel"
+        session.key(b"\x1b")
+        session.wait(lambda: path_in_header(session.screen, root)
+                     and cursor_path(session, [survivor.name]) == survivor.name,
+                     "completion/input filter did not clear after the queue drained")
+        open_queue(session, [])
+        session.wait(lambda: "No deletions queued" in session.screen.words(),
+                     "completion/input retained a completed deletion job")
+        close_queue(session)
+        elapsed = session.finish(key=b"q")
+        return {"case": "deletion-completions-during-buffered-input",
+                "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed, "input": []}
+    finally:
+        session.close()
+
+
 def check_owned_visual_ranges(binary, work, threads):
     root = work / "visual-range"
     root.mkdir()
@@ -1756,6 +2659,90 @@ def prepare_input_fixture(session, root, label):
     session.key(b"\x1b[H")
     session.wait(lambda: ordered_rows() and session.screen.selected_row() == 1,
                  f"{label} fixture Home did not select folder")
+
+
+def check_owned_held_resize(binary, work, threads, cases=("normal", "visual")):
+    """Keep captured list rows fixed while a held press is clipped by resize."""
+    metrics = []
+    for mode in cases:
+        assert mode in ("normal", "visual"), mode
+        root = work / ("held-resize-" + mode)
+        root.mkdir()
+        names = [f"item-{index:03d}" for index in range(24)]
+        for name in names:
+            (root / name).touch()
+        session = Session(binary, root, threads)
+        samples = []
+        try:
+            # No preview publication can accidentally repair the viewport after
+            # a resize. There are more entries than either list can display.
+            session.resize(11, 80)
+            session.wait(lambda: "Scan complete" in session.screen.text(header=True)
+                         and len(visible_paths(session, names)) == 10,
+                         f"{mode} held-resize fixture did not finish scanning")
+            session.key(b"n")
+            settled_home(session, lambda: visible_paths(session, names) == names[:10],
+                         f"{mode} held-resize fixture name order did not settle")
+
+            def rows_ready(count):
+                return (session.screen.normal_view() and not preview_rows(session)
+                        and visible_paths(session, names) == names[:count])
+
+            if mode == "visual":
+                session.key(b"v")
+                wait_visual(session, names, names[:1], cursor=names[0])
+            samples.append(stationary_sample(
+                session, lambda: rows_ready(10) and cursor_path(session, names) == names[0],
+                f"{mode} list before held resize"))
+
+            # Header occupies terminal row 1: main-list row 10 is SGR row 11.
+            # Keep the button down, with no motion or keyboard input, across
+            # both resizes. Shrinking may clip the captured cursor completely.
+            session.key(b"\x1b[<0;35;11M")
+
+            def held_ready(count, cursor):
+                return (rows_ready(count) and cursor_path(session, names) == cursor
+                        and (mode != "visual" or visual_count(session) == 2))
+
+            samples.append(stationary_sample(
+                session, lambda: held_ready(10, names[9]),
+                f"{mode} bottom-row press before resize"))
+            session.resize(7, 80)
+            samples.append(stationary_sample(
+                session, lambda: held_ready(6, None),
+                f"{mode} held press clipped by shrink without input"))
+            session.resize(11, 80)
+            samples.append(stationary_sample(
+                session, lambda: held_ready(10, names[9]),
+                f"{mode} held press restored by growth without input"))
+
+            if mode == "visual":
+                # Drag back to an interior row after growth. The original
+                # pressed entry is still the anchor, and the pre-press mark
+                # at the first row must survive the added range.
+                session.key(b"\x1b[<32;35;8M\x1b[<0;35;8m")
+                expected = names[:1] + names[6:10]
+                wait_visual(session, names, expected, cursor=names[6])
+                samples.append(stationary_sample(
+                    session, lambda: rows_ready(10)
+                    and visual_count(session) == len(expected)
+                    and visual_paths(session, names) == expected
+                    and cursor_path(session, names) == names[6],
+                    "visual original anchored range after held resize"))
+            else:
+                session.key(b"\x1b[<0;35;11m")
+                samples.append(stationary_sample(
+                    session, lambda: held_ready(10, names[9]),
+                    "normal pressed row after held-resize release"))
+            assert all((root / name).is_file() for name in names), \
+                "held resize changed owned fixture files"
+            elapsed = session.finish(key=b"q")
+            metrics.append({"case": mode + "-held-mouse-resize",
+                            "first_frame_ms": session.first_frame_ms,
+                            "quit_ms": elapsed, "input": [], "idle": samples})
+        finally:
+            session.close()
+    return metrics
 
 
 def check_owned_resize_input(binary, work, threads):
@@ -2002,6 +2989,12 @@ def main():
         metrics = check(args.binary, root, args.root is None, args.max_input_ms, args.threads)
         if args.root is None:
             metrics.append(check_owned_queue(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_queue_resize(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_error_queue(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_helper_shutdown(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_special_previews(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_mouse_navigation(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_mouse_header(args.binary, Path(work), args.threads))
             metrics.append(check_owned_cancellation(args.binary, Path(work), args.threads))
             metrics.append(check_owned_quit_guard(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_quit_interrupts(args.binary, Path(work), args.threads))
@@ -2009,11 +3002,17 @@ def main():
             metrics.append(check_owned_quit_completion(
                 args.binary, Path(work), args.threads, replacement_error=True))
             metrics.append(check_owned_refresh(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_refresh_after_quit(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_idle(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_leaf_root_idle(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_drag_modes(args.binary, Path(work), args.threads))
             metrics.append(check_owned_visual(args.binary, Path(work), args.threads))
             metrics.append(check_owned_input_modes(args.binary, Path(work), args.threads))
             metrics.append(check_owned_filter(args.binary, Path(work), args.threads))
             metrics.append(check_owned_batch_queue(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_completion_input(args.binary, Path(work), args.threads))
             metrics.append(check_owned_visual_ranges(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_held_resize(args.binary, Path(work), args.threads))
             metrics.append(check_owned_resize_input(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_resize_confirmation(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_fragmented_input(args.binary, Path(work), args.threads))
@@ -2028,9 +3027,19 @@ def main():
         checks = ["initial frame", "untouched startup selection", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
                   "scan error", "terminal restoration"]
         if args.root is None:
-            checks += ["shared preview bars", "text and binary file previews", "responsive pane widths", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queue reorder/remove/overlap", "queued descendant markers", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
+            checks += ["shared preview bars", "text and binary file previews", "responsive pane widths", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queued full-path deletion errors", "mouse viewport scrolling and back control", "trailing header paths", "queue reorder/remove/overlap", "queued descendant markers", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "deletion completions during buffered input", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
         if args.root is None:
             checks.append("target-replacement error after terminal restoration")
+            checks.append("stationary paused queue growth and shrink without input")
+            checks.append("held normal and visual mouse rows across shrink and growth without input")
+            checks.append("normal mouse click opens directories, visual click selects, both back-arrow cells activate")
+            checks.append("spaced plain drag selection and Ctrl-drag deselection, reversal and press modifiers")
+            checks.append("symlink destinations without following targets, installed archive/PDF helpers, unsupported file fallback")
+            if sys.platform.startswith("linux"):
+                checks.append("owned preview helpers and descendants stop on q, Ctrl-C and SIGTERM")
+            checks.append("manual refresh restores deletion survivor reconciliation after cancelled quit")
+            checks.append("stationary idle after scan, preview, filter, refresh, deletion and empty navigation")
+            checks.append("stationary file, symlink and missing roots with empty visual mode and refresh input")
         if any(sample["during_scanning"] and "help" in sample["action"]
                for metric in metrics for sample in metric["input"]):
             checks.append("help during scanning")

@@ -323,6 +323,8 @@ pub struct DeleteQueue {
     superseded_nodes: HashMap<NodeId, QueueId>,
     pruning: Vector<Prune>,
     active: Option<ActiveDelete>,
+    #[cfg(target_os = "linux")]
+    completion: Arc<rustix::fd::OwnedFd>,
     paused: bool,
     next_id: QueueId,
     retirer: Retirer<Vec<Retired>>,
@@ -338,11 +340,23 @@ impl DeleteQueue {
             superseded_nodes: HashMap::new(),
             pruning: Vector::new(),
             active: None,
+            #[cfg(target_os = "linux")]
+            completion: Arc::new(rustix::event::eventfd(
+                0,
+                rustix::event::EventfdFlags::NONBLOCK | rustix::event::EventfdFlags::CLOEXEC,
+            )?),
             paused: false,
             next_id: 0,
             retirer: Retirer::new()?,
             retired: Vec::new(),
         })
+    }
+
+    /// Readiness means a worker finished; the input loop drains this counter.
+    #[cfg(target_os = "linux")]
+    pub fn completion_fd(&self) -> Option<rustix::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.completion.as_ref().as_fd())
     }
 
     /// Production jobs retain the identity captured before confirmation.
@@ -673,7 +687,17 @@ impl DeleteQueue {
     }
 
     pub fn start_next(&mut self) -> bool {
-        self.start_next_with(|entry| {
+        #[cfg(target_os = "linux")]
+        let completion = Arc::clone(&self.completion);
+        self.start_next_with(move |entry| {
+            #[cfg(target_os = "linux")]
+            let handle = delete::spawn_with_completion(
+                Arc::clone(&entry.anchor),
+                entry.relative.clone(),
+                entry.target,
+                completion,
+            );
+            #[cfg(not(target_os = "linux"))]
             let handle = match entry.target {
                 Some(target) => delete::spawn_confirmed(
                     Arc::clone(&entry.anchor),
@@ -713,9 +737,11 @@ impl DeleteQueue {
             Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => DeleteResult {
                 relative: active.entry.relative.clone(),
+                target_removed: false,
                 outcome: Err(io::Error::other("deletion worker stopped without a result")),
                 parent_metadata: None,
                 metadata_error: None,
+                errors: Vec::new(),
                 progress: active.worker.progress(),
             },
         };
@@ -789,9 +815,11 @@ mod tests {
             self.sender
                 .try_send(DeleteResult {
                     relative: self.relative.clone(),
+                    target_removed: outcome.is_ok(),
                     outcome,
                     parent_metadata: None,
                     metadata_error: None,
+                    errors: Vec::new(),
                     progress: DeleteProgress::default(),
                 })
                 .unwrap();

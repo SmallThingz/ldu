@@ -1,5 +1,12 @@
 //! Bounded, latest-selection file previews. All filesystem work stays off the UI.
-use crate::{backend::RootAnchor, types::NodeId};
+use crate::{
+    backend::RootAnchor,
+    types::{NodeId, NodeKind},
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "preview_helpers.rs"]
+mod helpers;
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{Sender, bounded};
 use std::{
@@ -21,6 +28,7 @@ struct Request {
     revision: u64,
     anchor: Arc<RootAnchor>,
     relative: PathBuf,
+    kind: NodeKind,
     cancelled: AtomicBool,
 }
 
@@ -36,6 +44,8 @@ pub struct FilePreview {
     result: Arc<ArcSwapOption<FileContents>>,
     wake: Sender<()>,
     revision: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    helper_control: Arc<helpers::Control>,
 }
 
 impl FilePreview {
@@ -45,9 +55,15 @@ impl FilePreview {
         let (wake, receiver) = bounded(1);
         let requests = Arc::clone(&request);
         let results = Arc::clone(&result);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let helper_control = Arc::new(helpers::Control::default());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let control = Arc::clone(&helper_control);
         std::thread::Builder::new()
             .name("ldu-preview".into())
             .spawn(move || {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let mut helpers = None;
                 while receiver.recv().is_ok() {
                     let Some(request) = requests.load_full() else {
                         continue;
@@ -59,7 +75,14 @@ impl FilePreview {
                     {
                         continue;
                     }
-                    let mut contents = read_contents(&request).unwrap_or(FileContents {
+                    let mut contents = read_contents(
+                        &request,
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        &mut helpers,
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        &control,
+                    )
+                    .unwrap_or(FileContents {
                         revision: 0,
                         kind: "Unavailable",
                         text: None,
@@ -81,6 +104,8 @@ impl FilePreview {
             result,
             wake,
             revision: 0,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            helper_control,
         })
     }
 
@@ -88,8 +113,25 @@ impl FilePreview {
         self.request.load().as_ref().map(|request| request.id)
     }
 
-    pub fn request(&mut self, id: NodeId, anchor: Arc<RootAnchor>, relative: PathBuf) {
-        if self.selected() == Some(id) {
+    pub fn matches(&self, id: NodeId, kind: NodeKind) -> bool {
+        self.request
+            .load()
+            .as_ref()
+            .is_some_and(|request| request.id == id && request.kind == kind)
+    }
+
+    pub fn request(
+        &mut self,
+        id: NodeId,
+        anchor: Arc<RootAnchor>,
+        relative: PathBuf,
+        kind: NodeKind,
+    ) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.helper_control.is_shutdown() {
+            return;
+        }
+        if self.matches(id, kind) {
             return;
         }
         self.clear();
@@ -99,6 +141,7 @@ impl FilePreview {
             revision: self.revision,
             anchor,
             relative,
+            kind,
             cancelled: AtomicBool::new(false),
         })));
         let _ = self.wake.try_send(());
@@ -107,8 +150,18 @@ impl FilePreview {
     pub fn clear(&mut self) {
         if let Some(previous) = self.request.swap(None) {
             previous.cancelled.store(true, Ordering::Relaxed);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            self.helper_control.cancel();
         }
         self.result.store(None);
+    }
+
+    /// Stop future helper launches and synchronously signal any owned helper.
+    /// Never wait for a filesystem operation, process spawn, worker, or process reap.
+    pub fn shutdown(&mut self) {
+        self.clear();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.helper_control.shutdown();
     }
 
     pub fn snapshot(&self) -> Option<Arc<FileContents>> {
@@ -122,7 +175,7 @@ impl FilePreview {
 
 impl Drop for FilePreview {
     fn drop(&mut self) {
-        self.clear();
+        self.shutdown();
         // Dropping the sender wakes an idle worker. Never join a blocked read.
     }
 }
@@ -139,7 +192,17 @@ fn cancelled(request: &Request) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn open_file(request: &Request) -> io::Result<(std::fs::File, u64)> {
+fn open_parent(request: &Request) -> io::Result<rustix::fd::OwnedFd> {
+    use std::path::Component;
+    if request.relative.file_name().is_none()
+        || request
+            .relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::other("invalid preview path"));
+    }
+    #[cfg(not(target_os = "linux"))]
     use rustix::fs::{Mode, OFlags, openat};
     cancelled(request)?;
     #[cfg(target_os = "linux")]
@@ -189,6 +252,13 @@ fn open_file(request: &Request) -> io::Result<(std::fs::File, u64)> {
         }
         fd
     };
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn open_file(request: &Request) -> io::Result<(std::fs::File, u64)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let parent = open_parent(request)?;
     let name = request
         .relative
         .file_name()
@@ -222,9 +292,111 @@ fn open_file(_request: &Request) -> io::Result<(std::fs::File, u64)> {
     ))
 }
 
-fn read_contents(request: &Request) -> io::Result<FileContents> {
-    let (file, length) = open_file(request)?;
-    let (bytes, truncated) = read_prefix(file, length, || cancelled(request))?;
+#[cfg(unix)]
+fn read_link(request: &Request) -> io::Result<FileContents> {
+    let parent = open_parent(request)?;
+    let name = request
+        .relative
+        .file_name()
+        .ok_or_else(|| io::Error::other("preview requires a link"))?;
+    // A fixed buffer also bounds unusual synthetic/filesystem link targets.
+    let mut bytes = vec![0; READ_LIMIT];
+    let count = loop {
+        cancelled(request)?;
+        match rustix::fs::readlinkat_raw(&parent, name, &mut bytes[..]) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => break result?,
+        }
+    };
+    cancelled(request)?;
+    let (text, escaped_truncated) = escape_path(&bytes[..count]);
+    Ok(FileContents {
+        revision: 0,
+        kind: "Symlink",
+        text: Some(text),
+        truncated: count == READ_LIMIT || escaped_truncated,
+    })
+}
+
+#[cfg(not(unix))]
+fn read_link(_request: &Request) -> io::Result<FileContents> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "link preview unavailable",
+    ))
+}
+
+// Preserve the stored destination literally: no resolution and no lossy byte replacement.
+fn escape_path(mut bytes: &[u8]) -> (String, bool) {
+    use std::fmt::Write;
+    let mut output = String::with_capacity(bytes.len().min(TEXT_LIMIT));
+    let mut piece = String::with_capacity(10);
+    while !bytes.is_empty() {
+        let (valid, invalid) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text, 0),
+            Err(error) => (
+                std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap(),
+                error
+                    .error_len()
+                    .unwrap_or(bytes.len() - error.valid_up_to()),
+            ),
+        };
+        for ch in valid.chars() {
+            piece.clear();
+            match ch {
+                '\\' => piece.push_str("\\\\"),
+                '\n' => piece.push_str("\\n"),
+                '\r' => piece.push_str("\\r"),
+                '\t' => piece.push_str("\\t"),
+                ch if ch.is_control()
+                    || matches!(ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}') =>
+                {
+                    let _ = write!(piece, "\\u{{{:x}}}", u32::from(ch));
+                }
+                ch => piece.push(ch),
+            }
+            if output.len() + piece.len() > TEXT_LIMIT {
+                return (output, true);
+            }
+            output.push_str(&piece);
+        }
+        bytes = &bytes[valid.len()..];
+        for byte in &bytes[..invalid] {
+            if output.len() + 4 > TEXT_LIMIT {
+                return (output, true);
+            }
+            let _ = write!(output, "\\x{byte:02x}");
+        }
+        bytes = &bytes[invalid..];
+    }
+    (output, false)
+}
+
+fn read_contents(
+    request: &Request,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] helpers: &mut Option<helpers::Catalog>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] control: &helpers::Control,
+) -> io::Result<FileContents> {
+    cancelled(request)?;
+    if request.kind == NodeKind::Symlink {
+        return read_link(request);
+    }
+    if request.kind != NodeKind::File {
+        return Err(io::Error::other("unsupported preview kind"));
+    }
+    let (mut file, length) = open_file(request)?;
+    let (bytes, truncated) = read_prefix(&mut file, length, || cancelled(request))?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(contents) = helpers::preview(
+        &mut file,
+        &bytes,
+        &request.relative,
+        &request.cancelled,
+        helpers,
+        control,
+    )? {
+        return Ok(contents);
+    }
     Ok(decode(&bytes, truncated))
 }
 
@@ -261,9 +433,28 @@ fn utf16(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\xff\xfe") || bytes.starts_with(b"\xfe\xff")
 }
 
+fn archive_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+        || bytes.starts_with(b"7z\xbc\xaf\x27\x1c")
+        || bytes.starts_with(b"Rar!\x1a\x07")
+        || bytes.starts_with(b"\x1f\x8b")
+        || bytes.starts_with(b"BZh")
+        || bytes.starts_with(b"\xfd7zXZ\0")
+        || bytes.starts_with(b"\x28\xb5\x2f\xfd")
+        || bytes.get(257..262) == Some(b"ustar")
+        || bytes.starts_with(b"!<arch>\n")
+        || bytes.starts_with(b"070701")
+        || bytes.starts_with(b"070702")
+        || bytes.starts_with(b"070707")
+}
+
 fn file_kind(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"%PDF-") {
         "PDF"
+    } else if archive_magic(bytes) {
+        "Archive"
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         || bytes.starts_with(b"\xff\xd8\xff")
         || bytes.starts_with(b"GIF87a")
@@ -280,7 +471,7 @@ fn file_kind(bytes: &[u8]) -> &'static str {
     }
 }
 
-fn decode(bytes: &[u8], mut truncated: bool) -> FileContents {
+fn decode(bytes: &[u8], truncated: bool) -> FileContents {
     let kind = file_kind(bytes);
     let fallback = || FileContents {
         revision: 0,
@@ -331,6 +522,10 @@ fn decode(bytes: &[u8], mut truncated: bool) -> FileContents {
     if text.contains('\0') {
         return fallback();
     }
+    text_contents(&text, truncated)
+}
+
+fn text_contents(text: &str, mut truncated: bool) -> FileContents {
     let mut output = String::with_capacity(text.len().min(TEXT_LIMIT));
     let mut lines = 1;
     let mut chars = text.chars().peekable();
@@ -517,15 +712,36 @@ mod tests {
                 revision: 1,
                 anchor: Arc::clone(&anchor),
                 relative: PathBuf::from(path),
+                kind: NodeKind::File,
                 cancelled: AtomicBool::new(false),
             };
-            assert!(read_contents(&request).is_err(), "{path}");
+            assert!(
+                read_contents(
+                    &request,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &mut Some(helpers::Catalog::empty()),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &helpers::Control::default()
+                )
+                .is_err(),
+                "{path}"
+            );
         }
         let mut preview = FilePreview::new().unwrap();
-        preview.request(1, Arc::clone(&anchor), PathBuf::from("first"));
+        preview.request(
+            1,
+            Arc::clone(&anchor),
+            PathBuf::from("first"),
+            NodeKind::File,
+        );
         preview.clear();
         assert!(preview.selected().is_none() && preview.snapshot().is_none());
-        preview.request(2, Arc::clone(&anchor), PathBuf::from("last"));
+        preview.request(
+            2,
+            Arc::clone(&anchor),
+            PathBuf::from("last"),
+            NodeKind::File,
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while preview.snapshot().is_none() {
             assert!(std::time::Instant::now() < deadline);
@@ -548,22 +764,185 @@ mod tests {
                 revision: 3,
                 anchor,
                 relative: PathBuf::from("last"),
+                kind: NodeKind::File,
                 cancelled: AtomicBool::new(false),
             };
             assert_eq!(
-                read_contents(&request).unwrap().text.as_deref(),
+                read_contents(
+                    &request,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &mut Some(helpers::Catalog::empty()),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &helpers::Control::default()
+                )
+                .unwrap()
+                .text
+                .as_deref(),
                 Some("last")
             );
             let request = Request {
                 relative: PathBuf::from("fifo"),
                 ..request
             };
-            assert!(read_contents(&request).is_err());
+            assert!(
+                read_contents(
+                    &request,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &mut Some(helpers::Catalog::empty()),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &helpers::Control::default()
+                )
+                .is_err()
+            );
             request.cancelled.store(true, Ordering::Relaxed);
             assert_eq!(
-                read_contents(&request).err().unwrap().kind(),
+                read_contents(
+                    &request,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &mut Some(helpers::Catalog::empty()),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &helpers::Control::default()
+                )
+                .err()
+                .unwrap()
+                .kind(),
                 io::ErrorKind::Interrupted
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_show_only_the_stored_destination_and_expected_kind_is_enforced() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        std::fs::create_dir_all(".tmp").unwrap();
+        let directory = tempfile::tempdir_in(".tmp").unwrap();
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), "never show this payload").unwrap();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("folder/secret"), "never enumerate this folder").unwrap();
+        let anchor = Arc::new(RootAnchor::open(&root).unwrap());
+        for (name, raw, expected) in [
+            ("file-link", b"file".as_slice(), "file"),
+            ("folder-link", b"folder".as_slice(), "folder"),
+            ("dangling", b"../../missing".as_slice(), "../../missing"),
+            ("absolute", b"/outside/root".as_slice(), "/outside/root"),
+            (
+                "raw",
+                b"a\xff\\x\n\t\x1b".as_slice(),
+                "a\\xff\\\\x\\n\\t\\u{1b}",
+            ),
+        ] {
+            symlink(std::ffi::OsStr::from_bytes(raw), root.join(name)).unwrap();
+            let request = Request {
+                id: 1,
+                revision: 1,
+                anchor: Arc::clone(&anchor),
+                relative: name.into(),
+                kind: NodeKind::Symlink,
+                cancelled: AtomicBool::new(false),
+            };
+            let result = read_contents(
+                &request,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &mut Some(helpers::Catalog::empty()),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &helpers::Control::default(),
+            )
+            .unwrap();
+            assert_eq!(result.kind, "Symlink");
+            assert_eq!(result.text.as_deref(), Some(expected));
+            assert!(!result.truncated);
+            let request = Request {
+                kind: NodeKind::File,
+                ..request
+            };
+            assert!(
+                read_contents(
+                    &request,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &mut Some(helpers::Catalog::empty()),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    &helpers::Control::default()
+                )
+                .is_err()
+            );
+        }
+        // A vanished/replaced link must never turn into a regular-file contents request.
+        let request = Request {
+            id: 1,
+            revision: 1,
+            anchor: Arc::clone(&anchor),
+            relative: "file".into(),
+            kind: NodeKind::Symlink,
+            cancelled: AtomicBool::new(false),
+        };
+        assert!(
+            read_contents(
+                &request,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &mut Some(helpers::Catalog::empty()),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &helpers::Control::default()
+            )
+            .is_err()
+        );
+        symlink("folder", root.join("parent")).unwrap();
+        let request = Request {
+            relative: "parent/secret".into(),
+            kind: NodeKind::File,
+            ..request
+        };
+        assert!(
+            read_contents(
+                &request,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &mut Some(helpers::Catalog::empty()),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                &helpers::Control::default()
+            )
+            .is_err()
+        );
+
+        let mut preview = FilePreview::new().unwrap();
+        preview.request(1, Arc::clone(&anchor), "file".into(), NodeKind::File);
+        let old = preview.request.load_full().unwrap();
+        preview.request(1, anchor, "folder-link".into(), NodeKind::Symlink);
+        assert!(old.cancelled.load(Ordering::Relaxed));
+        assert!(preview.matches(1, NodeKind::Symlink));
+        assert!(!preview.matches(1, NodeKind::File));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while preview.snapshot().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(preview.snapshot().unwrap().text.as_deref(), Some("folder"));
+        preview.shutdown();
+        assert!(preview.selected().is_none() && preview.snapshot().is_none());
+        preview.request(2, Arc::clone(&old.anchor), "file".into(), NodeKind::File);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            preview.selected().is_none(),
+            "stopped preview must not restart"
+        );
+    }
+
+    #[test]
+    fn link_path_escaping_is_reversible_and_bounded() {
+        assert_eq!(
+            escape_path("é\\literal\n\u{202e}tail".as_bytes()),
+            ("é\\\\literal\\n\\u{202e}tail".into(), false)
+        );
+        assert_eq!(escape_path(b"bad\xff\xfe"), ("bad\\xff\\xfe".into(), false));
+        for input in [
+            vec![0xff; READ_LIMIT],
+            vec![b'\\'; READ_LIMIT],
+            vec![b'a'; READ_LIMIT],
+        ] {
+            let (text, truncated) = escape_path(&input);
+            assert!(truncated && text.len() <= TEXT_LIMIT);
+            assert!(!text.contains('\n') && !text.contains('\u{1b}'));
         }
     }
 }

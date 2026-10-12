@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::OsStr,
     ops::{Index, IndexMut},
     path::{Path, PathBuf},
@@ -20,19 +20,22 @@ struct HardlinkGroup {
     sizes: Sizes,
     metadata_generation: u64,
     owner: Option<NodeId>,
-    members: Vec<NodeId>,
+    members: Option<Box<HardlinkMembers>>,
 }
 
+// Only actual aliases allocate member state. The monotonic cursor never
+// revisits tombstoned candidates when successive owners are removed.
 #[derive(Debug, Default)]
-struct RemovalCursor {
-    group: usize,
-    member: usize,
+struct HardlinkMembers {
+    ids: Vec<NodeId>,
+    next: usize,
+    pending: bool,
 }
 
 #[derive(Debug)]
 struct CleanupCursor {
-    next: usize,
-    end: usize,
+    next: NodeId,
+    siblings: bool,
 }
 
 /// A scanner's local IDs stay contiguous even when several scopes interleave.
@@ -223,8 +226,11 @@ pub struct Model {
     directories: HashMap<NodeId, DirectoryInfo>,
     hardlink_indices: HashMap<NodeId, usize>,
     hardlink_groups: Vec<HardlinkGroup>,
-    removal_cursor: Option<RemovalCursor>,
-    cleanup_cursor: Option<CleanupCursor>,
+    hardlink_owners: HashMap<NodeId, usize>,
+    removals: VecDeque<usize>,
+    cleanup: VecDeque<CleanupCursor>,
+    #[cfg(test)]
+    removal_checks: usize,
     scans: HashMap<u64, ScopeScan>,
     active_scopes: HashMap<NodeId, u64>,
     generation: u64,
@@ -251,8 +257,11 @@ impl Model {
             directories: HashMap::new(),
             hardlink_indices: HashMap::new(),
             hardlink_groups: Vec::new(),
-            removal_cursor: None,
-            cleanup_cursor: None,
+            hardlink_owners: HashMap::new(),
+            removals: VecDeque::new(),
+            cleanup: VecDeque::new(),
+            #[cfg(test)]
+            removal_checks: 0,
             scans: HashMap::from([(0, ScopeScan::new(ROOT))]),
             active_scopes: HashMap::from([(ROOT, 0)]),
             generation: 0,
@@ -399,6 +408,7 @@ impl Model {
         let suppressed = node.suppressed_subtrees;
         let was_complete = node.complete;
         let parent = node.parent;
+        let old_children = node.first_child;
         let mut changed = vec![id];
         let mut current = parent;
         while let Some(ancestor) = current {
@@ -448,7 +458,7 @@ impl Model {
         self.has_removals = true;
         self.finished = false;
         self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
-        self.schedule_cleanup(id);
+        self.schedule_cleanup(old_children, true);
         if self
             .last_error_id
             .is_some_and(|error_id| error_id == id || self.is_removed(error_id))
@@ -549,7 +559,7 @@ impl Model {
             }
             self.complete_ready(parent);
         }
-        self.schedule_cleanup(id);
+        self.schedule_cleanup(id, false);
         if self.last_error_id.is_some_and(|id| self.is_removed(id))
             || self.nodes[ROOT as usize].error_count == 0
         {
@@ -563,97 +573,109 @@ impl Model {
         changed
     }
 
-    /// Repair hardlink ownership in small batches after subtree tombstoning.
-    /// Only aliases with live ancestors may receive the group's byte charge.
+    /// Retire only detached subtrees and repair only their charged alias groups.
+    /// Both kinds of work share one bounded input-thread budget.
     pub fn pump_removals(&mut self) -> Vec<NodeId> {
         let started = Instant::now();
-        let Some(mut cursor) = self.removal_cursor.take() else {
-            self.pump_cleanup(started);
-            return Vec::new();
-        };
-        let mut checks = 0;
         let mut changed = Vec::new();
-        while cursor.group < self.hardlink_groups.len()
-            && checks < REMOVAL_CHECKS
-            && started.elapsed() < REMOVAL_BUDGET
-        {
-            checks += 1;
-            let group = &self.hardlink_groups[cursor.group];
-            if group.owner.is_some_and(|id| self.is_live(id)) {
-                cursor.group += 1;
-                cursor.member = 0;
-                continue;
+        for _ in 0..REMOVAL_CHECKS {
+            if started.elapsed() >= REMOVAL_BUDGET {
+                break;
             }
-            if cursor.member >= group.members.len() {
-                self.hardlink_groups[cursor.group].owner = None;
-                cursor.group += 1;
-                cursor.member = 0;
-                continue;
+            if let Some(&index) = self.removals.front() {
+                self.repair_hardlink(index, &mut changed);
+            } else if !self.cleanup.is_empty() {
+                self.pump_cleanup();
+            } else {
+                break;
             }
-            let id = group.members[cursor.member];
-            cursor.member += 1;
-            if self.is_live(id) {
-                let sizes = self.hardlink_groups[cursor.group].sizes;
-                self.hardlink_groups[cursor.group].owner = Some(id);
-                self.nodes[id as usize].hardlink_duplicate = false;
-                self.add_totals(id, sizes, 0, 0, false, &mut changed);
-                cursor.group += 1;
-                cursor.member = 0;
+            #[cfg(test)]
+            {
+                self.removal_checks += 1;
             }
         }
-        if cursor.group < self.hardlink_groups.len() {
-            self.removal_cursor = Some(cursor);
-        }
-        self.pump_cleanup(started);
         if !changed.is_empty() {
             self.revision = self.revision.wrapping_add(1);
         }
         changed
     }
 
-    pub fn has_pending_removals(&self) -> bool {
-        self.removal_cursor.is_some() || self.cleanup_cursor.is_some()
-    }
-
-    fn schedule_cleanup(&mut self, start: NodeId) {
-        if !self.hardlink_groups.is_empty() {
-            self.removal_cursor = Some(RemovalCursor::default());
+    fn repair_hardlink(&mut self, index: usize, changed: &mut Vec<NodeId>) {
+        if self.hardlink_groups[index]
+            .owner
+            .is_some_and(|id| self.is_live(id))
+        {
+            self.finish_hardlink_repair(index);
+            return;
         }
-        // Parents precede their descendants in the append-only arena. Earlier
-        // IDs need cleanup only if an existing cursor has not reached them yet.
-        let start = (start as usize).max(1);
-        let next = self
-            .cleanup_cursor
-            .as_ref()
-            .map_or(start, |cursor| cursor.next.min(start));
-        self.cleanup_cursor = Some(CleanupCursor {
-            next,
-            end: self.nodes.len(),
-        });
-    }
-
-    fn pump_cleanup(&mut self, started: Instant) {
-        let Some(mut cursor) = self.cleanup_cursor.take() else {
+        if let Some(previous) = self.hardlink_groups[index].owner.take() {
+            self.hardlink_owners.remove(&previous);
+        }
+        let members = self.hardlink_groups[index].members.as_mut().unwrap();
+        let Some(&id) = members.ids.get(members.next) else {
+            self.hardlink_groups[index].owner = None;
+            self.finish_hardlink_repair(index);
             return;
         };
-        let mut checks = 0;
-        while cursor.next < cursor.end
-            && checks < REMOVAL_CHECKS
-            && started.elapsed() < REMOVAL_BUDGET
-        {
-            let id = cursor.next as NodeId;
-            cursor.next += 1;
-            checks += 1;
-            if self.is_removed(id) {
-                let node = &mut self.nodes[id as usize];
-                node.flags |= Node::REMOVED;
-                node.name = Arc::clone(&self.tombstone_name);
-                self.directories.remove(&id);
+        members.next += 1;
+        if self.is_live(id) {
+            let sizes = self.hardlink_groups[index].sizes;
+            self.hardlink_groups[index].owner = Some(id);
+            self.hardlink_owners.insert(id, index);
+            self.nodes[id as usize].hardlink_duplicate = false;
+            self.add_totals(id, sizes, 0, 0, false, changed);
+            self.finish_hardlink_repair(index);
+        }
+    }
+
+    fn finish_hardlink_repair(&mut self, index: usize) {
+        self.hardlink_groups[index]
+            .members
+            .as_mut()
+            .unwrap()
+            .pending = false;
+        self.removals.pop_front();
+    }
+
+    pub fn has_pending_removals(&self) -> bool {
+        !self.removals.is_empty() || !self.cleanup.is_empty()
+    }
+
+    fn schedule_cleanup(&mut self, next: NodeId, siblings: bool) {
+        if next != NO_NODE {
+            self.cleanup.push_back(CleanupCursor { next, siblings });
+        }
+    }
+
+    fn pump_cleanup(&mut self) {
+        let mut cursor = self.cleanup.pop_front().unwrap();
+        let id = cursor.next;
+        let node = &self.nodes[id as usize];
+        let children = node.first_child;
+        let next = node.next_sibling;
+        // A refresh detaches a whole sibling chain; an individual removal
+        // detaches just its target. Neither follows unrelated live siblings.
+        if cursor.siblings && next != NO_NODE {
+            cursor.next = next;
+            self.cleanup.push_front(cursor);
+        }
+        if children != NO_NODE {
+            self.cleanup.push_front(CleanupCursor {
+                next: children,
+                siblings: true,
+            });
+        }
+        if let Some(index) = self.hardlink_owners.remove(&id) {
+            let members = self.hardlink_groups[index].members.as_mut().unwrap();
+            if !members.pending {
+                members.pending = true;
+                self.removals.push_back(index);
             }
         }
-        if cursor.next < cursor.end {
-            self.cleanup_cursor = Some(cursor);
-        }
+        let node = &mut self.nodes[id as usize];
+        node.flags |= Node::REMOVED;
+        node.name = Arc::clone(&self.tombstone_name);
+        self.directories.remove(&id);
     }
 
     /// Refresh one surviving directory's own inode bytes after a deletion.
@@ -1202,7 +1224,7 @@ impl Model {
                 sizes,
                 metadata_generation: 0,
                 owner: None,
-                members: Vec::new(),
+                members: None,
             });
             (index, true)
         };
@@ -1223,16 +1245,27 @@ impl Model {
         let group = &mut self.hardlink_groups[index];
         // The initial member is already stored as owner. Once tombstoned it
         // can never return, so repair only needs later aliases. Ordinary files
-        // therefore do not allocate a singleton members vector.
+        // allocate neither member state nor entries in the repair owner index.
         if !new_group {
-            group.members.push(id);
+            group
+                .members
+                .get_or_insert_with(Default::default)
+                .ids
+                .push(id);
         }
-        if live && !owner_live {
+        let charged = if live && !owner_live {
+            if let Some(previous) = group.owner {
+                self.hardlink_owners.remove(&previous);
+            }
             group.owner = Some(id);
             group.sizes
         } else {
             Sizes::default()
+        };
+        if group.members.is_some() && (owner_live || live) {
+            self.hardlink_owners.insert(group.owner.unwrap(), index);
         }
+        charged
     }
 
     fn replace_node_charge(
@@ -2049,6 +2082,249 @@ mod tests {
             model.pump_removals();
         }
         panic!("bounded hardlink repair did not finish");
+    }
+
+    fn assert_removal_work_stays_settled(model: &mut Model) {
+        assert!(!model.has_pending_removals());
+        let revision = model.revision();
+        let checks = model.removal_checks;
+        let sizes = model.node(ROOT).sizes;
+        for _ in 0..64 {
+            assert!(model.pump_removals().is_empty());
+            assert!(!model.has_pending_removals());
+            assert_eq!(model.revision(), revision);
+            assert_eq!(model.removal_checks, checks);
+            assert_eq!(model.node(ROOT).sizes, sizes);
+        }
+    }
+
+    #[test]
+    fn completed_pristine_scan_with_many_aliases_has_no_removal_work() {
+        const GROUPS: NodeId = 4096;
+        const ALIASES: NodeId = 4;
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: (1..=GROUPS * ALIASES)
+                .map(|id| linked(id, "link", 1 + (id - 1) / ALIASES * ALIASES))
+                .collect(),
+        });
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+
+        assert!(model.finished && model.node(ROOT).complete);
+        assert!(!model.has_partial_totals(ROOT));
+        assert_eq!(model.node(ROOT).items, u64::from(GROUPS * ALIASES));
+        assert_eq!(model.node(ROOT).sizes.apparent, 2 + u64::from(GROUPS) * 100);
+        assert_eq!(model.hardlink_owners.len(), GROUPS as usize);
+        assert_eq!(model.removal_checks, 0);
+        assert_removal_work_stays_settled(&mut model);
+    }
+
+    #[test]
+    fn interleaved_refresh_cleanup_drains_once_and_stays_settled() {
+        const GROUPS: NodeId = 4096;
+        const CHUNK: NodeId = 256;
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 0, 0),
+                entry(2, "untouched", NodeKind::Directory, 0, 0),
+            ],
+        });
+        let mut old_ids = Vec::new();
+        let mut aliases = Vec::new();
+        let mut baseline_next = 3;
+        for _ in 0..GROUPS / CHUNK {
+            let start = baseline_next;
+            old_ids.extend(start..start + CHUNK);
+            model.apply(ScanEvent::Entries {
+                parent: 1,
+                entries: (start..start + CHUNK)
+                    .map(|id| linked(id, "old-owner", id))
+                    .collect(),
+            });
+            aliases.extend(start + CHUNK..start + CHUNK * 2);
+            model.apply(ScanEvent::Entries {
+                parent: 2,
+                entries: (0..CHUNK)
+                    .map(|offset| linked(start + CHUNK + offset, "survivor", start + offset))
+                    .collect(),
+            });
+            baseline_next += CHUNK * 2;
+        }
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        assert!(!model.has_pending_removals());
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 7);
+        assert!(model.has_pending_removals());
+
+        let mut fresh_ids = Vec::new();
+        for wave in 0..8 {
+            let checks = model.removal_checks;
+            model.pump_removals();
+            assert!(model.removal_checks - checks <= REMOVAL_CHECKS);
+            fresh_ids.push(model.len() as NodeId);
+            model.apply_scoped(
+                1,
+                1,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: vec![entry(wave + 1, "fresh", NodeKind::File, 3, 4)],
+                },
+            );
+            fresh_ids.push(model.len() as NodeId);
+            model.apply(ScanEvent::Entries {
+                parent: 2,
+                entries: vec![entry(
+                    baseline_next + wave,
+                    "late-baseline",
+                    NodeKind::File,
+                    5,
+                    8,
+                )],
+            });
+        }
+        done(&mut model, 1, 1, ROOT);
+        finish(&mut model, 1, 1);
+        done(&mut model, ROOT, 0, 2);
+        finish(&mut model, ROOT, 0);
+        assert!(model.finished && model.node(ROOT).complete);
+        assert!(model.has_pending_removals());
+
+        // Count detached nodes and ownership repairs, independently of timing.
+        let expected_checks = GROUPS as usize * 2;
+        for _ in 0..=expected_checks {
+            if !model.has_pending_removals() {
+                break;
+            }
+            let checks = model.removal_checks;
+            model.pump_removals();
+            assert!(model.removal_checks - checks <= REMOVAL_CHECKS);
+            assert!(model.removal_checks <= expected_checks);
+        }
+        assert_eq!(model.removal_checks, expected_checks);
+        assert!(!model.has_pending_removals());
+        assert!(!model.has_partial_totals(ROOT));
+        assert_eq!(model.node(ROOT).items, u64::from(GROUPS) + 18);
+        assert_eq!(
+            model.node(ROOT).sizes,
+            Sizes {
+                apparent: 2 + 7 + u64::from(GROUPS) * 100 + 8 * (3 + 5),
+                allocated: 4 + 7 + u64::from(GROUPS) * 512 + 8 * (4 + 8),
+            }
+        );
+        for id in old_ids {
+            assert!(model.node(id).name.is_empty());
+        }
+        for id in aliases {
+            assert_eq!(model.node(id).name.as_ref(), OsStr::new("survivor"));
+            assert_eq!(model.node(id).sizes.apparent, 100);
+        }
+        for id in fresh_ids {
+            assert!(model.is_live(id));
+            assert!(!model.node(id).name.is_empty());
+        }
+        assert_removal_work_stays_settled(&mut model);
+    }
+
+    #[test]
+    fn independent_leaf_removals_never_sweep_unrelated_nodes_or_groups() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: (1..=4096).map(|id| linked(id, "ordinary", id)).collect(),
+        });
+        assert!(model.hardlink_owners.is_empty());
+        for id in 1..=512 {
+            let checks = model.removal_checks;
+            model.remove(id);
+            finish_removals(&mut model);
+            assert_eq!(model.removal_checks - checks, 1);
+            assert!(model.node(id).name.is_empty());
+        }
+        assert_eq!(model.node(ROOT).items, 4096 - 512);
+        assert_eq!(model.node(513).name.as_ref(), OsStr::new("ordinary"));
+        assert_eq!(model.node(4096).name.as_ref(), OsStr::new("ordinary"));
+        assert!(model.hardlink_owners.is_empty());
+    }
+
+    #[test]
+    fn detached_subtree_cleanup_skips_interleaved_live_arena_entries() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "gone", NodeKind::Directory, 0, 0),
+                entry(2, "live", NodeKind::Directory, 0, 0),
+            ],
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 1,
+            entries: (3..=10).map(|id| linked(id, "gone-child", id)).collect(),
+        });
+        model.apply(ScanEvent::Entries {
+            parent: 2,
+            entries: (11..=4096).map(|id| linked(id, "live-child", id)).collect(),
+        });
+        model.remove(1);
+        finish_removals(&mut model);
+        assert_eq!(model.removal_checks, 9);
+        for id in 3..=10 {
+            assert!(model.node(id).name.is_empty());
+        }
+        assert_eq!(model.node(11).name.as_ref(), OsStr::new("live-child"));
+        assert_eq!(model.node(4096).name.as_ref(), OsStr::new("live-child"));
+        assert_eq!(model.children(ROOT).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn successive_hardlink_owners_never_revisit_dead_alias_prefixes() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: (1..=1024).map(|id| linked(id, "link", 1)).collect(),
+        });
+        for id in 1..=1024 {
+            assert_eq!(model.node(id).sizes.apparent, 100);
+            model.remove(id);
+            finish_removals(&mut model);
+        }
+        assert_eq!(model.removal_checks, 2048);
+        assert!(model.hardlink_owners.is_empty());
+        assert_eq!(
+            model.node(ROOT).sizes,
+            Sizes {
+                apparent: 2,
+                allocated: 4
+            }
+        );
+    }
+
+    #[test]
+    fn alias_arrival_during_pending_repair_keeps_one_charge_and_owner_index() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![linked(1, "old", 1), linked(2, "survivor", 1)],
+        });
+        model.remove(1);
+        model.pump_cleanup();
+        assert_eq!(model.removals.len(), 1);
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![linked(3, "new-owner", 1)],
+        });
+        assert_eq!(model.node(3).sizes.apparent, 100);
+        model.remove(3);
+        finish_removals(&mut model);
+        assert_eq!(model.node(2).sizes.apparent, 100);
+        assert_eq!(model.hardlink_owners.len(), 1);
+        assert!(model.hardlink_owners.contains_key(&2));
+        assert_eq!(model.node(ROOT).sizes.apparent, 102);
+        assert_eq!(model.node(ROOT).items, 1);
     }
 
     #[test]
@@ -3033,12 +3309,15 @@ mod tests {
             entries: vec![linked(1, "single", 77)],
         });
         let index = model.hardlink_indices[&77];
-        assert!(model.hardlink_groups[index].members.is_empty());
+        assert!(model.hardlink_groups[index].members.is_none());
         model.apply(ScanEvent::Entries {
             parent: ROOT,
             entries: vec![linked(2, "alias", 77)],
         });
-        assert_eq!(model.hardlink_groups[index].members, vec![2]);
+        assert_eq!(
+            model.hardlink_groups[index].members.as_ref().unwrap().ids,
+            vec![2]
+        );
         model.remove(1);
         finish_removals(&mut model);
         assert_eq!(model.node(2).sizes.apparent, 100);

@@ -1,7 +1,7 @@
 //! Capture an entire confirmed selection without filesystem work on the UI thread.
 
 use crate::backend::RootAnchor;
-use crate::delete::{self, ConfirmedTarget};
+use crate::delete::{self, ConfirmedTarget, DeleteError};
 use crate::types::NodeId;
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TrySendError, bounded};
 use std::io;
@@ -29,6 +29,7 @@ pub enum BatchEvent {
         relative: PathBuf,
         target: ConfirmedTarget,
     },
+    Failures(Vec<DeleteError>),
     Failed(String),
     Done,
 }
@@ -235,7 +236,20 @@ fn prepare(
     cancel: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
 ) {
+    let root = match std::path::absolute(anchor.root_path()) {
+        Ok(root) => root,
+        Err(error) => {
+            let _ = send(
+                &output,
+                BatchEvent::Failed(format!("Could not resolve the scan root: {error}")),
+                &cancel,
+            );
+            let _ = send(&output, BatchEvent::Done, &cancel);
+            return;
+        }
+    };
     let mut entries = Vec::new();
+    let mut errors = Vec::new();
     loop {
         if cancel.load(Ordering::Acquire) {
             return;
@@ -248,13 +262,11 @@ fn prepare(
                 let target = match delete::capture(&anchor, &relative) {
                     Ok(target) => target,
                     Err(error) => {
-                        let _ = send(
-                            &output,
-                            BatchEvent::Failed(format!("Could not prepare {relative:?}: {error}")),
-                            &cancel,
-                        );
-                        let _ = send(&output, BatchEvent::Done, &cancel);
-                        return;
+                        errors.push(DeleteError {
+                            path: root.join(&relative),
+                            message: format!("Could not prepare deletion: {error}"),
+                        });
+                        continue;
                     }
                 };
                 if cancel.load(Ordering::Acquire) {
@@ -283,7 +295,7 @@ fn prepare(
     if !send(
         &output,
         BatchEvent::Ready {
-            count: entries.len(),
+            count: entries.len() + errors.len(),
         },
         &cancel,
     ) {
@@ -311,6 +323,9 @@ fn prepare(
         ) {
             return;
         }
+    }
+    if !errors.is_empty() && !send(&output, BatchEvent::Failures(errors), &cancel) {
+        return;
     }
     let _ = send(&output, BatchEvent::Done, &cancel);
 }
@@ -407,19 +422,75 @@ mod tests {
     }
 
     #[test]
-    fn failed_capture_aborts_the_entire_selection_without_streaming() {
+    fn failed_captures_are_reported_after_confirming_without_losing_other_targets() {
         let work = fixture();
         std::fs::write(work.path().join("valid"), b"keep").unwrap();
         let anchor = Arc::new(RootAnchor::open(work.path()).unwrap());
-        let batch = BatchCapture::new(anchor).unwrap();
-        batch.try_push(1, "valid".into()).unwrap();
-        batch.try_push(2, "../outside".into()).unwrap();
-        let _ = batch.finish_input();
-        assert!(matches!(next(&batch), BatchEvent::Failed(_)));
+        let batch = BatchCapture::new(Arc::clone(&anchor)).unwrap();
+        batch.try_push(1, "../outside-before".into()).unwrap();
+        batch.try_push(2, "valid".into()).unwrap();
+        batch.try_push(3, "../outside-after".into()).unwrap();
+        assert!(batch.finish_input());
+        assert!(matches!(next(&batch), BatchEvent::Ready { count: 3 }));
+        assert!(
+            batch.event().is_none(),
+            "preparation errors escaped confirmation"
+        );
+        assert!(batch.confirm());
+        assert!(matches!(next(&batch), BatchEvent::Entry { node: 2, .. }));
+        let BatchEvent::Failures(errors) = next(&batch) else {
+            panic!("expected all preparation failures");
+        };
+        assert_eq!(errors.len(), 2);
+        let root = std::path::absolute(anchor.root_path()).unwrap();
+        assert!(errors.iter().all(|error| error.path.is_absolute()));
+        assert_eq!(errors[0].path, root.join("../outside-before"));
+        assert_eq!(errors[1].path, root.join("../outside-after"));
+        assert!(errors.iter().all(|error| !error.message.is_empty()));
         assert!(matches!(next(&batch), BatchEvent::Done));
         stopped(&batch);
-        assert!(!batch.confirm());
         assert_eq!(std::fs::read(work.path().join("valid")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn preparation_failures_from_relative_roots_have_full_paths() {
+        let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+        let root = std::path::absolute(anchor.root_path()).unwrap();
+        let batch = BatchCapture::new(anchor).unwrap();
+        batch.try_push(1, "../outside".into()).unwrap();
+        assert!(batch.finish_input());
+        assert!(matches!(next(&batch), BatchEvent::Ready { count: 1 }));
+        assert!(batch.confirm());
+        let BatchEvent::Failures(errors) = next(&batch) else {
+            panic!("expected preparation failure");
+        };
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].path.is_absolute());
+        assert_eq!(errors[0].path, root.join("../outside"));
+        assert!(matches!(next(&batch), BatchEvent::Done));
+        stopped(&batch);
+    }
+
+    #[test]
+    fn all_failed_captures_remain_reviewable_and_cancellable() {
+        for confirm in [false, true] {
+            let work = fixture();
+            let anchor = Arc::new(RootAnchor::open(work.path()).unwrap());
+            let batch = BatchCapture::new(anchor).unwrap();
+            batch.try_push(1, "../outside".into()).unwrap();
+            assert!(batch.finish_input());
+            assert!(matches!(next(&batch), BatchEvent::Ready { count: 1 }));
+            assert!(batch.event().is_none());
+            if confirm {
+                assert!(batch.confirm());
+                assert!(matches!(next(&batch), BatchEvent::Failures(errors) if errors.len() == 1));
+                assert!(matches!(next(&batch), BatchEvent::Done));
+            } else {
+                batch.cancel();
+            }
+            stopped(&batch);
+            assert!(batch.event().is_none());
+        }
     }
 
     #[test]

@@ -160,7 +160,22 @@ impl RootAnchor {
         relative: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<rustix::fd::OwnedFd> {
-        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+        use rustix::fs::OFlags;
+        self.open_directory_with_flags_cancellable(
+            relative,
+            cancel,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_directory_with_flags_cancellable(
+        &self,
+        relative: &Path,
+        cancel: &AtomicBool,
+        flags: rustix::fs::OFlags,
+    ) -> io::Result<rustix::fd::OwnedFd> {
+        use rustix::fs::{Mode, ResolveFlags, openat2};
         check_open_cancel(cancel)?;
         validate_relative(relative)?;
         let path = if relative.as_os_str().is_empty() {
@@ -168,7 +183,6 @@ impl RootAnchor {
         } else {
             relative
         };
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         if self.openat2_available.load(Ordering::Relaxed) {
             loop {
                 check_open_cancel(cancel)?;
@@ -221,7 +235,16 @@ impl RootAnchor {
                 "the scan root has no selectable parent",
             ));
         }
-        self.open_directory_cancellable(relative.parent().unwrap_or(Path::new("")), cancel)
+        // Identity capture and unlinkat only need a searchable, retained parent;
+        // requiring read permission rejects otherwise deletable entries.
+        self.open_directory_with_flags_cancellable(
+            relative.parent().unwrap_or(Path::new("")),
+            cancel,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+        )
     }
 }
 

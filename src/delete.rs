@@ -107,6 +107,12 @@ struct WorkerState {
     removed_directories: AtomicU64,
     #[cfg(test)]
     cancel_after: AtomicU64,
+    #[cfg(test)]
+    failed_names: std::sync::Mutex<std::collections::HashSet<std::ffi::OsString>>,
+    #[cfg(test)]
+    deny_next_unlink: AtomicBool,
+    #[cfg(test)]
+    fail_parent_restore: AtomicBool,
 }
 
 impl WorkerState {
@@ -152,10 +158,20 @@ impl WorkerState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DeleteError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 pub struct DeleteResult {
     pub relative: PathBuf,
+    /// The requested target is removed or already absent, even if cleanup failed.
+    pub target_removed: bool,
     /// Interrupted means cancellation, possibly after the progress removals.
     pub outcome: io::Result<()>,
+    /// Every failed entry, collected only after the requested target finishes.
+    pub errors: Vec<DeleteError>,
     pub progress: DeleteProgress,
     pub parent_metadata: Option<ParentMetadata>,
     /// Parent metadata failure does not change a successful deletion outcome.
@@ -164,6 +180,8 @@ pub struct DeleteResult {
 
 struct Removal {
     outcome: io::Result<()>,
+    target_removed: bool,
+    errors: Vec<DeleteError>,
     parent_metadata: Option<ParentMetadata>,
     metadata_error: Option<String>,
 }
@@ -172,6 +190,8 @@ impl Removal {
     fn failed(error: io::Error) -> Self {
         Self {
             outcome: Err(error),
+            target_removed: false,
+            errors: Vec::new(),
             parent_metadata: None,
             metadata_error: None,
         }
@@ -181,6 +201,8 @@ impl Removal {
     fn already_absent() -> Self {
         Self {
             outcome: Ok(()),
+            target_removed: true,
+            errors: Vec::new(),
             parent_metadata: None,
             metadata_error: None,
         }
@@ -208,18 +230,44 @@ impl DeleteHandle {
     }
 }
 
-struct FinishedGuard(Arc<AtomicBool>);
+#[derive(Clone, Default)]
+struct CompletionWake {
+    #[cfg(target_os = "linux")]
+    fd: Option<Arc<rustix::fd::OwnedFd>>,
+}
+
+impl CompletionWake {
+    fn signal(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            let increment = 1_u64.to_ne_bytes();
+            // The queue owns a nonblocking eventfd. A full counter is already
+            // readable, so notification never waits for the input thread.
+            while let Err(rustix::io::Errno::INTR) = rustix::io::write(fd.as_ref(), &increment) {}
+        }
+    }
+}
+
+struct FinishedGuard {
+    finished: Arc<AtomicBool>,
+    completion: CompletionWake,
+    sender: Option<crossbeam_channel::Sender<DeleteResult>>,
+}
 
 impl Drop for FinishedGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        // On unwind, the receiver must already be disconnected when it wakes.
+        // Otherwise it could observe Empty and consume the only notification.
+        self.sender.take();
+        self.finished.store(true, Ordering::Release);
+        self.completion.signal();
     }
 }
 
 /// Call only after user confirmation. Dropping the handle never joins the worker.
 /// The caller keeps at most one operation active and applies its result to the model.
 pub fn spawn(anchor: Arc<RootAnchor>, relative: PathBuf) -> DeleteHandle {
-    spawn_inner(anchor, relative, None)
+    spawn_inner(anchor, relative, None, CompletionWake::default())
 }
 
 /// Start an operation authorized by an earlier confirmation snapshot. Replacement
@@ -229,47 +277,95 @@ pub fn spawn_confirmed(
     relative: PathBuf,
     target: ConfirmedTarget,
 ) -> DeleteHandle {
-    spawn_inner(anchor, relative, Some(target))
+    spawn_inner(anchor, relative, Some(target), CompletionWake::default())
+}
+
+/// The queue's nonblocking eventfd wakes input polling after final publication.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_with_completion(
+    anchor: Arc<RootAnchor>,
+    relative: PathBuf,
+    target: Option<ConfirmedTarget>,
+    completion: Arc<rustix::fd::OwnedFd>,
+) -> DeleteHandle {
+    spawn_inner(
+        anchor,
+        relative,
+        target,
+        CompletionWake {
+            fd: Some(completion),
+        },
+    )
 }
 
 fn spawn_inner(
     anchor: Arc<RootAnchor>,
     relative: PathBuf,
     target: Option<ConfirmedTarget>,
+    completion: CompletionWake,
 ) -> DeleteHandle {
     let (sender, receiver) = bounded(1);
     let finished = Arc::new(AtomicBool::new(false));
     let worker_finished = Arc::clone(&finished);
+    let worker_completion = completion.clone();
     let state = Arc::new(WorkerState::default());
     let worker_state = Arc::clone(&state);
     let failure_sender = sender.clone();
     let failure_relative = relative.clone();
+    let failure_path = std::path::absolute(anchor.root_path())
+        .unwrap_or_else(|_| anchor.root_path().to_path_buf())
+        .join(&relative);
+    let worker_path = failure_path.clone();
     let result = thread::Builder::new()
         .name("ldu-delete".into())
         .spawn(move || {
-            let _finished = FinishedGuard(worker_finished);
-            let removal = remove_expected(&anchor, &relative, &worker_state, target)
+            let finished_guard = FinishedGuard {
+                finished: worker_finished,
+                completion: worker_completion,
+                sender: Some(sender),
+            };
+            let mut removal = remove_expected(&anchor, &relative, &worker_state, target)
                 .unwrap_or_else(Removal::failed);
-            let _ = sender.try_send(DeleteResult {
-                relative,
-                outcome: removal.outcome,
-                progress: worker_state.snapshot(),
-                parent_metadata: removal.parent_metadata,
-                metadata_error: removal.metadata_error,
-            });
+            if let Err(error) = &removal.outcome {
+                if error.kind() != io::ErrorKind::Interrupted && removal.errors.is_empty() {
+                    removal.errors.push(DeleteError {
+                        path: worker_path,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            let _ = finished_guard
+                .sender
+                .as_ref()
+                .unwrap()
+                .try_send(DeleteResult {
+                    relative,
+                    outcome: removal.outcome,
+                    target_removed: removal.target_removed,
+                    errors: removal.errors,
+                    progress: worker_state.snapshot(),
+                    parent_metadata: removal.parent_metadata,
+                    metadata_error: removal.metadata_error,
+                });
         });
     if let Err(error) = result {
         let _ = failure_sender.try_send(DeleteResult {
             relative: failure_relative,
+            target_removed: false,
             outcome: Err(io::Error::new(
                 error.kind(),
                 format!("could not start deletion worker: {error}"),
             )),
+            errors: vec![DeleteError {
+                path: failure_path,
+                message: format!("could not start deletion worker: {error}"),
+            }],
             progress: state.snapshot(),
             parent_metadata: None,
             metadata_error: None,
         });
         finished.store(true, Ordering::Release);
+        completion.signal();
     }
     DeleteHandle {
         receiver,
@@ -370,12 +466,38 @@ fn remove_linux(
             "deletion target has no basename",
         )
     })?;
-    let outcome = remove_from_parent(&parent, basename, state, expected);
+    let mut errors = Vec::new();
+    let mut target_removed = false;
+    let mut path = std::path::absolute(anchor.root_path())?.join(relative);
+    let mut outcome = remove_from_parent(
+        &parent,
+        basename,
+        state,
+        expected,
+        &mut path,
+        &mut errors,
+        &mut target_removed,
+    );
+    if let Err(error) = &outcome {
+        if error.kind() != io::ErrorKind::Interrupted {
+            errors.push(DeleteError {
+                path,
+                message: error.to_string(),
+            });
+        }
+    } else if !errors.is_empty() {
+        outcome = Err(io::Error::other(format!(
+            "{} entries could not be deleted",
+            errors.len()
+        )));
+    }
     // Cancellation must not start more filesystem work just to refresh totals.
     // The caller can reconcile surviving descendants with a scoped refresh.
     if state.cancel.load(Ordering::Relaxed) {
         return Ok(Removal {
             outcome,
+            target_removed,
+            errors,
             parent_metadata: None,
             metadata_error: None,
         });
@@ -402,6 +524,8 @@ fn remove_linux(
         };
     Ok(Removal {
         outcome,
+        target_removed,
+        errors,
         parent_metadata,
         metadata_error,
     })
@@ -457,12 +581,162 @@ struct DirectoryFrame {
     captured: rustix::fs::Stat,
     pending: Vec<DirectoryName>,
     exhausted: bool,
+    errors_at_entry: usize,
 }
 
 #[cfg(target_os = "linux")]
 struct DirectoryName {
     name: std::ffi::OsString,
     inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_path(fd: &rustix::fd::OwnedFd) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// O_PATH descriptors cannot use fchmod. The proc path names the held inode,
+/// never a user-controlled pathname; symlink inodes are explicitly rejected.
+#[cfg(target_os = "linux")]
+fn chmod_held(
+    fd: &rustix::fd::OwnedFd,
+    mode: rustix::fs::Mode,
+    state: &WorkerState,
+) -> io::Result<()> {
+    let held = retry_operation(state, || rustix::fs::fstat(fd))?;
+    if rustix::fs::FileType::from_raw_mode(held.st_mode) == rustix::fs::FileType::Symlink {
+        return Err(io::Error::other(
+            "cannot change permissions through a symlink",
+        ));
+    }
+    let path = descriptor_path(fd);
+    let visible = retry_operation(state, || rustix::fs::stat(&path))?;
+    if !identity_matches(&held, &visible) {
+        return Err(changed_target());
+    }
+    retry_operation(state, || rustix::fs::chmod(&path, mode))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_parent_mode_recoverable(
+    original: rustix::fs::Mode,
+    group: u32,
+    effective_group: u32,
+    supplementary_member: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<()> {
+    if original.contains(rustix::fs::Mode::SGID)
+        && group != effective_group
+        && !supplementary_member()?
+    {
+        // chmod can succeed while silently clearing SGID. Conservatively refuse
+        // external-parent changes unless group membership guarantees preservation.
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot preserve the containing directory's setgid permission",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_held_mode(
+    fd: &rustix::fd::OwnedFd,
+    expected: rustix::fs::Mode,
+    state: &WorkerState,
+) -> io::Result<()> {
+    let stat = retry_operation(state, || rustix::fs::fstat(fd))?;
+    let actual = rustix::fs::Mode::from_raw_mode(stat.st_mode);
+    if actual != expected {
+        return Err(io::Error::other(format!(
+            "permission restoration did not preserve mode {:04o}; found {:04o}",
+            expected.bits(),
+            actual.bits(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn repair_directory_permissions(
+    fd: &rustix::fd::OwnedFd,
+    state: &WorkerState,
+    allow_ownership: bool,
+) -> io::Result<Option<rustix::fs::Mode>> {
+    use rustix::fs::{AtFlags, FileType, Mode, chownat, fstat};
+    let stat = retry_operation(state, || fstat(fd))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(changed_target());
+    }
+    let original = Mode::from_raw_mode(stat.st_mode);
+    let repaired = original | Mode::RWXU;
+    if !allow_ownership {
+        // Avoid both a no-op chmod and a later restoration of an unchanged mode.
+        if repaired == original {
+            return Ok(None);
+        }
+        ensure_parent_mode_recoverable(
+            original,
+            stat.st_gid,
+            rustix::process::getegid().as_raw(),
+            || {
+                retry_operation(state, rustix::process::getgroups)
+                    .map(|groups| groups.iter().any(|group| group.as_raw() == stat.st_gid))
+            },
+        )?;
+    }
+    if let Err(mode_error) = chmod_held(fd, repaired, state) {
+        if !allow_ownership || mode_error.kind() != io::ErrorKind::PermissionDenied {
+            return Err(mode_error);
+        }
+        // This uses only the process's existing credentials; no elevation or
+        // recursive ownership changes are attempted.
+        retry_operation(state, || {
+            chownat(
+                fd,
+                "",
+                Some(rustix::process::geteuid()),
+                None,
+                AtFlags::EMPTY_PATH,
+            )
+        })
+        .map_err(|owner_error| {
+            io::Error::new(
+                owner_error.kind(),
+                format!(
+                    "permission repair failed: {mode_error}; ownership repair failed: {owner_error}"
+                ),
+            )
+        })?;
+        chmod_held(fd, repaired, state)?;
+    }
+    Ok(Some(original))
+}
+
+#[cfg(target_os = "linux")]
+fn checked_path_handle(
+    parent: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected: Option<&rustix::fs::Stat>,
+    inode: u64,
+    state: &WorkerState,
+) -> io::Result<(rustix::fd::OwnedFd, rustix::fs::Stat)> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+    let fd = retry_operation(state, || {
+        openat(
+            parent,
+            name,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+    })?;
+    let captured = retry_operation(state, || fstat(&fd))?;
+    if expected.is_some_and(|expected| !identity_matches(expected, &captured))
+        || (inode != 0 && inode != captured.st_ino)
+    {
+        return Err(changed_target());
+    }
+    Ok((fd, captured))
 }
 
 #[cfg(target_os = "linux")]
@@ -473,17 +747,33 @@ fn open_checked_directory(
     inode: u64,
     state: &WorkerState,
 ) -> io::Result<Option<DirectoryFrame>> {
-    use rustix::fs::{Mode, OFlags, fstat, openat};
-    let fd = match retry_operation(state, || {
-        openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-    }) {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let fd = match retry_operation(state, || openat(parent, name, flags, Mode::empty())) {
         Ok(fd) => fd,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let (held, captured) = match checked_path_handle(parent, name, expected, inode, state) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied && expected.is_none() =>
+                {
+                    // An enumerated directory can be readable but not searchable.
+                    // Its retained parent is inside the confirmed subtree.
+                    repair_directory_permissions(parent, state, true)?;
+                    checked_path_handle(parent, name, expected, inode, state)?
+                }
+                result => result?,
+            };
+            if FileType::from_raw_mode(captured.st_mode) != FileType::Directory {
+                return Err(changed_target());
+            }
+            if !checked_current(parent, name, &captured, state)? {
+                return Ok(None);
+            }
+            repair_directory_permissions(&held, state, true)?;
+            // Reopen the held directory itself, never resolve the entry again.
+            retry_operation(state, || openat(&held, ".", flags, Mode::empty()))?
+        }
         Err(error) => return Err(error),
     };
     let captured = retry_operation(state, || fstat(&fd))?;
@@ -501,6 +791,7 @@ fn open_checked_directory(
         captured,
         pending: Vec::new(),
         exhausted: false,
+        errors_at_entry: 0,
     }))
 }
 
@@ -512,6 +803,22 @@ fn unlink_entry(
     state: &WorkerState,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, unlinkat};
+    #[cfg(test)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if state.deny_next_unlink.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        let name = name.as_cow_c_str()?;
+        if state
+            .failed_names
+            .lock()
+            .unwrap()
+            .contains(std::ffi::OsStr::from_bytes(name.to_bytes()))
+        {
+            return Err(io::Error::other("injected removal failure"));
+        }
+    }
     let flags = if directory {
         AtFlags::REMOVEDIR
     } else {
@@ -528,17 +835,151 @@ fn unlink_entry(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn retry_failed_unlink(
+    parent: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    directory: bool,
+    captured: Option<&rustix::fs::Stat>,
+    inode: u64,
+    restore_parent: bool,
+    state: &WorkerState,
+    original_error: io::Error,
+    target_removed: Option<&mut bool>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, chownat};
+    if original_error.kind() != io::ErrorKind::PermissionDenied {
+        return Err(original_error);
+    }
+    let (target, captured) = match checked_path_handle(parent, name, captured, inode, state) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(target_removed) = target_removed {
+                *target_removed = true;
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !restore_parent => {
+            repair_directory_permissions(parent, state, true)?;
+            checked_path_handle(parent, name, captured, inode, state)?
+        }
+        result => result?,
+    };
+    if (FileType::from_raw_mode(captured.st_mode) == FileType::Directory) != directory {
+        return Err(changed_target());
+    }
+    if !checked_current(parent, name, &captured, state)? {
+        if let Some(target_removed) = target_removed {
+            *target_removed = true;
+        }
+        return Ok(());
+    }
+    let repaired = repair_directory_permissions(parent, state, !restore_parent);
+    // Sticky directories may additionally require ownership of the selected
+    // inode. EMPTY_PATH acts on the retained inode and never follows a link.
+    let ownership_error = if FileType::from_raw_mode(captured.st_mode) != FileType::Symlink
+        && captured.st_uid != rustix::process::geteuid().as_raw()
+    {
+        retry_operation(state, || {
+            chownat(
+                &target,
+                "",
+                Some(rustix::process::geteuid()),
+                None,
+                AtFlags::EMPTY_PATH,
+            )
+        })
+        .err()
+    } else {
+        None
+    };
+    let retry = checked_current(parent, name, &captured, state).and_then(|exists| {
+        if exists {
+            unlink_entry(parent, name, directory, state)
+        } else {
+            Ok(())
+        }
+    });
+    // Record the unlink boundary before restoring an external parent's mode.
+    // Restoration diagnostics must not resurrect a successfully removed target.
+    if retry.is_ok() {
+        if let Some(target_removed) = target_removed {
+            *target_removed = true;
+        }
+    }
+    // The target's containing directory can lie outside the requested subtree.
+    // Restore its permissions even after cooperative cancellation.
+    if restore_parent {
+        if let Ok(Some(original_mode)) = repaired.as_ref() {
+            let restore_state = WorkerState::default();
+            #[cfg(test)]
+            let restoration = if state.fail_parent_restore.load(Ordering::Relaxed) {
+                Err(io::Error::other("injected parent restoration failure"))
+            } else {
+                chmod_held(parent, *original_mode, &restore_state)
+            };
+            #[cfg(not(test))]
+            let restoration = chmod_held(parent, *original_mode, &restore_state);
+            let restoration =
+                restoration.and_then(|()| verify_held_mode(parent, *original_mode, &restore_state));
+            restoration.map_err(|error| {
+                let path = std::fs::read_link(descriptor_path(parent))
+                    .unwrap_or_else(|_| descriptor_path(parent));
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not restore permissions of {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+    }
+    match retry {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(error),
+        Err(error) => {
+            let mut message = error.to_string();
+            if let Err(repair_error) = repaired {
+                message.push_str(&format!("; permission recovery failed: {repair_error}"));
+            }
+            if let Some(owner_error) = ownership_error {
+                message.push_str(&format!("; ownership recovery failed: {owner_error}"));
+            }
+            Err(io::Error::new(error.kind(), message))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_error(errors: &mut Vec<DeleteError>, path: &Path, error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return Err(error);
+    }
+    errors.push(DeleteError {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn remove_from_parent(
     parent: &rustix::fd::OwnedFd,
     name: &std::ffi::OsStr,
     state: &WorkerState,
     expected: Option<ConfirmedTarget>,
+    path: &mut PathBuf,
+    errors: &mut Vec<DeleteError>,
+    target_removed: &mut bool,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, statat};
     let captured = match retry_operation(state, || statat(parent, name, AtFlags::SYMLINK_NOFOLLOW))
     {
         Ok(captured) => captured,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            *target_removed = true;
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     state.examined_entries.fetch_add(1, Ordering::Relaxed);
@@ -547,12 +988,30 @@ fn remove_from_parent(
         return Err(changed_target());
     }
     if !checked_current(parent, name, &captured, state)? {
+        *target_removed = true;
         return Ok(());
     }
     if FileType::from_raw_mode(captured.st_mode) != FileType::Directory {
-        return unlink_entry(parent, name, false, state);
+        return match unlink_entry(parent, name, false, state) {
+            Ok(()) => {
+                *target_removed = true;
+                Ok(())
+            }
+            Err(error) => retry_failed_unlink(
+                parent,
+                name,
+                false,
+                Some(&captured),
+                0,
+                true,
+                state,
+                error,
+                Some(target_removed),
+            ),
+        };
     }
     let Some(root) = open_checked_directory(parent, name, Some(&captured), 0, state)? else {
+        *target_removed = true;
         return Ok(());
     };
     let mut stack = vec![root];
@@ -564,42 +1023,96 @@ fn remove_from_parent(
         state.check_cancel()?;
         if let Some(next) = stack.last_mut().unwrap().pending.pop() {
             let frame = stack.last().unwrap();
-            if let Some(child) =
-                open_checked_directory(&frame.fd, &next.name, None, next.inode, state)?
-            {
-                stack.push(child);
+            path.push(&next.name);
+            match open_checked_directory(&frame.fd, &next.name, None, next.inode, state) {
+                Ok(Some(mut child)) => {
+                    child.errors_at_entry = errors.len();
+                    stack.push(child);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => record_error(errors, path, error)?,
             }
+            path.pop();
             continue;
         }
         let frame = stack.last_mut().unwrap();
         if !frame.exhausted {
-            let (pending, exhausted) = read_directory_batch(&frame.fd, &mut buffer, state)?;
-            frame.pending = pending;
-            frame.exhausted = exhausted;
+            match read_directory_batch(&frame.fd, &mut buffer, state, path, errors) {
+                Ok((pending, exhausted)) => {
+                    frame.pending = pending;
+                    frame.exhausted = exhausted;
+                }
+                Err(error) => {
+                    record_error(errors, path, error)?;
+                    frame.exhausted = true;
+                }
+            }
             continue;
         }
         let finished = stack.pop().unwrap();
-        let parent = stack.last().map(|frame| &frame.fd).unwrap_or(parent);
-        if checked_current(parent, &finished.name, &finished.captured, state)? {
-            unlink_entry(parent, finished.name.as_os_str(), true, state)?;
+        let is_target = stack.is_empty();
+        let containing_parent = stack.last().map(|frame| &frame.fd).unwrap_or(parent);
+        let result = checked_current(containing_parent, &finished.name, &finished.captured, state)
+            .and_then(|exists| {
+                if !exists {
+                    if is_target {
+                        *target_removed = true;
+                    }
+                    return Ok(());
+                }
+                match unlink_entry(containing_parent, &finished.name, true, state) {
+                    Ok(()) => {
+                        if is_target {
+                            *target_removed = true;
+                        }
+                        Ok(())
+                    }
+                    Err(error) => retry_failed_unlink(
+                        containing_parent,
+                        &finished.name,
+                        true,
+                        Some(&finished.captured),
+                        0,
+                        is_target,
+                        state,
+                        error,
+                        if is_target {
+                            Some(&mut *target_removed)
+                        } else {
+                            None
+                        },
+                    ),
+                }
+            });
+        if let Err(error) = result {
+            // A retained descendant already explains why its ancestors remain.
+            if !(errors.len() > finished.errors_at_entry
+                && error.raw_os_error() == Some(rustix::io::Errno::NOTEMPTY.raw_os_error()))
+            {
+                record_error(errors, path, error)?;
+            }
+        }
+        if !stack.is_empty() {
+            path.pop();
         }
     }
     Ok(())
 }
 
-/// Consume one whole getdents buffer before suspending its descriptor. This
-/// preserves every entry without a self-referential iterator or a recursive
-/// Rust call stack. Ordinary files are unlinked directly from borrowed names.
+/// Consume one whole getdents buffer before suspending its descriptor. Files
+/// retain the direct unlink fast path; errors alone allocate full paths.
 #[cfg(target_os = "linux")]
 fn read_directory_batch(
     fd: &rustix::fd::OwnedFd,
     buffer: &mut Vec<u8>,
     state: &WorkerState,
+    path: &Path,
+    errors: &mut Vec<DeleteError>,
 ) -> io::Result<(Vec<DirectoryName>, bool)> {
     use rustix::fs::{AtFlags, FileType, RawDir, statat};
     use rustix::io::Errno;
     use std::os::unix::ffi::OsStrExt;
-
     let mut pending = Vec::new();
     loop {
         let capacity = buffer.capacity();
@@ -614,41 +1127,68 @@ fn read_directory_batch(
                     Ok(entry) => entry,
                     Err(Errno::INTR) => continue,
                     Err(Errno::INVAL) if capacity < 1024 * 1024 => break,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        record_error(errors, path, error.into())?;
+                        return Ok((pending, true));
+                    }
                 };
                 let bytes = entry.file_name().to_bytes();
                 if bytes != b"." && bytes != b".." {
                     state.examined_entries.fetch_add(1, Ordering::Relaxed);
                     let kind = entry.file_type();
                     let name = std::ffi::OsStr::from_bytes(bytes);
-                    let is_directory = if kind == FileType::Directory {
-                        true
-                    } else {
-                        match unlink_entry(fd, entry.file_name(), false, state) {
-                            Ok(()) => false,
-                            Err(error)
-                                if kind == FileType::Unknown
-                                    && matches!(error.raw_os_error(), Some(code)
-                                        if code == Errno::ISDIR.raw_os_error()
-                                            || code == Errno::PERM.raw_os_error()) =>
+                    let mut is_directory = kind == FileType::Directory;
+                    if !is_directory {
+                        if let Err(error) = unlink_entry(fd, entry.file_name(), false, state) {
+                            let mut captured = None;
+                            if kind == FileType::Unknown
+                                && (error.kind() == io::ErrorKind::PermissionDenied
+                                    || error.raw_os_error() == Some(Errno::ISDIR.raw_os_error()))
                             {
-                                match retry_operation(state, || {
+                                let inspected = retry_operation(state, || {
                                     statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
-                                }) {
-                                    Ok(stat)
-                                        if FileType::from_raw_mode(stat.st_mode)
-                                            == FileType::Directory =>
-                                    {
-                                        true
+                                })
+                                .or_else(|error| {
+                                    if error.kind() != io::ErrorKind::PermissionDenied {
+                                        return Err(error);
                                     }
-                                    Ok(_) => return Err(error),
-                                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                                    Err(error) => return Err(error),
+                                    repair_directory_permissions(fd, state, true)?;
+                                    retry_operation(state, || {
+                                        statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                                    })
+                                });
+                                match inspected {
+                                    Ok(stat) => {
+                                        is_directory = FileType::from_raw_mode(stat.st_mode)
+                                            == FileType::Directory;
+                                        captured = Some(stat);
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        record_error(errors, &path.join(name), error)?;
+                                        continue;
+                                    }
                                 }
                             }
-                            Err(error) => return Err(error),
+                            if !is_directory {
+                                if let Err(error) = retry_failed_unlink(
+                                    fd,
+                                    name,
+                                    false,
+                                    captured.as_ref(),
+                                    entry.ino(),
+                                    false,
+                                    state,
+                                    error,
+                                    None,
+                                ) {
+                                    record_error(errors, &path.join(name), error)?;
+                                }
+                            }
                         }
-                    };
+                    }
                     if is_directory {
                         pending.push(DirectoryName {
                             name: name.to_owned(),
@@ -697,6 +1237,94 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn completion_notification_follows_result_and_finished_publication() {
+        use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, eventfd, poll};
+        let work = fixture();
+        std::fs::write(work.path().join("target"), b"remove").unwrap();
+        let anchor = Arc::new(RootAnchor::open(work.path()).unwrap());
+        let target = capture(&anchor, Path::new("target")).unwrap();
+        let completion =
+            Arc::new(eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC).unwrap());
+        let handle = spawn_with_completion(
+            anchor,
+            PathBuf::from("target"),
+            Some(target),
+            Arc::clone(&completion),
+        );
+        let mut fds = [PollFd::new(completion.as_ref(), PollFlags::IN)];
+        assert_eq!(
+            poll(
+                &mut fds,
+                Some(&Timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0
+                })
+            )
+            .unwrap(),
+            1
+        );
+        assert!(handle.is_finished());
+        assert!(handle.receiver.try_recv().unwrap().outcome.is_ok());
+        let mut count = [0_u8; 8];
+        assert_eq!(
+            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
+            8
+        );
+        assert_eq!(u64::from_ne_bytes(count), 1);
+        assert_eq!(
+            rustix::io::read(completion.as_ref(), &mut count),
+            Err(rustix::io::Errno::AGAIN)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_guard_wakes_on_unwind_and_never_waits_on_a_full_counter() {
+        use rustix::event::{EventfdFlags, eventfd};
+        let completion =
+            Arc::new(eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC).unwrap());
+        let finished = Arc::new(AtomicBool::new(false));
+        let wake = CompletionWake {
+            fd: Some(Arc::clone(&completion)),
+        };
+        let (sender, receiver) = bounded(1);
+        let result = std::panic::catch_unwind(|| {
+            let _guard = FinishedGuard {
+                finished: Arc::clone(&finished),
+                completion: wake.clone(),
+                sender: Some(sender),
+            };
+            panic!("completion guard unwind fixture");
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert!(finished.load(Ordering::Acquire));
+        let mut count = [0_u8; 8];
+        assert_eq!(
+            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
+            8
+        );
+        assert_eq!(u64::from_ne_bytes(count), 1);
+        rustix::io::write(completion.as_ref(), &(u64::MAX - 1).to_ne_bytes()).unwrap();
+        finished.store(false, Ordering::Relaxed);
+        drop(FinishedGuard {
+            finished: Arc::clone(&finished),
+            completion: wake,
+            sender: None,
+        });
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(
+            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
+            8
+        );
+        assert_eq!(u64::from_ne_bytes(count), u64::MAX - 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn cancellation_between_unlinks_retains_progress_without_more_metadata() {
         let work = fixture();
         std::fs::create_dir(work.path().join("target")).unwrap();
@@ -707,6 +1335,7 @@ mod tests {
         let state = WorkerState::default();
         state.cancel_after.store(2, Ordering::Relaxed);
         let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+        assert!(!removal.target_removed);
         assert_eq!(
             removal.outcome.unwrap_err().kind(),
             io::ErrorKind::Interrupted
@@ -745,6 +1374,7 @@ mod tests {
             let state = WorkerState::default();
             state.cancel_after.store(1, Ordering::Relaxed);
             let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(removal.target_removed);
             assert!(removal.outcome.is_ok());
             assert!(!target.exists());
             assert_eq!(state.snapshot().removed_entries, 1);
@@ -907,6 +1537,327 @@ mod tests {
         }
         assert!(!work.path().join("parent").exists());
         assert!(work.path().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failures_are_collected_with_full_paths_while_siblings_continue() {
+        let work = fixture();
+        std::fs::create_dir_all(work.path().join("target/nested/deeper")).unwrap();
+        std::fs::create_dir(work.path().join("target/removable")).unwrap();
+        let state = WorkerState::default();
+        let mut expected_paths = std::collections::HashSet::new();
+        for n in 0..512 {
+            let relative = format!("target/nested/deeper/failure-{n}");
+            let path = work.path().join(&relative);
+            std::fs::write(&path, b"keep").unwrap();
+            state
+                .failed_names
+                .lock()
+                .unwrap()
+                .insert(path.file_name().unwrap().to_owned());
+            expected_paths.insert(std::path::absolute(path).unwrap());
+            std::fs::write(
+                work.path().join("target/removable").join(format!("ok-{n}")),
+                b"remove",
+            )
+            .unwrap();
+        }
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+        assert!(removal.outcome.is_err());
+        assert_eq!(removal.errors.len(), 512);
+        for error in removal.errors {
+            assert!(error.path.is_absolute());
+            assert!(
+                expected_paths.remove(&error.path),
+                "unexpected or duplicate error: {error:?}"
+            );
+            assert!(error.message.contains("injected removal failure"));
+        }
+        assert!(expected_paths.is_empty());
+        assert!(!work.path().join("target/removable").exists());
+        assert_eq!(state.snapshot().removed_entries, 513);
+        assert!(work.path().join("target/nested/deeper").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_parent_setgid_recovery_requires_effective_or_supplementary_membership() {
+        use rustix::fs::Mode;
+        let mode = Mode::from_raw_mode(0o2500);
+        ensure_parent_mode_recoverable(mode, 17, 17, || panic!("effective group matches")).unwrap();
+        ensure_parent_mode_recoverable(mode, 17, 23, || Ok(true)).unwrap();
+        let error = ensure_parent_mode_recoverable(mode, 17, 23, || Ok(false)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("setgid"));
+        let error = ensure_parent_mode_recoverable(mode, 17, 23, || {
+            Err(io::Error::other("group lookup failed"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("group lookup failed"));
+        ensure_parent_mode_recoverable(Mode::from_raw_mode(0o500), 17, 23, || {
+            panic!("ordinary modes need no group lookup")
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_mode_verification_detects_silent_special_bit_loss() {
+        use rustix::fs::Mode;
+        let work = fixture();
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let fd = anchor.open_directory(Path::new("")).unwrap();
+        let state = WorkerState::default();
+        // A successful chmod alone does not establish the requested final mode.
+        let actual = Mode::from_raw_mode(0o500);
+        chmod_held(&fd, actual, &state).unwrap();
+        verify_held_mode(&fd, actual, &state).unwrap();
+        for expected in [0o2500, 0o4500, 0o1500, 0o700] {
+            let error = verify_held_mode(&fd, Mode::from_raw_mode(expected), &state).unwrap_err();
+            assert!(error.to_string().contains("permission restoration"));
+            assert!(error.to_string().contains(&format!("{expected:04o}")));
+            assert!(error.to_string().contains("0500"));
+        }
+        chmod_held(&fd, Mode::RWXU, &state).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_setgid_parent_restores_after_removal_and_skips_unchanged_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        for original_mode in [0o2500, 0o2700] {
+            for cancel_after_unlink in [false, true] {
+                let work = fixture();
+                let parent = work.path().join("parent");
+                std::fs::create_dir(&parent).unwrap();
+                // An owner can assign an owned fixture to their effective group.
+                rustix::fs::chown(&parent, None, Some(rustix::process::getegid())).unwrap();
+                let target = parent.join("target");
+                std::fs::write(&target, b"remove").unwrap();
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(original_mode))
+                    .unwrap();
+                let anchor = RootAnchor::open(work.path()).unwrap();
+                let expected = capture(&anchor, Path::new("parent/target")).unwrap();
+                let state = WorkerState::default();
+                state.deny_next_unlink.store(true, Ordering::Relaxed);
+                // A no-op repair must not attempt restoration at all.
+                state
+                    .fail_parent_restore
+                    .store(original_mode == 0o2700, Ordering::Relaxed);
+                if cancel_after_unlink {
+                    state.cancel_after.store(1, Ordering::Relaxed);
+                }
+                let removal =
+                    remove_expected(&anchor, Path::new("parent/target"), &state, Some(expected))
+                        .unwrap();
+                let restored = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o7777;
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(removal.target_removed);
+                assert!(removal.outcome.is_ok(), "{:?}", removal.errors);
+                assert!(removal.errors.is_empty());
+                assert_eq!(state.snapshot().removed_entries, 1);
+                assert!(!target.exists());
+                assert_eq!(restored, original_mode);
+                if cancel_after_unlink {
+                    assert!(removal.parent_metadata.is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_directories_are_repaired_and_external_parent_mode_is_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = fixture();
+        std::fs::create_dir_all(work.path().join("target/locked")).unwrap();
+        std::fs::write(work.path().join("target/locked/leaf"), b"remove").unwrap();
+        std::fs::create_dir_all(work.path().join("target/no-search/child")).unwrap();
+        std::fs::write(work.path().join("target/no-search/leaf"), b"remove").unwrap();
+        std::fs::write(work.path().join("target/no-search/child/leaf"), b"remove").unwrap();
+        std::fs::set_permissions(
+            work.path().join("target/no-search"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            work.path().join("target/locked"),
+            std::fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            work.path().join("target"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let target = capture(&anchor, Path::new("target")).unwrap();
+        let removal = remove_expected(
+            &anchor,
+            Path::new("target"),
+            &WorkerState::default(),
+            Some(target),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(work.path()).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(removal.outcome.is_ok(), "{:?}", removal.errors);
+        assert!(removal.errors.is_empty());
+        assert_eq!(mode, 0o500);
+        assert!(!work.path().join("target").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_restore_failure_preserves_successful_leaf_removal() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for link in [false, true] {
+            for cancel_after_unlink in [false, true] {
+                let work = fixture();
+                let parent = work.path().join("parent");
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(work.path().join("sentinel"), b"keep").unwrap();
+                let target = parent.join("target");
+                if link {
+                    symlink("../sentinel", &target).unwrap();
+                } else {
+                    std::fs::write(&target, b"remove").unwrap();
+                }
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+                let anchor = RootAnchor::open(work.path()).unwrap();
+                let expected = capture(&anchor, Path::new("parent/target")).unwrap();
+                let state = WorkerState::default();
+                // Force recovery even when the test runner has elevated privileges.
+                state.deny_next_unlink.store(true, Ordering::Relaxed);
+                state.fail_parent_restore.store(true, Ordering::Relaxed);
+                if cancel_after_unlink {
+                    state.cancel_after.store(1, Ordering::Relaxed);
+                }
+                let removal =
+                    remove_expected(&anchor, Path::new("parent/target"), &state, Some(expected))
+                        .unwrap();
+                assert!(removal.target_removed);
+                assert!(removal.outcome.is_err());
+                assert_eq!(state.snapshot().removed_entries, 1);
+                assert!(std::fs::symlink_metadata(&target).is_err());
+                assert_eq!(
+                    std::fs::read(work.path().join("sentinel")).unwrap(),
+                    b"keep"
+                );
+                assert_eq!(removal.errors.len(), 1);
+                assert_eq!(
+                    removal.errors[0].path,
+                    std::path::absolute(&target).unwrap()
+                );
+                assert!(
+                    removal.errors[0]
+                        .message
+                        .contains("could not restore permissions")
+                );
+                assert!(
+                    removal.errors[0]
+                        .message
+                        .contains("injected parent restoration failure")
+                );
+                if cancel_after_unlink {
+                    assert!(removal.parent_metadata.is_none());
+                }
+                // The injected failure intentionally leaves the recovered mode.
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_does_not_require_parent_read_permission_or_change_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = fixture();
+        std::fs::create_dir(work.path().join("parent")).unwrap();
+        std::fs::write(work.path().join("parent/target"), b"remove").unwrap();
+        std::fs::set_permissions(
+            work.path().join("parent"),
+            std::fs::Permissions::from_mode(0o300),
+        )
+        .unwrap();
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let expected = capture(&anchor, Path::new("parent/target")).unwrap();
+        let mode = std::fs::metadata(work.path().join("parent"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o300);
+        let removal = remove_expected(
+            &anchor,
+            Path::new("parent/target"),
+            &WorkerState::default(),
+            Some(expected),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            work.path().join("parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(removal.outcome.is_ok());
+        assert!(removal.errors.is_empty());
+        assert!(!work.path().join("parent/target").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_refuses_symlinks_and_replacement_inodes() {
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, statat};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let work = fixture();
+        std::fs::write(work.path().join("outside"), b"keep").unwrap();
+        std::fs::set_permissions(
+            work.path().join("outside"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        symlink("outside", work.path().join("target")).unwrap();
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let parent = anchor.open_parent(Path::new("target")).unwrap();
+        let link = openat(
+            &parent,
+            "target",
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert!(chmod_held(&link, Mode::RWXU, &WorkerState::default()).is_err());
+        let captured = statat(&parent, "target", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        std::fs::rename(work.path().join("target"), work.path().join("original")).unwrap();
+        std::fs::write(work.path().join("target"), b"replacement").unwrap();
+        let result = retry_failed_unlink(
+            &parent,
+            std::ffi::OsStr::new("target"),
+            false,
+            Some(&captured),
+            0,
+            true,
+            &WorkerState::default(),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            None,
+        );
+        assert!(result.unwrap_err().to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read(work.path().join("target")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::metadata(work.path().join("outside"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
     }
 
     #[cfg(target_os = "linux")]
