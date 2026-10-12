@@ -39,7 +39,9 @@ jobs:
             smoke: '["qemu-arm"]'
           - target: riscv64gc-unknown-linux-gnu
             os: ubuntu-24.04
-            smoke: '["qemu-riscv64", "-L", "/usr/riscv64-linux-gnu"]'
+            # Invoke the cross loader directly: a sysroot prefix would redirect
+            # anchored opens of / away from the host's smoke-test fixture.
+            smoke: '["qemu-riscv64", "-L", "/", "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1", "--library-path", "/usr/riscv64-linux-gnu/lib"]'
     defaults:
       run:
         shell: bash
