@@ -53,22 +53,12 @@ def binary_for(target):
 
 
 def check_architecture(data, target):
-    arch = target.split("-")[0]
-    if "linux" in target:
-        expected = {"x86_64": 62, "aarch64": 183, "armv7": 40, "riscv64gc": 243}
-        require(data[:4] == b"\x7fELF" and data[5] == 1, "Expected little-endian ELF")
-        actual = struct.unpack_from("<H", data, 18)[0]
-    elif "apple" in target:
-        expected = {"x86_64": 0x01000007, "aarch64": 0x0100000C}
-        require(data[:4] == b"\xcf\xfa\xed\xfe", "Expected 64-bit Mach-O")
-        actual = struct.unpack_from("<I", data, 4)[0]
-    else:
-        expected = {"x86_64": 0x8664, "aarch64": 0xAA64}
-        require(data[:2] == b"MZ", "Expected PE executable")
-        offset = struct.unpack_from("<I", data, 0x3C)[0]
-        require(data[offset:offset + 4] == b"PE\0\0", "Invalid PE signature")
-        actual = struct.unpack_from("<H", data, offset + 4)[0]
-    require(actual == expected[arch], f"Wrong executable architecture for {target}")
+    expected = {"x86_64": 62, "aarch64": 183, "armv7": 40, "riscv64gc": 243}
+    require(len(data) >= 20 and data[:4] == b"\x7fELF" and data[5] == 1,
+            "Expected little-endian ELF")
+    actual = struct.unpack_from("<H", data, 18)[0]
+    require(actual == expected[target.split("-")[0]],
+            f"Wrong executable architecture for {target}")
 
 
 def totals(paths):

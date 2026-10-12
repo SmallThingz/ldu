@@ -979,8 +979,7 @@ impl App {
     }
 
     fn selection_index(&self) -> Option<usize> {
-        self.selected
-            .and_then(|id| self.view.positions.get(&id).copied())
+        self.selected.and_then(|id| self.view.position(id))
     }
     fn screen_rows(&self) -> impl Iterator<Item = (usize, NodeId)> + '_ {
         self.rows_in(&self.view, self.offset)
@@ -2166,8 +2165,8 @@ impl App {
         let cursor = if live(lead) {
             Some(lead)
         } else {
-            view.positions.get(&lead).and_then(|&index| {
-                let anchor = view.positions.get(&anchor).copied().unwrap_or(index);
+            view.position(lead).and_then(|index| {
+                let anchor = view.position(anchor).unwrap_or(index);
                 (0..256)
                     .filter_map(|step| {
                         if anchor <= index {
@@ -2189,13 +2188,13 @@ impl App {
         // Discard its dependent Enter keys before generic focus repair can bind
         // them to an unrelated row; later cursor intents keep their own keys.
         let follows_gesture = cursor.is_some_and(|id| {
-            let Some(&index) = view.positions.get(&id) else {
+            let Some(index) = view.position(id) else {
                 return false;
             };
-            let Some(&anchor) = view.positions.get(&anchor) else {
+            let Some(anchor) = view.position(anchor) else {
                 return false;
             };
-            let Some(&lead) = view.positions.get(&lead) else {
+            let Some(lead) = view.position(lead) else {
                 return false;
             };
             (anchor.min(lead)..=anchor.max(lead)).contains(&index)
@@ -2253,20 +2252,16 @@ impl App {
             |(_, _, time)| time,
         );
         self.drag_scroll = self.mouse_press_view.as_ref().and_then(|view| {
-            view.positions
-                .get(&id)
-                .copied()
-                .filter(|_| edge != 0)
-                .map(|index| {
-                    let index = previous.map_or(index, |(_, old, _)| {
-                        if edge < 0 {
-                            old.min(index)
-                        } else {
-                            old.max(index)
-                        }
-                    });
-                    (edge, index, deadline)
-                })
+            view.position(id).filter(|_| edge != 0).map(|index| {
+                let index = previous.map_or(index, |(_, old, _)| {
+                    if edge < 0 {
+                        old.min(index)
+                    } else {
+                        old.max(index)
+                    }
+                });
+                (edge, index, deadline)
+            })
         });
     }
 
@@ -3120,17 +3115,19 @@ impl App {
                 human_size(size)
             )
         };
+        let visually_selected = self.visual.contains(id);
         let marker = if selected {
             "›"
-        } else if self.visual.contains(id) {
+        } else if visually_selected {
             "✓"
         } else {
             " "
         };
-        let mut spans = vec![
+        let mut spans = Vec::with_capacity(6);
+        spans.extend([
             Span::styled(marker, Style::default().fg(Color::White)),
             Span::raw(format!("{size_label:>11} ")),
-        ];
+        ]);
         let graph_width = match width {
             45.. => 10,
             30.. => 5,
@@ -3187,7 +3184,7 @@ impl App {
         ));
         spans.push(Span::styled(name, Style::default().fg(color)));
         let line = Line::from(spans);
-        if self.visual.contains(id) {
+        if visually_selected {
             line.style(
                 Style::default()
                     .bg(Color::Blue)
@@ -3410,10 +3407,13 @@ impl App {
         );
         let (painted_view, painted_offset) =
             held_view.unwrap_or_else(|| (Arc::clone(&self.view), self.offset));
-        self.painted_rows = self
-            .rows_in(&painted_view, painted_offset)
-            .map(|(_, id)| id)
-            .collect();
+        let mut painted_rows = std::mem::take(&mut self.painted_rows);
+        painted_rows.clear();
+        painted_rows.extend(
+            self.rows_in(&painted_view, painted_offset)
+                .map(|(_, id)| id),
+        );
+        self.painted_rows = painted_rows;
         self.painted_view = painted_view;
         self.painted_offset = painted_offset;
         self.painted_directory = self.directory;
@@ -4456,18 +4456,13 @@ fn pump_batch(
                 {
                     continue;
                 }
-                preparation
-                    .order
-                    .positions
-                    .get(&id)
-                    .copied()
-                    .map(|ordinal| {
-                        (
-                            id,
-                            preparation.relative.join(app.model.node(id).name.as_ref()),
-                            ordinal,
-                        )
-                    })
+                preparation.order.position(id).map(|ordinal| {
+                    (
+                        id,
+                        preparation.relative.join(app.model.node(id).name.as_ref()),
+                        ordinal,
+                    )
+                })
             } else {
                 None
             };
@@ -10382,7 +10377,11 @@ mod tests {
                     Arc::new(CachedSnapshot {
                         generation: app.view.generation,
                         child_epoch: app.model.node(1).child_epoch,
-                        positions: ids.iter().enumerate().map(|(i, &id)| (id, i)).collect(),
+                        positions: ids
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &id)| (id, u32::try_from(i).unwrap()))
+                            .collect(),
                         ids,
                     })
                 };
@@ -10756,7 +10755,11 @@ mod tests {
             app.view = Arc::new(CachedSnapshot {
                 generation: original.generation,
                 child_epoch: original.child_epoch,
-                positions: ids.iter().enumerate().map(|(i, &id)| (id, i)).collect(),
+                positions: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &id)| (id, u32::try_from(i).unwrap()))
+                    .collect(),
                 ids,
             });
             app.offset = 0;
@@ -11158,7 +11161,11 @@ mod tests {
                         Arc::new(CachedSnapshot {
                             generation: app.view.generation,
                             child_epoch: app.model.node(1).child_epoch,
-                            positions: ids.iter().enumerate().map(|(i, &id)| (id, i)).collect(),
+                            positions: ids
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &id)| (id, u32::try_from(i).unwrap()))
+                                .collect(),
                             ids,
                         })
                     };
@@ -13436,7 +13443,7 @@ mod tests {
             positions: ids
                 .iter()
                 .enumerate()
-                .map(|(index, &id)| (id, index))
+                .map(|(index, &id)| (id, u32::try_from(index).unwrap()))
                 .collect(),
             ids,
         });
@@ -13743,7 +13750,7 @@ mod tests {
             positions: ids
                 .iter()
                 .enumerate()
-                .map(|(index, &id)| (id, index))
+                .map(|(index, &id)| (id, u32::try_from(index).unwrap()))
                 .collect(),
             ids,
         });

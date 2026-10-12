@@ -289,7 +289,9 @@ impl VisualSelection {
                 .or(removed_anchor)
                 .filter(|id| snapshot.positions.contains_key(id))
                 .unwrap_or(lead);
-            let anchor = snapshot.positions[&anchor_id];
+            let anchor = snapshot
+                .position(anchor_id)
+                .expect("anchor is in the snapshot");
             let preserve_anchor = self.preserve_anchor && self.anchor == Some(anchor_id);
             self.anchor = (removed_anchor != Some(anchor_id)).then_some(anchor_id);
             self.range = Some(Range {
@@ -306,7 +308,7 @@ impl VisualSelection {
             });
         }
         let range = self.range.as_mut().expect("range was initialized");
-        let Some(&lead) = range.snapshot.positions.get(&lead) else {
+        let Some(lead) = range.snapshot.position(lead) else {
             return false;
         };
         range.desired = (range.anchor.min(lead), range.anchor.max(lead));
@@ -489,7 +491,7 @@ mod tests {
             positions: ids
                 .iter()
                 .enumerate()
-                .map(|(i, &id)| (id, i))
+                .map(|(i, &id)| (id, u32::try_from(i).unwrap()))
                 .collect::<StdHashMap<_, _>>(),
         })
     }

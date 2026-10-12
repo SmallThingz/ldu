@@ -117,6 +117,6 @@ Allocated disk usage is the default. Scanning and finished entries sort together
 
 At 96 columns or wider, the list and preview share the width in a 4:3 ratio. The preview shows directory contents and text. Symlinks show their stored destination path, including broken links, without opening the target. Installed archive utilities can provide a bounded listing of archive entries; `pdftotext` can provide PDF text. Formats without a suitable tool, or failed previews, fall back to file details. Nothing needs to be installed for ordinary browsing.
 
-[Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md) · [Review results](REVIEW.md)
+[Behavior and platform details](docs/behavior.md) · [ncdu and DUA references](upstream/README.md)
 
 MIT license; see [LICENSE](LICENSE).

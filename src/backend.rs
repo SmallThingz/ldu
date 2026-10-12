@@ -481,6 +481,66 @@ fn enumerate_std(
 }
 
 #[cfg(target_os = "linux")]
+const NATIVE_BUFFER_LIMIT: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static NATIVE_READ_BUFFER: std::cell::RefCell<Vec<u8>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(target_os = "linux")]
+struct NativeReadBuffer {
+    bytes: Vec<u8>,
+    window: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeReadBuffer {
+    fn new(window: usize) -> io::Result<Self> {
+        // Own the buffer across callbacks, which can reenter scanning on this thread.
+        let bytes = NATIVE_READ_BUFFER.with(|cache| std::mem::take(&mut *cache.borrow_mut()));
+        let mut buffer = Self {
+            bytes,
+            window: window.max(4096),
+        };
+        buffer
+            .bytes
+            .try_reserve_exact(buffer.window)
+            .map_err(io::Error::other)?;
+        Ok(buffer)
+    }
+
+    fn spare_capacity_mut(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        // Cached allocation capacity must not override the configured read size.
+        &mut self.bytes.spare_capacity_mut()[..self.window]
+    }
+
+    fn grow(&mut self) -> io::Result<()> {
+        self.window = self.window.saturating_mul(2).min(NATIVE_BUFFER_LIMIT);
+        self.bytes
+            .try_reserve_exact(self.window)
+            .map_err(io::Error::other)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NativeReadBuffer {
+    fn drop(&mut self) {
+        if self.bytes.capacity() > NATIVE_BUFFER_LIMIT {
+            return;
+        }
+        let _ = NATIVE_READ_BUFFER.try_with(|cache| {
+            let mut cached = cache.borrow_mut();
+            if self.bytes.capacity() > cached.capacity() {
+                std::mem::swap(&mut *cached, &mut self.bytes);
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn enumerate_native(
     reader: &MetadataReader,
     buffer_size: usize,
@@ -493,14 +553,11 @@ fn enumerate_native(
     use std::os::unix::ffi::OsStrExt;
 
     let MetadataReader::Native(fd) = reader;
-    let mut buffer = Vec::<u8>::new();
-    buffer
-        .try_reserve_exact(buffer_size.max(4096))
-        .map_err(io::Error::other)?;
+    let mut buffer = NativeReadBuffer::new(buffer_size)?;
     let mut batch = Vec::new();
     loop {
         let mut resize = false;
-        let capacity = buffer.capacity();
+        let window = buffer.window;
         {
             let mut entries = RawDir::new(fd, buffer.spare_capacity_mut());
             loop {
@@ -511,7 +568,7 @@ fn enumerate_native(
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(Errno::INTR) => continue,
-                    Err(Errno::INVAL) if capacity < 1024 * 1024 => {
+                    Err(Errno::INVAL) if window < NATIVE_BUFFER_LIMIT => {
                         resize = true;
                         break;
                     }
@@ -536,10 +593,7 @@ fn enumerate_native(
         if !resize {
             break;
         }
-        let new_capacity = buffer.capacity().saturating_mul(2).min(1024 * 1024);
-        buffer
-            .try_reserve_exact(new_capacity)
-            .map_err(io::Error::other)?;
+        buffer.grow()?;
     }
     check_cancel(cancel)?;
     flush(&mut batch, reader, emit)
@@ -643,6 +697,95 @@ mod tests {
             .prefix("backend-")
             .tempdir_in(".tmp")
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_buffer_cache_preserves_read_window_and_bounded_ownership() {
+        std::thread::spawn(|| {
+            let large = NativeReadBuffer::new(64 * 1024).unwrap();
+            let allocation = large.bytes.as_ptr();
+            drop(large);
+            let mut small = NativeReadBuffer::new(4096).unwrap();
+            assert_eq!(small.bytes.as_ptr(), allocation);
+            assert_eq!(small.spare_capacity_mut().len(), 4096);
+            small.grow().unwrap();
+            assert_eq!(small.spare_capacity_mut().len(), 8192);
+            let nested = NativeReadBuffer::new(8192).unwrap();
+            assert_ne!(small.bytes.as_ptr(), nested.bytes.as_ptr());
+            drop(nested);
+            drop(small);
+            NATIVE_READ_BUFFER.with(|cache| {
+                let capacity = cache.borrow().capacity();
+                assert!((64 * 1024..=NATIVE_BUFFER_LIMIT).contains(&capacity));
+            });
+            let oversized = NativeReadBuffer::new(NATIVE_BUFFER_LIMIT + 4096).unwrap();
+            drop(oversized);
+            NATIVE_READ_BUFFER.with(|cache| assert_eq!(cache.borrow().capacity(), 0));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_enumeration_callbacks_can_reenter_and_release_buffers_on_error() {
+        let outer = fixture();
+        let inner = fixture();
+        for index in 0..4 {
+            fs::write(outer.path().join(format!("outer-{index}")), b"outer").unwrap();
+        }
+        for index in 0..3 {
+            fs::write(inner.path().join(format!("inner-{index}")), b"inner").unwrap();
+        }
+        std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let mut outer_count = 0;
+            let mut inner_count = 0;
+            enumerate(
+                outer.path(),
+                Backend::Native,
+                4096,
+                1,
+                &cancel,
+                |names, reader| {
+                    if outer_count == 0 {
+                        enumerate(
+                            inner.path(),
+                            Backend::Native,
+                            64 * 1024,
+                            2,
+                            &cancel,
+                            |names, reader| {
+                                for name in names {
+                                    assert_eq!(reader.metadata(&name)?.sizes.apparent, 5);
+                                    inner_count += 1;
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    for name in names {
+                        assert_eq!(reader.metadata(&name)?.sizes.apparent, 5);
+                        outer_count += 1;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!((outer_count, inner_count), (4, 3));
+            let error = enumerate(outer.path(), Backend::Native, 4096, 1, &cancel, |_, _| {
+                Err(io::Error::other("stop after the first batch"))
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "stop after the first batch");
+            NATIVE_READ_BUFFER.with(|cache| {
+                let capacity = cache.borrow().capacity();
+                assert!((64 * 1024..=NATIVE_BUFFER_LIMIT).contains(&capacity));
+            });
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]

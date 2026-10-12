@@ -6,13 +6,13 @@ use crate::retire::Retirer;
 use crate::types::NodeId;
 use crossbeam_channel::TryRecvError;
 use im::{HashMap, OrdMap, Vector};
-use std::ffi::OsString;
 use std::io;
+use std::ops::Bound::{Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub type QueueId = u64;
-type Paths = HashMap<usize, OrdMap<Arc<[OsString]>, QueueId>>;
+type Paths = HashMap<usize, OrdMap<Arc<Path>, QueueId>>;
 
 #[derive(Clone, Default)]
 pub struct QueueMarks {
@@ -71,7 +71,8 @@ pub struct QueueCompletion {
 
 #[derive(Clone)]
 struct PendingNode {
-    entry: Arc<QueueEntry>,
+    // The entries map is never snapshotted; keep its sparse slots compact.
+    entry: Box<QueueEntry>,
     previous: Option<QueueId>,
     next: Option<QueueId>,
 }
@@ -121,7 +122,7 @@ impl PendingQueue {
         self.entries.insert(
             id,
             PendingNode {
-                entry: Arc::new(entry),
+                entry: Box::new(entry),
                 previous: self.last,
                 next: None,
             },
@@ -158,7 +159,7 @@ impl PendingQueue {
         } else {
             self.last = node.previous;
         }
-        Some(Arc::unwrap_or_clone(node.entry))
+        Some(*node.entry)
     }
 
     fn move_adjacent(&mut self, id: QueueId, direction: isize) -> bool {
@@ -289,10 +290,10 @@ struct Prune {
     anchor: usize,
     node: NodeId,
     ancestor: QueueId,
-    prefix: Arc<[OsString]>,
+    prefix: Arc<Path>,
     // A cheap persistent snapshot fixes which already-confirmed jobs were
     // superseded. Later confirmations must survive an older cancelled ancestor.
-    paths: OrdMap<Arc<[OsString]>, QueueId>,
+    paths: OrdMap<Arc<Path>, QueueId>,
 }
 
 enum Retired {
@@ -399,16 +400,16 @@ impl DeleteQueue {
             };
         }
         let root = anchor_id(&anchor);
-        let components = path_components(&relative);
-        if let Some(id) = self.covering_pending(root, &components) {
+        if let Some(id) = self.covering_pending(root, &relative) {
             return EnqueueOutcome {
                 id,
                 inserted: false,
             };
         }
         let superseded = self
-            .first_descendant(root, &components, None)
-            .map(|_| self.paths[&root].clone());
+            .has_at_or_below(root, &relative)
+            .then(|| self.paths[&root].clone());
+        let path = Arc::<Path>::from(relative.as_path());
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -417,7 +418,7 @@ impl DeleteQueue {
         self.paths
             .entry(root)
             .or_default()
-            .insert(components.clone(), id);
+            .insert(Arc::clone(&path), id);
         self.pending.push_back(QueueEntry {
             id,
             node,
@@ -430,12 +431,12 @@ impl DeleteQueue {
             self.superseded
                 .entry(root)
                 .or_default()
-                .insert(components.clone(), id);
+                .insert(Arc::clone(&path), id);
             self.pruning.push_back(Prune {
                 anchor: root,
                 node,
                 ancestor: id,
-                prefix: components,
+                prefix: path,
                 paths,
             });
         }
@@ -542,8 +543,7 @@ impl DeleteQueue {
         // already superseded descendants cannot be revived or manipulated.
         if self.is_updating()
             && self.pending.get(id).is_some_and(|entry| {
-                self.covering_pending(anchor_id(&entry.anchor), &path_components(&entry.relative))
-                    != Some(id)
+                self.covering_pending(anchor_id(&entry.anchor), &entry.relative) != Some(id)
             })
         {
             return None;
@@ -554,12 +554,12 @@ impl DeleteQueue {
     fn remove_pending_inner(&mut self, id: QueueId) -> Option<QueueEntry> {
         let entry = self.pending.remove(id)?;
         let root = anchor_id(&entry.anchor);
-        let path = path_components(&entry.relative);
+        let path = entry.relative.as_path();
         if let Some(paths) = self.paths.get_mut(&root) {
             // An older superseded job may have been explicitly reconfirmed at
             // the same path with a fresh ID before its old prune completed.
-            if paths.get(&path) == Some(&id) {
-                paths.remove(&path);
+            if paths.get(path) == Some(&id) {
+                paths.remove(path);
             }
             if paths.is_empty() {
                 self.paths.remove(&root);
@@ -598,41 +598,55 @@ impl DeleteQueue {
             return true;
         }
         let root = anchor_id(anchor);
-        let path = path_components(relative);
-        self.covering_pending(root, &path).is_some()
-            || self.first_descendant(root, &path, None).is_some()
+        self.covering_pending(root, relative).is_some() || self.has_at_or_below(root, relative)
     }
 
-    fn covering_pending(&self, root: usize, path: &[OsString]) -> Option<QueueId> {
+    fn covering_pending(&self, root: usize, path: &Path) -> Option<QueueId> {
         let paths = self.paths.get(&root)?;
-        for end in 0..=path.len() {
-            if let Some(id) = paths.get(&path[..end]) {
-                if !self.is_superseded(root, &path[..end], *id) {
-                    return Some(*id);
+        let empty = Path::new("");
+        if let Some(&id) = paths.get(empty) {
+            if !self.is_superseded(root, empty, id) {
+                return Some(id);
+            }
+        }
+        // Ancestors arrive longest first. Keep the final eligible match to
+        // preserve shortest-prefix coverage without allocating component keys.
+        let mut covering = None;
+        for prefix in path
+            .ancestors()
+            .take_while(|path| !path.as_os_str().is_empty())
+        {
+            if let Some(&id) = paths.get(prefix) {
+                if !self.is_superseded(root, prefix, id) {
+                    covering = Some(id);
                 }
             }
         }
-        None
+        covering
     }
 
-    fn is_superseded(&self, root: usize, path: &[OsString], id: QueueId) -> bool {
+    fn is_superseded(&self, root: usize, path: &Path, id: QueueId) -> bool {
         let Some(markers) = self.superseded.get(&root) else {
             return false;
         };
-        (0..=path.len()).any(|end| markers.get(&path[..end]).is_some_and(|cutoff| id < *cutoff))
+        // Keep the empty-root marker even for an absolute lookup, whose
+        // ancestors stop at the filesystem root instead of the empty path.
+        markers
+            .get(Path::new(""))
+            .is_some_and(|cutoff| id < *cutoff)
+            || path
+                .ancestors()
+                .any(|prefix| markers.get(prefix).is_some_and(|cutoff| id < *cutoff))
     }
 
-    fn first_descendant(
-        &self,
-        root: usize,
-        prefix: &[OsString],
-        except: Option<QueueId>,
-    ) -> Option<(Arc<[OsString]>, QueueId)> {
-        let paths = self.paths.get(&root)?;
-        let (path, id) = paths
-            .range(Arc::<[OsString]>::from(prefix)..)
-            .find(|(_, id)| Some(**id) != except)?;
-        path.starts_with(prefix).then(|| (path.clone(), *id))
+    fn has_at_or_below(&self, root: usize, prefix: &Path) -> bool {
+        let Some(paths) = self.paths.get(&root) else {
+            return false;
+        };
+        paths
+            .range::<_, Path>((Included(prefix), Unbounded))
+            .next()
+            .is_some_and(|(path, _)| path.starts_with(prefix))
     }
 
     /// Ancestors replace potentially many pending descendants in bounded steps.
@@ -651,9 +665,9 @@ impl DeleteQueue {
             };
             let candidate = prune
                 .paths
-                .range(prune.prefix.clone()..)
+                .range::<_, Path>((Included(prune.prefix.as_ref()), Unbounded))
                 .next()
-                .filter(|(path, _)| path.starts_with(&prune.prefix))
+                .filter(|(path, _)| path.starts_with(prune.prefix.as_ref()))
                 .map(|(path, id)| (path.clone(), *id));
             if let Some((path, id)) = candidate {
                 self.pruning
@@ -776,14 +790,6 @@ impl Drop for DeleteQueue {
 
 fn anchor_id(anchor: &Arc<RootAnchor>) -> usize {
     Arc::as_ptr(anchor) as usize
-}
-
-fn path_components(relative: &Path) -> Arc<[OsString]> {
-    relative
-        .components()
-        .map(|component| component.as_os_str().to_os_string())
-        .collect::<Vec<_>>()
-        .into()
 }
 
 fn covers(entry: &QueueEntry, anchor: &Arc<RootAnchor>, relative: &Path) -> bool {
@@ -994,6 +1000,65 @@ mod tests {
         );
         assert!(queue.enqueue(4, other_anchor, "parent".into()).inserted);
         assert_eq!(queue.pending().len(), 2);
+    }
+
+    #[test]
+    fn pending_path_index_keeps_component_order_normalization_and_root_coverage() {
+        let anchor = anchor();
+        let mut queue = DeleteQueue::new().unwrap();
+        let sibling = queue
+            .enqueue(1, Arc::clone(&anchor), "tree-sibling".into())
+            .id;
+        let child = queue
+            .enqueue(2, Arc::clone(&anchor), "tree/child".into())
+            .id;
+        assert!(queue.overlaps(&anchor, Path::new("")));
+        assert!(queue.overlaps(&anchor, Path::new("tree")));
+        assert!(queue.overlaps(&anchor, Path::new("tree/child/deeper")));
+        assert!(!queue.overlaps(&anchor, Path::new("tree-sib")));
+        assert_eq!(
+            queue.enqueue(3, Arc::clone(&anchor), "tree//./child/".into()),
+            EnqueueOutcome {
+                id: child,
+                inserted: false
+            },
+        );
+        assert_eq!(queue.remove_pending(child).unwrap().id, child);
+        assert!(!queue.overlaps(&anchor, Path::new("tree")));
+        queue.enqueue(2, Arc::clone(&anchor), "tree/child".into());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = Path::new("tree").join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            let raw_id = queue.enqueue(4, Arc::clone(&anchor), raw.clone()).id;
+            assert!(queue.overlaps(&anchor, &raw));
+            assert_eq!(
+                queue.enqueue(5, Arc::clone(&anchor), raw),
+                EnqueueOutcome {
+                    id: raw_id,
+                    inserted: false
+                },
+            );
+        }
+        let ancestor = queue.enqueue(6, Arc::clone(&anchor), "tree".into()).id;
+        queue.pump(128);
+        assert!(!queue.is_updating());
+        assert_eq!(
+            queue
+                .pending()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![sibling, ancestor],
+        );
+        let root = queue.enqueue(7, Arc::clone(&anchor), PathBuf::new()).id;
+        assert_eq!(
+            queue.enqueue(8, Arc::clone(&anchor), "/absolute".into()),
+            EnqueueOutcome {
+                id: root,
+                inserted: false
+            },
+        );
     }
 
     #[test]

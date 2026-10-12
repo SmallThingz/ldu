@@ -173,11 +173,12 @@ impl Drop for ExclusionTrie {
 
 impl ExclusionTrie {
     fn excludes(&self, path: &Path) -> bool {
+        self.excludes_components(path.components())
+    }
+
+    fn excludes_components<'a>(&self, components: impl Iterator<Item = Component<'a>>) -> bool {
         let mut node = self;
-        for component in path
-            .components()
-            .filter(|component| !matches!(component, Component::CurDir))
-        {
+        for component in components.filter(|component| !matches!(component, Component::CurDir)) {
             if node.terminal {
                 return true;
             }
@@ -337,7 +338,19 @@ impl ScanControl {
     }
 
     fn excludes_child(&self, parent: &Path, name: &std::ffi::OsStr) -> bool {
-        self.has_exclusions.load(Ordering::Acquire) && self.excludes(&parent.join(name))
+        if !self.has_exclusions.load(Ordering::Acquire) {
+            return false;
+        }
+        // Enumeration supplies a single non-dot basename, so no joined path is needed.
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .excluded
+            .excludes_components(
+                parent
+                    .components()
+                    .chain(std::iter::once(Component::Normal(name))),
+            )
     }
 
     fn activate<'a>(&'a self, task: &DirectoryTask, cancel: &AtomicBool) -> ActiveTask<'a> {
@@ -608,20 +621,25 @@ impl Default for HardlinkRegistry {
 
 impl HardlinkRegistry {
     fn group(&self, identity: (u64, u64)) -> io::Result<(NodeId, bool)> {
-        let mut state = self
-            .state
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(&group) = state.groups.get(&identity) {
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .group(identity)
+    }
+}
+
+impl HardlinkState {
+    fn group(&mut self, identity: (u64, u64)) -> io::Result<(NodeId, bool)> {
+        if let Some(&group) = self.groups.get(&identity) {
             return Ok((group, true));
         }
-        let group = state.next_group;
-        state.next_group = group.checked_add(1).ok_or_else(|| {
+        let group = self.next_group;
+        self.next_group = group.checked_add(1).ok_or_else(|| {
             io::Error::other("too many hardlink groups for the scan's identifiers")
         })?;
         // Record single-link files too. A later refresh may discover a new alias
         // of an unchanged file outside the refreshed branch.
-        state.groups.insert(identity, group);
+        self.groups.insert(identity, group);
         Ok((group, false))
     }
 }
@@ -661,6 +679,7 @@ impl Emitter {
     ) -> io::Result<Vec<DirectoryTask>> {
         let mut entries = Vec::with_capacity(discovered.len());
         let mut directories = Vec::new();
+        let mut hardlinks = None;
         for (name, metadata) in discovered {
             // Filter before allocating an ID. Already allocated IDs must still be
             // delivered, so queued batches cannot create holes in the model.
@@ -676,7 +695,13 @@ impl Emitter {
                     let (group, duplicate) = if metadata.kind == NodeKind::File {
                         match metadata.identity.filter(|_| metadata.links != 0) {
                             Some(identity) => {
-                                let (group, duplicate) = self.hardlinks.group(identity)?;
+                                let registry = hardlinks.get_or_insert_with(|| {
+                                    self.hardlinks
+                                        .state
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                });
+                                let (group, duplicate) = registry.group(identity)?;
                                 (Some(group), duplicate)
                             }
                             None => (None, false),
@@ -710,6 +735,8 @@ impl Emitter {
                 error,
             });
         }
+        // Other scoped scans must not wait for this scan's event backpressure.
+        drop(hardlinks);
         // IDs and delivery share one lock, so the model receives append-only IDs in order.
         self.send(
             ScanEvent::Entries {
@@ -1617,6 +1644,38 @@ mod tests {
     }
 
     #[test]
+    fn child_exclusions_preserve_ancestors_exact_names_and_root_paths() {
+        let control = ScanControl::default();
+        assert!(!control.excludes_child(Path::new("branch"), std::ffi::OsStr::new("blocked")));
+        control.exclude(Path::new("branch/blocked"));
+        control.exclude(Path::new("ancestor"));
+        for (parent, name, expected) in [
+            ("branch", "blocked", true),
+            ("./branch/.", "blocked", true),
+            ("branch/blocked", "child", true),
+            ("branch/blocked/deep", "child", true),
+            ("branch", "blocked-other", false),
+            ("branch", "survivor", false),
+            ("branch-other", "blocked", false),
+            ("", "branch", false),
+            ("", "ancestor", true),
+            (".", "ancestor", true),
+            ("ancestor/deep", "child", true),
+            ("", "ancestor-other", false),
+            ("unrelated", "blocked", false),
+        ] {
+            assert_eq!(
+                control.excludes_child(Path::new(parent), std::ffi::OsStr::new(name)),
+                expected,
+                "{parent:?} / {name:?}"
+            );
+        }
+        control.exclude(Path::new("."));
+        assert!(control.excludes_child(Path::new(""), std::ffi::OsStr::new("anything")));
+        assert!(control.excludes_child(Path::new("unrelated"), std::ffi::OsStr::new("child")));
+    }
+
+    #[test]
     fn deep_exclusions_drop_without_recursing_on_the_thread_stack() {
         thread::Builder::new()
             .name("ldu-deep-exclusion-drop".into())
@@ -2148,6 +2207,67 @@ mod tests {
         assert_eq!(completed.len(), directories);
         assert!(saw_deep);
         assert!(expected_id > 70);
+    }
+
+    #[test]
+    fn hardlink_batch_preserves_order_and_releases_registry_before_delivery() {
+        let (sender, receiver) = bounded(0);
+        let hardlinks = Arc::new(HardlinkRegistry::default());
+        let worker_hardlinks = Arc::clone(&hardlinks);
+        let worker = thread::spawn(move || {
+            let mut emitter = Emitter {
+                sender,
+                next_id: 1,
+                hardlinks: worker_hardlinks,
+            };
+            let discovered = [("first", 42), ("alias", 42), ("second", 43)]
+                .into_iter()
+                .map(|(name, inode)| {
+                    (
+                        name.into(),
+                        Ok(EntryMetadata {
+                            kind: NodeKind::File,
+                            sizes: Sizes::default(),
+                            identity: Some((1, inode)),
+                            links: 1,
+                        }),
+                    )
+                })
+                .collect();
+            emitter.entries(
+                &task(0, ""),
+                discovered,
+                &AtomicBool::new(false),
+                &ScanControl::default(),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let available_before_delivery = loop {
+            if let Ok(state) = hardlinks.state.try_lock() {
+                if state.groups.len() == 2 {
+                    break true;
+                }
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::yield_now();
+        };
+        let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(worker.join().unwrap().unwrap().is_empty());
+        assert!(available_before_delivery);
+        let ScanEvent::Entries { entries, .. } = event else {
+            panic!("expected an entry batch");
+        };
+        let groups: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.id, entry.hardlink_group, entry.hardlink_duplicate))
+            .collect();
+        assert_eq!(
+            groups,
+            [(1, Some(1), false), (2, Some(1), true), (3, Some(2), false)]
+        );
+        assert_eq!(hardlinks.group((1, 42)).unwrap(), (1, true));
     }
 
     #[test]

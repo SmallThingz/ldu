@@ -99,6 +99,10 @@ pub struct DeleteProgress {
     pub removed_directories: u64,
 }
 
+// Progress has exactly one writer: the deletion worker created with this state.
+// UI handles only read snapshots or set cancellation; capture/restoration helpers
+// use independent states. Keep progress writes on that one worker: increments
+// deliberately avoid atomic read-modify-write instructions.
 #[derive(Default)]
 struct WorkerState {
     cancel: AtomicBool,
@@ -141,10 +145,30 @@ impl WorkerState {
     }
 
     #[cfg(target_os = "linux")]
+    fn examined(&self) {
+        self.examined_entries.store(
+            self.examined_entries
+                .load(Ordering::Relaxed)
+                .wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn removed(&self, directory: bool) {
-        let _ = self.removed_entries.fetch_add(1, Ordering::Release);
+        // Publish prior examination first, then each directory's entry removal.
+        // snapshot() acquires these counters in the opposite order.
+        self.removed_entries.store(
+            self.removed_entries.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Release,
+        );
         if directory {
-            self.removed_directories.fetch_add(1, Ordering::Release);
+            self.removed_directories.store(
+                self.removed_directories
+                    .load(Ordering::Relaxed)
+                    .wrapping_add(1),
+                Ordering::Release,
+            );
         }
         // A deterministic syscall-boundary cancellation fixture. Production
         // workers have no hook and use the same cancellation checks.
@@ -951,12 +975,16 @@ fn retry_failed_unlink(
 }
 
 #[cfg(target_os = "linux")]
-fn record_error(errors: &mut Vec<DeleteError>, path: &Path, error: io::Error) -> io::Result<()> {
+fn record_error(
+    errors: &mut Vec<DeleteError>,
+    path: impl Into<PathBuf>,
+    error: io::Error,
+) -> io::Result<()> {
     if error.kind() == io::ErrorKind::Interrupted {
         return Err(error);
     }
     errors.push(DeleteError {
-        path: path.to_path_buf(),
+        path: path.into(),
         message: error.to_string(),
     });
     Ok(())
@@ -982,7 +1010,7 @@ fn remove_from_parent(
         }
         Err(error) => return Err(error),
     };
-    state.examined_entries.fetch_add(1, Ordering::Relaxed);
+    state.examined();
     if expected.is_some_and(|expected| expected.target != Some(FileIdentity::from_stat(&captured)))
     {
         return Err(changed_target());
@@ -1031,20 +1059,24 @@ fn remove_from_parent(
                     continue;
                 }
                 Ok(None) => {}
-                Err(error) => record_error(errors, path, error)?,
+                Err(error) => record_error(errors, path.as_path(), error)?,
             }
             path.pop();
             continue;
         }
         let frame = stack.last_mut().unwrap();
         if !frame.exhausted {
-            match read_directory_batch(&frame.fd, &mut buffer, state, path, errors) {
-                Ok((pending, exhausted)) => {
-                    frame.pending = pending;
-                    frame.exhausted = exhausted;
-                }
+            match read_directory_batch(
+                &frame.fd,
+                &mut buffer,
+                &mut frame.pending,
+                state,
+                path,
+                errors,
+            ) {
+                Ok(exhausted) => frame.exhausted = exhausted,
                 Err(error) => {
-                    record_error(errors, path, error)?;
+                    record_error(errors, path.as_path(), error)?;
                     frame.exhausted = true;
                 }
             }
@@ -1090,7 +1122,7 @@ fn remove_from_parent(
             if !(errors.len() > finished.errors_at_entry
                 && error.raw_os_error() == Some(rustix::io::Errno::NOTEMPTY.raw_os_error()))
             {
-                record_error(errors, path, error)?;
+                record_error(errors, path.as_path(), error)?;
             }
         }
         if !stack.is_empty() {
@@ -1106,14 +1138,17 @@ fn remove_from_parent(
 fn read_directory_batch(
     fd: &rustix::fd::OwnedFd,
     buffer: &mut Vec<u8>,
+    pending: &mut Vec<DirectoryName>,
     state: &WorkerState,
     path: &Path,
     errors: &mut Vec<DeleteError>,
-) -> io::Result<(Vec<DirectoryName>, bool)> {
+) -> io::Result<bool> {
     use rustix::fs::{AtFlags, FileType, RawDir, statat};
     use rustix::io::Errno;
     use std::os::unix::ffi::OsStrExt;
-    let mut pending = Vec::new();
+    // The caller drains each batch before reading again. Retain its allocation
+    // for wide directory trees instead of rebuilding it for every getdents call.
+    debug_assert!(pending.is_empty());
     loop {
         let capacity = buffer.capacity();
         {
@@ -1121,7 +1156,7 @@ fn read_directory_batch(
             loop {
                 state.check_cancel()?;
                 let Some(entry) = entries.next() else {
-                    return Ok((pending, true));
+                    return Ok(true);
                 };
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -1129,12 +1164,12 @@ fn read_directory_batch(
                     Err(Errno::INVAL) if capacity < 1024 * 1024 => break,
                     Err(error) => {
                         record_error(errors, path, error.into())?;
-                        return Ok((pending, true));
+                        return Ok(true);
                     }
                 };
                 let bytes = entry.file_name().to_bytes();
                 if bytes != b"." && bytes != b".." {
-                    state.examined_entries.fetch_add(1, Ordering::Relaxed);
+                    state.examined();
                     let kind = entry.file_type();
                     let name = std::ffi::OsStr::from_bytes(bytes);
                     let mut is_directory = kind == FileType::Directory;
@@ -1167,7 +1202,7 @@ fn read_directory_batch(
                                         continue;
                                     }
                                     Err(error) => {
-                                        record_error(errors, &path.join(name), error)?;
+                                        record_error(errors, path.join(name), error)?;
                                         continue;
                                     }
                                 }
@@ -1184,7 +1219,7 @@ fn read_directory_batch(
                                     error,
                                     None,
                                 ) {
-                                    record_error(errors, &path.join(name), error)?;
+                                    record_error(errors, path.join(name), error)?;
                                 }
                             }
                         }
@@ -1197,7 +1232,7 @@ fn read_directory_batch(
                     }
                 }
                 if entries.is_buffer_empty() {
-                    return Ok((pending, false));
+                    return Ok(false);
                 }
             }
         }

@@ -94,7 +94,7 @@ pub struct Node {
     pub child_epoch: u64,
     pub parent_epoch: u64,
     scan_generation: u64,
-    suppression_cutoff: Option<u64>,
+    suppression_cutoff: u64,
     suppressed_subtrees: u64,
 }
 
@@ -103,6 +103,7 @@ impl Node {
     const READ_DONE: u8 = 2;
     const OVERFLOW_REPORTED: u8 = 4;
     const METADATA_UNCERTAIN: u8 = 8;
+    const SCAN_SUPPRESSED: u8 = 16;
 
     fn new(name: Arc<OsStr>, parent: Option<NodeId>, kind: NodeKind, sizes: Sizes) -> Self {
         let complete = kind != NodeKind::Directory;
@@ -124,7 +125,7 @@ impl Node {
             child_epoch: 0,
             parent_epoch: 0,
             scan_generation: 0,
-            suppression_cutoff: None,
+            suppression_cutoff: 0,
             suppressed_subtrees: 0,
         }
     }
@@ -139,6 +140,19 @@ impl Node {
 
     fn overflow_reported(&self) -> bool {
         self.flags & Self::OVERFLOW_REPORTED != 0
+    }
+
+    fn suppression_cutoff(&self) -> Option<u64> {
+        (self.flags & Self::SCAN_SUPPRESSED != 0).then_some(self.suppression_cutoff)
+    }
+
+    fn set_suppression_cutoff(&mut self, cutoff: Option<u64>) {
+        if let Some(cutoff) = cutoff {
+            self.suppression_cutoff = cutoff;
+            self.flags |= Self::SCAN_SUPPRESSED;
+        } else {
+            self.flags &= !Self::SCAN_SUPPRESSED;
+        }
     }
 
     fn set_read_done(&mut self, done: bool) {
@@ -328,8 +342,8 @@ impl Model {
         if !self.is_live(id) {
             return Vec::new();
         }
-        let already_suppressed = self.nodes[id as usize].suppression_cutoff.is_some();
-        self.nodes[id as usize].suppression_cutoff = Some(self.generation);
+        let already_suppressed = self.nodes[id as usize].suppression_cutoff().is_some();
+        self.nodes[id as usize].set_suppression_cutoff(Some(self.generation));
         let mut changed = Vec::new();
         let mut current = Some(id);
         while let Some(ancestor) = current {
@@ -435,7 +449,7 @@ impl Model {
         node.last_child = NO_NODE;
         node.child_epoch = epoch;
         node.scan_generation = generation;
-        node.suppression_cutoff = None;
+        node.set_suppression_cutoff(None);
         node.suppressed_subtrees = 0;
         self.directories.insert(id, DirectoryInfo::default());
         // Reopen only the completed part of the ancestor chain. An incomplete
@@ -481,7 +495,7 @@ impl Model {
         loop {
             if node.removed()
                 || node
-                    .suppression_cutoff
+                    .suppression_cutoff()
                     .is_some_and(|cutoff| generation <= cutoff)
             {
                 return false;
@@ -1440,6 +1454,27 @@ mod tests {
             error: None,
         });
         model
+    }
+
+    #[test]
+    fn suppression_cutoffs_preserve_zero_and_maximum_scan_generations() {
+        let mut model = model();
+        assert!(model.accepts_scan(ROOT, 0));
+        model.suppress_scan(ROOT);
+        assert_eq!(model.node(ROOT).suppression_cutoff(), Some(0));
+        assert!(!model.accepts_scan(ROOT, 0));
+        model.suppress_scan(ROOT);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
+
+        model.begin_rescan(ROOT, u64::MAX);
+        assert_eq!(model.node(ROOT).suppression_cutoff(), None);
+        assert!(model.accepts_scan(ROOT, u64::MAX));
+        assert!(!model.accepts_scan(ROOT, 0));
+        model.suppress_scan(ROOT);
+        assert_eq!(model.node(ROOT).suppression_cutoff(), Some(u64::MAX));
+        assert!(!model.accepts_scan(ROOT, u64::MAX));
+        model.suppress_scan(ROOT);
+        assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
     }
 
     #[test]
@@ -2713,7 +2748,7 @@ mod tests {
             });
             assert_eq!(model.mark_metadata_uncertain(1), vec![1, ROOT]);
             assert!(model.mark_metadata_uncertain(1).is_empty());
-            assert!(model.node(1).suppression_cutoff.is_none());
+            assert!(model.node(1).suppression_cutoff().is_none());
             assert!(!model.cancelled);
             model.apply(ScanEvent::Entries {
                 parent: 1,
@@ -2807,7 +2842,7 @@ mod tests {
         assert!(model.revision != revision);
         assert_eq!(model.node(ROOT).suppressed_subtrees, 1);
         assert_eq!(model.node(1).suppressed_subtrees, 1);
-        assert!(model.node(1).suppression_cutoff.is_some());
+        assert!(model.node(1).suppression_cutoff().is_some());
         assert!(model.has_partial_totals(1) && model.cancelled);
         assert!(
             model

@@ -73,7 +73,7 @@ impl OrderRow {
 
 struct SortedRows {
     ids: Vec<NodeId>,
-    positions: HashMap<NodeId, usize>,
+    positions: HashMap<NodeId, u32>,
 }
 
 struct RowState {
@@ -115,7 +115,11 @@ impl State {
         for (rank, state) in ranked.into_iter().enumerate() {
             state.rank = NonZeroUsize::new(rank + 1);
             ids.push(state.row.id);
-            positions.insert(state.row.id, rank);
+            // Each row has a distinct u32 node ID, so its zero-based rank fits.
+            positions.insert(
+                state.row.id,
+                u32::try_from(rank).expect("node rank fits u32"),
+            );
         }
         self.dirty = false;
         SortedRows { ids, positions }
@@ -217,7 +221,13 @@ pub struct CachedSnapshot {
     pub generation: u64,
     pub child_epoch: u64,
     pub ids: Vec<NodeId>,
-    pub positions: HashMap<NodeId, usize>,
+    pub positions: HashMap<NodeId, u32>,
+}
+
+impl CachedSnapshot {
+    pub fn position(&self, id: NodeId) -> Option<usize> {
+        self.positions.get(&id).map(|&rank| rank as usize)
+    }
 }
 
 enum CacheCommand {
@@ -243,7 +253,7 @@ type SharedCache = Arc<ArcSwap<PublishedCache>>;
 struct FilterRequest {
     revision: u64,
     directory: NodeId,
-    query: Arc<str>,
+    query: Box<str>,
     directories_only: bool,
 }
 
@@ -281,7 +291,7 @@ struct FilterTask {
     query: String,
     next: usize,
     ids: Vec<NodeId>,
-    positions: HashMap<NodeId, usize>,
+    positions: HashMap<NodeId, u32>,
 }
 
 #[derive(Default)]
@@ -359,7 +369,10 @@ impl FilterState {
                 {
                     continue;
                 }
-                task.positions.insert(id, task.ids.len());
+                task.positions.insert(
+                    id,
+                    u32::try_from(task.ids.len()).expect("filtered node rank fits u32"),
+                );
                 task.ids.push(id);
             }
         }
@@ -516,7 +529,7 @@ impl CachedOrderWorker {
         self.filter.request.store(Some(Arc::new(FilterRequest {
             revision: self.filter_revision,
             directory,
-            query: Arc::from(query),
+            query: Box::from(query),
             directories_only,
         })));
         let _ = self.sender.try_send(CacheCommand::Wake);
@@ -1856,7 +1869,7 @@ mod tests {
         mailbox.request.store(Some(Arc::new(FilterRequest {
             revision,
             directory: ROOT,
-            query: Arc::from(query),
+            query: Box::from(query),
             directories_only,
         })));
     }
