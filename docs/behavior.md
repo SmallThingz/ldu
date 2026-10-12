@@ -119,7 +119,7 @@ The native backend uses Rustix for buffered directory reads. `auto` falls back t
 
 Other platforms use the standard backend; explicit `native` requires Linux. The non-Linux backend rejects known symlink directories but cannot fully eliminate path-replacement races. File previews on Linux use the opened scan root. Other Unix systems reopen the root path, so directory replacement can change the preview; symlinks are not followed. Non-Unix systems show file metadata only.
 
-There is no io_uring backend. Performance depends on the filesystem, cache state and concurrent load; no universal speed claim is made. Review qualification and benchmark conditions are tracked in [REVIEW.md](../REVIEW.md).
+There is no io_uring backend. Performance depends on the filesystem, cache state and concurrent load; no universal speed claim is made.
 
 ## Upstream references
 

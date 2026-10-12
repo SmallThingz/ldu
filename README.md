@@ -1,7 +1,7 @@
 # ldu
 
 ![Rust](https://img.shields.io/badge/Rust-2024-a65f34?logo=rust&logoColor=ffffff)
-![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-495057)
+![Linux](https://img.shields.io/badge/platform-Linux-495057)
 ![Ratatui](https://img.shields.io/badge/TUI-Ratatui-526d82)
 
 Terminal disk-usage browser written in Rust. Browse folder sizes while a parallel scan runs.
@@ -18,9 +18,9 @@ Terminal disk-usage browser written in Rust. Browse folder sizes while a paralle
 
 ## Download
 
-Download an archive for your OS and architecture from [Releases](https://github.com/SmallThingz/ldu/releases/latest). Each archive contains the executable, license, and usage notes; `SHA256SUMS` lists the archive checksums. Linux downloads include glibc and statically linked musl builds; see the release notes for architectures and compatibility details.
+Download the Linux binary for your architecture from [Releases](https://github.com/SmallThingz/ldu/releases/latest), make it executable with `chmod +x`, and run it. Downloads include glibc and statically linked musl builds; see the release notes for architectures and compatibility details.
 
-Deletion requires Linux and accessible procfs. macOS supports browsing and previews; Windows supports browsing with metadata previews. On Windows, allocated size is approximated by apparent size and hard links are not deduplicated. See [platform details](docs/behavior.md#backends-and-platforms).
+Deletion requires accessible procfs. See [backend details](docs/behavior.md#backends-and-platforms).
 
 ## Build
 

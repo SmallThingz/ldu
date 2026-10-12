@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke-test and package release binaries (Python 3.11+, Git, Rust 1.99.0)."""
+"""Prepare and smoke-test Linux release binaries (Python 3.11+, Git, Rust 1.99.0)."""
 
 import argparse
 import datetime
-import gzip
 import hashlib
-import io
 import json
 import math
 import os
@@ -14,7 +12,6 @@ import platform
 import re
 import struct
 import subprocess
-import tarfile
 import tempfile
 import tomllib
 import zipfile
@@ -26,10 +23,6 @@ TARGETS = {
     "aarch64-unknown-linux-musl",
     "armv7-unknown-linux-musleabihf",
     "riscv64gc-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
 }
 TOOLCHAIN = "1.99.0"
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,9 +30,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def run(command, timeout=120):
     result = subprocess.run(
-        [str(part) for part in command], cwd=ROOT, check=True, timeout=timeout,
+        [str(part) for part in command], cwd=ROOT, check=False, timeout=timeout,
         stdout=subprocess.PIPE, text=True, encoding="utf-8",
     )
+    if result.returncode:
+        print(result.stdout, flush=True)
+        result.check_returncode()
     return result.stdout.strip()
 
 
@@ -53,8 +49,7 @@ def require(condition, message):
 
 
 def binary_for(target):
-    name = "ldu.exe" if "windows" in target else "ldu"
-    return ROOT / "target" / target / "release" / name
+    return ROOT / "target" / target / "release" / "ldu"
 
 
 def check_architecture(data, target):
@@ -110,11 +105,22 @@ def smoke(args, version, binary):
         paths = [root, *root.rglob("*")]
         expected = totals(paths)
         nested_expected = totals([nested, *nested.rglob("*")])
-        backends = ["auto", "native", "std"] if "linux" in args.target else ["auto", "std"]
+        backends = ["auto", "native", "std"]
         for backend in backends:
-            report = json.loads(run(command + [
+            scan_command = command + [
                 "--json", "--backend", backend, "--threads", "2", str(root),
-            ]))
+            ]
+            try:
+                report = json.loads(run(scan_command))
+            except subprocess.CalledProcessError:
+                if runner and Path(runner[0]).name.startswith("qemu-"):
+                    trace = subprocess.run(
+                        [runner[0], "-strace", *scan_command[1:]], cwd=ROOT,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, encoding="utf-8", errors="replace", timeout=30,
+                    )
+                    print(trace.stdout[-30000:], flush=True)
+                raise
             require(report["root"] == str(root), f"{backend}: wrong root")
             require(report["entries"] == len(paths) - 1, f"{backend}: wrong entry count")
             require(report["errors"] == 0 and report["cancelled"] is False,
@@ -155,6 +161,7 @@ def smoke(args, version, binary):
     }
     report_path = ROOT / ".tmp" / f"release-smoke-{args.target}.json"
     report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print("SMOKE_METADATA " + json.dumps(result, sort_keys=True), flush=True)
     print(f"Smoke passed: {args.target} ({' '.join(runner) if runner else 'native'})")
 
 
@@ -223,60 +230,45 @@ def runtime_licenses():
 
 def package(args, version, binary):
     data = binary.read_bytes()
-    smoke_path = ROOT / ".tmp" / f"release-smoke-{args.target}.json"
-    report = json.loads(smoke_path.read_text(encoding="utf-8"))
-    require(report["binary_sha256"] == digest(data) and report["version"] == version
-            and report["target"] == args.target, "Smoke report does not match this binary")
+    check_architecture(data, args.target)
     commit = run(["git", "rev-parse", "HEAD"])
     epoch = int(run(["git", "show", "-s", "--format=%ct", "HEAD"]))
-    files = dependency_licenses(args.target)
-    files.update(runtime_licenses())
-    files[binary.name] = data
-    for name in ["LICENSE", "README.md", "docs/behavior.md", f"docs/releases/v{version}.md"]:
-        files[name] = (ROOT / name).read_bytes()
-    prefix = f"ldu-v{version}-{args.target}"
+    notices = dependency_licenses(args.target)
+    notices.update(runtime_licenses())
+    notices["LICENSE"] = (ROOT / "LICENSE").read_bytes()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    if "windows" in args.target:
-        archive = output / f"{prefix}.zip"
-        # ZIP timestamps start in 1980 and have two-second resolution.
-        timestamp = datetime.datetime.fromtimestamp(max(epoch, 315532800), datetime.timezone.utc)
-        stamp = (timestamp.year, timestamp.month, timestamp.day,
-                 timestamp.hour, timestamp.minute, timestamp.second // 2 * 2)
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
-            for name, content in sorted(files.items()):
-                entry = zipfile.ZipInfo(f"{prefix}/{name}", date_time=stamp)
-                entry.create_system = 3
-                entry.external_attr = (0o100755 if name == binary.name else 0o100644) << 16
-                entry.compress_type = zipfile.ZIP_DEFLATED
-                handle.writestr(entry, content, compresslevel=9)
-    else:
-        archive = output / f"{prefix}.tar.gz"
-        with archive.open("wb") as raw:
-            with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0, compresslevel=9) as zipped:
-                with tarfile.open(fileobj=zipped, mode="w", format=tarfile.PAX_FORMAT) as handle:
-                    for name, content in sorted(files.items()):
-                        entry = tarfile.TarInfo(f"{prefix}/{name}")
-                        entry.size = len(content)
-                        entry.mode = 0o755 if name == binary.name else 0o644
-                        entry.mtime = epoch
-                        handle.addfile(entry, io.BytesIO(content))
-    archive_data = archive.read_bytes()
-    archive_hash = digest(archive_data)
-    archive.with_name(archive.name + ".sha256").write_text(
-        f"{archive_hash}  {archive.name}\n", encoding="utf-8",
-    )
+    released = output / f"ldu-v{version}-{args.target}"
+    require(released != binary, "Release destination must differ from the build output")
+    released.write_bytes(data)
+    # ELF loaders ignore trailing data. Keep required license texts compressed in
+    # the executable itself so downloads consist solely of runnable binaries.
+    # ZIP readers can inspect these notices without running the program.
+    timestamp = datetime.datetime.fromtimestamp(max(epoch, 315532800), datetime.timezone.utc)
+    stamp = (timestamp.year, timestamp.month, timestamp.day,
+             timestamp.hour, timestamp.minute, timestamp.second // 2 * 2)
+    with zipfile.ZipFile(released, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
+        for name, content in sorted(notices.items()):
+            entry = zipfile.ZipInfo(name, date_time=stamp)
+            entry.create_system = 3
+            entry.external_attr = 0o100644 << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            handle.writestr(entry, content, compresslevel=9)
+    released.chmod(0o755)
+    final = released.read_bytes()
     manifest = {
         "version": version, "target": args.target, "source_commit": commit,
         "source_date_epoch": epoch, "rustc": run(["rustc", f"+{TOOLCHAIN}", "-Vv"]),
         "release_profile": tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["profile"]["release"],
         "target_rustflags": os.environ.get("CARGO_TARGET_" + args.target.upper().replace("-", "_") + "_RUSTFLAGS", ""),
-        "binary": {"name": binary.name, "bytes": len(data), "sha256": digest(data)},
-        "archive": {"name": archive.name, "bytes": len(archive_data), "sha256": archive_hash},
-        "smoke": report,
+        "build_binary_sha256": digest(data),
+        "binary": {"name": released.name, "bytes": len(final), "sha256": digest(final)},
     }
-    (output / f"{prefix}.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"{archive.name}: {len(data):,} byte binary, {len(archive_data):,} byte archive")
+    (ROOT / ".tmp").mkdir(exist_ok=True)
+    (ROOT / ".tmp" / f"release-manifest-{args.target}.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print("BUILD_METADATA " + json.dumps(manifest, sort_keys=True), flush=True)
+    print(f"{released.name}: {len(final):,} bytes")
 
 
 def main():

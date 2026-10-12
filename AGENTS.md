@@ -16,4 +16,4 @@
 - Use project-relative paths for tools and `.tmp` for temporary fixtures. Never signal unrelated processes.
 - Root owns compiler runs, release qualification, commits and repository publication during parallel development.
 - Measure only after the host is quiet; do not claim universal speed wins from synthetic timings.
-- After the latest implementation is frozen and qualified, complete two consecutive fully saturated six-agent adversarial passes with no valid findings. A finding and its fix, or new user requirements, reset the clean-pass count. Interrupted or unsaturated attempts do not count. Record results in `REVIEW.md`.
+- After the latest implementation is frozen and qualified, complete two consecutive fully saturated six-agent adversarial passes with no valid findings. A finding and its fix, or new user requirements, reset the clean-pass count. Interrupted or unsaturated attempts do not count. Keep review results local under `.tmp/reviews/`; never commit them or include them in release assets.
