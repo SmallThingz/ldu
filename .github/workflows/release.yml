@@ -22,12 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            smoke: "[]"
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            smoke: "[]"
           - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
             smoke: "[]"
@@ -37,11 +31,9 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             smoke: '["qemu-arm"]'
-          - target: riscv64gc-unknown-linux-gnu
+          - target: riscv64gc-unknown-linux-musl
             os: ubuntu-24.04
-            # Invoke the cross loader directly: a sysroot prefix would redirect
-            # anchored opens of / away from the host's smoke-test fixture.
-            smoke: '["qemu-riscv64", "-L", "/", "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1", "--library-path", "/usr/riscv64-linux-gnu/lib"]'
+            smoke: '["qemu-riscv64"]'
     defaults:
       run:
         shell: bash
@@ -57,24 +49,20 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-self-contained=yes"
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-self-contained=yes"
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "-C link-self-contained=yes"
-      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+      # RISC-V musl does not enable crt-static by default.
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C link-self-contained=yes"
     steps:
       - name: Check out the source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Install ARM emulator
-        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+      - name: Install the emulator
+        if: matrix.target == 'armv7-unknown-linux-musleabihf' || matrix.target == 'riscv64gc-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y qemu-user
-
-      - name: Install RISC-V linker and emulator
-        if: matrix.target == 'riscv64gc-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
 
       - name: Install the pinned Rust toolchain
         run: |
@@ -82,7 +70,7 @@ jobs:
           rustup target add --toolchain 1.99.0 "$LDU_TARGET"
 
       - name: Build
-        # Cargo.toml enables opt-level 3, thin LTO, one codegen unit and symbol stripping.
+        # Cargo.toml enables opt-level 3, full LTO, one codegen unit and symbol stripping.
         # Keep the target's baseline CPU and unwind support.
         run: cargo +1.99.0 build --locked --release --bin ldu --target "$LDU_TARGET"
 
