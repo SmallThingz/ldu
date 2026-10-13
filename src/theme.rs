@@ -103,6 +103,7 @@ fn hex_digit(byte: u8) -> Result<u8, ParseColorError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
     pub accent: Color,
+    pub header_foreground: Color,
     pub warning_background: Color,
     pub warning_dialog_background: Color,
     pub warning_foreground: Color,
@@ -128,6 +129,10 @@ impl Theme {
         };
         Self {
             accent: support.resolve(accent.0),
+            header_foreground: match support {
+                ColorSupport::TrueColor => Color::Rgb(255, 255, 255),
+                _ => Color::White,
+            },
             warning_background,
             warning_dialog_background,
             warning_foreground: Color::White,
@@ -433,6 +438,19 @@ mod tests {
             assert_eq!(theme.warning_foreground, Color::White);
             assert_ne!(theme.warning_background, theme.warning_foreground);
             assert_ne!(theme.warning_dialog_background, theme.warning_foreground);
+        }
+    }
+    #[test]
+    fn header_white_uses_supported_color_depth() {
+        for (support, expected) in [
+            (ColorSupport::TrueColor, Color::Rgb(255, 255, 255)),
+            (ColorSupport::Indexed, Color::White),
+            (ColorSupport::Ansi, Color::White),
+        ] {
+            assert_eq!(
+                Theme::with_support(ThemeColor::default(), support).header_foreground,
+                expected
+            );
         }
     }
 }

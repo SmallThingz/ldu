@@ -206,7 +206,7 @@ fn delete_long_spaced_target_can_scroll_to_last_component_with_pinned_choices() 
         .unwrap();
     let last = rendered(&terminal);
     assert!(last.contains("Delete?") && last.contains("FINAL-TARGET-NAME"));
-    assert!(last.contains("y / Enter: delete") && last.contains("n / Esc: cancel"));
+    assert!(last.contains("Yes · Enter") && last.contains("Cancel · Esc"));
     assert!(matches!(
         app.key(
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -285,7 +285,7 @@ fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
             let screen = rendered(&terminal);
-            assert!(screen.contains("/fixture/root-file") && screen.contains("y / Enter: delete"));
+            assert!(screen.contains("/fixture/root-file") && screen.contains("Yes · Enter"));
             assert!(!screen.contains("Checking target"));
             for _ in 0..2 {
                 assert!(matches!(
@@ -1009,7 +1009,7 @@ fn configured_accent_reaches_directory_graphs_breadcrumbs_and_dialog_choices() {
         .unwrap();
     for option in app.dialog_mouse.options.iter().flatten() {
         assert_eq!(
-            terminal.backend().buffer()[(option.area.right() - 1, option.area.y)].fg,
+            terminal.backend().buffer()[(option.area.x + 2, option.area.y)].fg,
             Color::Magenta
         );
     }
@@ -1054,7 +1054,7 @@ fn pending_batch_confirmation_advances_once_after_identity_checks() {
 #[cfg(unix)]
 #[test]
 fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
-    for (width, height) in [(80, 4), (38, 6)] {
+    for (width, height) in [(80, 4), (38, 4)] {
         let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
         app.modal = Some(Modal::Delete {
             id: ROOT,
@@ -2466,7 +2466,7 @@ fn quit_key_keeps_reviewability_and_warning_shows_live_delete_progress() {
     assert!(matches!(app.key(quit, None, true), Action::QuitWarning));
     assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
     assert!(matches!(app.key(quit, None, true), Action::Continue));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 3)).unwrap();
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     assert!(matches!(
         app.key(
@@ -2480,10 +2480,9 @@ fn quit_key_keeps_reviewability_and_warning_shows_live_delete_progress() {
     terminal.backend_mut().resize(80, 12);
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     let text = rendered(&terminal);
-    assert!(text.contains("Exit after deletion?"));
-    assert!(text.contains("Finishing deletions before exit."));
+    assert!(text.contains("Finishing deletions"));
     assert!(text.contains("12 removed · 3 queued"));
-    assert!(text.contains("Enter / q: cancel and exit"));
+    assert!(text.contains("Exit now · Enter"));
     app.queue_view.status = "23 removed · 2 queued".to_owned();
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     assert!(rendered(&terminal).contains("23 removed · 2 queued"));
@@ -2492,7 +2491,7 @@ fn quit_key_keeps_reviewability_and_warning_shows_live_delete_progress() {
 
 #[test]
 fn second_ctrl_c_quits_before_first_paint_and_in_tiny_terminals() {
-    for dimensions in [None, Some((1, 1)), Some((80, 4))] {
+    for dimensions in [None, Some((1, 1)), Some((80, 3))] {
         let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
         app.modal = Some(Modal::Enqueueing);
         let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -2630,9 +2629,56 @@ fn queue_mouse_reorders_painted_waiting_jobs_in_both_directions() {
 
 #[cfg(unix)]
 #[test]
+fn queue_release_only_drag_reaches_both_ends_of_a_full_page() {
+    let area = Rect::new(0, 0, 100, 24);
+    for (source, target) in [(0, 14), (14, 0)] {
+        let (mut app, mut queue, ids) = queue_mouse_fixture(15, area);
+        assert_eq!(app.queue_view.rows.len(), 15);
+        let mouse = |kind, row: usize| MouseEvent {
+            kind,
+            column: queue_layout(area).2[1].x + 1,
+            row: queue_layout(area).2[1].y + row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.queue_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), source),
+            &mut queue,
+        );
+        // The release supplies the final endpoint when no drag event arrives.
+        assert!(matches!(
+            app.queue_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), target),
+                &mut queue
+            ),
+            Some(Action::Continue)
+        ));
+        let mut expected = ids.clone();
+        let moved = expected.remove(source);
+        expected.insert(target, moved);
+        assert_eq!(
+            queue
+                .pending()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(queue.is_paused());
+        assert!(app.queue_drag.is_none());
+        assert_eq!(app.queue_selection(), Some(moved));
+        app.sync_queue(&mut queue, area);
+        assert_eq!(app.queue_view.rows[target].0, moved);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
     let area = Rect::new(0, 0, 100, 24);
     let (mut app, mut queue, ids) = queue_mouse_fixture(100, area);
+    let painted_end = app.queue_view.rows.last().unwrap().0;
+    let first_offscreen = queue.next_id(painted_end).unwrap();
+    let second_offscreen = queue.next_id(first_offscreen).unwrap();
     let mouse = |kind, row| MouseEvent {
         kind,
         column: queue_layout(area).2[1].x + 1,
@@ -2650,7 +2696,12 @@ fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
         ),
         &mut queue,
     );
-    assert_eq!(queue.previous_id(ids[0]), Some(ids[12]));
+    assert_eq!(queue.previous_id(ids[0]), Some(painted_end));
+    assert_eq!(
+        queue.next_id(ids[0]),
+        Some(first_offscreen),
+        "entering the edge reaches the painted endpoint without moving past it"
+    );
     assert!(
         !app.pump_queue_drag(&mut queue),
         "edge entry must not immediately move another row"
@@ -2658,7 +2709,12 @@ fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
     app.sync_queue(&mut queue, area);
     app.queue_drag.as_mut().unwrap().next_step = Instant::now() - FRAME_INTERVAL;
     assert!(app.pump_queue_drag(&mut queue));
-    assert_eq!(queue.previous_id(ids[0]), Some(ids[13]));
+    assert_eq!(queue.previous_id(ids[0]), Some(first_offscreen));
+    assert_eq!(
+        queue.next_id(ids[0]),
+        Some(second_offscreen),
+        "one elapsed deadline moves exactly one offscreen entry"
+    );
     assert!(
         !app.pump_queue_drag(&mut queue),
         "repeated pumping must respect the deadline"
@@ -2666,10 +2722,13 @@ fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
     app.sync_queue(&mut queue, area);
     app.queue_drag.as_mut().unwrap().next_step = Instant::now() - FRAME_INTERVAL;
     assert!(app.pump_queue_drag(&mut queue));
-    assert_eq!(queue.previous_id(ids[0]), Some(ids[14]));
+    assert_eq!(queue.previous_id(ids[0]), Some(second_offscreen));
     app.sync_queue(&mut queue, area);
     assert_eq!(app.queue_view.rows.last().unwrap().0, ids[0]);
-    assert_eq!(app.queue_view.rows.len(), 15);
+    assert_eq!(
+        app.queue_view.rows.len(),
+        usize::from(app.queue_area.height)
+    );
     queue.remove_pending(ids[0]).unwrap();
     assert!(!app.pump_queue_drag(&mut queue));
     assert!(app.queue_drag.is_none());
@@ -2967,8 +3026,8 @@ fn queue_selection_follows_job_identity_after_reorder_and_neighbor_removal() {
     let screen = rendered(&terminal);
     assert!(screen.contains("Deletion queue"));
     assert!(screen.contains("unmodified-selected"));
-    assert!(screen.contains("Click / Space: resume waiting"));
-    assert!(screen.contains("Right-click / d: remove/cancel"));
+    assert!(screen.contains("Resume · Space"));
+    assert!(screen.contains("Remove · d"));
     assert!(!screen.contains("Pending paused"));
     assert!(!screen.contains("Pending running"));
     assert!(!screen.contains("Esc: close"));
@@ -3788,9 +3847,8 @@ fn confirmed_batch_admission_blocks_bypass_keys_and_guards_quit_immediately() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
         let text = rendered(&terminal);
-        assert!(text.contains("Enqueueing selection"));
-        assert!(text.contains("Adding selection to the queue."));
-        assert!(text.contains("stop adding"));
+        assert!(text.contains("Adding selection to queue"));
+        assert!(text.contains("Stop adding · Esc"));
         app.key(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             None,
@@ -5541,7 +5599,7 @@ fn full_visual_queue_rejects_overflow_and_preserves_coalescing() {
         let screen = rendered(&terminal);
         let header = screen.lines().next().unwrap();
         assert!(header.contains(&format!("{} selected", app.visual.len())));
-        assert!(header.contains("[D] delete") && header.contains("? help"));
+        assert!(header.contains("[d] delete") && header.contains("? help"));
         assert!(!header.contains("Input full") && !header.contains("Selecting"));
     }
 }
@@ -8794,7 +8852,7 @@ fn pending_batch_confirmation_keeps_input_and_cancel_remains_available() {
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
-            assert!(rendered(&terminal).contains("y / Enter: enqueue selected"));
+            assert!(rendered(&terminal).contains("Yes · Enter"));
             assert!(!rendered(&terminal).contains("Checking targets"));
             assert!(matches!(
                 app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false),
@@ -9090,8 +9148,8 @@ fn batch_confirmation_scrolls_long_targets_with_pinned_choices_and_resize_guard(
     let screen = rendered(&terminal);
     assert!(
         screen.contains("final-component")
-            && screen.contains("y / Enter: enqueue selected")
-            && screen.contains("n / Esc: cancel")
+            && screen.contains("Yes · Enter")
+            && screen.contains("Cancel · Esc")
     );
     terminal.backend_mut().resize(30, 5);
     terminal
@@ -11102,8 +11160,9 @@ fn breadcrumbs_highlight_and_navigate_only_on_matching_release() {
         modifiers: KeyModifiers::NONE,
     };
     assert!(rendered(&terminal).starts_with("/outside/fixture/folder/child-folder"));
+    assert_eq!(terminal.backend().buffer()[(1, 0)].fg, Color::Gray);
     assert!(
-        terminal.backend().buffer()[(1, 0)]
+        !terminal.backend().buffer()[(1, 0)]
             .modifier
             .contains(Modifier::DIM)
     );
@@ -11180,7 +11239,7 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     let app = browser_fixture_at(PathBuf::from("/outside/fixture"));
     let mut crumbs = Breadcrumbs::default();
     crumbs.sync(&app.root, &app.model, 5);
-    let line = crumbs.line(25, Rect::new(0, 0, 25, 1), false, Color::Cyan);
+    let line = crumbs.line(25, Rect::new(0, 0, 25, 1), false, Color::Cyan, Color::White);
     assert_eq!(line.to_string(), "…/folder/child-folder");
     assert_eq!(
         crumbs.hits.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
@@ -11189,7 +11248,7 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     assert!(crumbs.hits.iter().all(|(area, _)| area.x >= 2));
     assert_eq!(
         crumbs
-            .line(8, Rect::new(0, 0, 8, 1), false, Color::Cyan)
+            .line(8, Rect::new(0, 0, 8, 1), false, Color::Cyan, Color::White)
             .to_string(),
         "…-folder"
     );
@@ -11201,7 +11260,7 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     let mut root = Breadcrumbs::default();
     root.sync(&app.root, &app.model, ROOT);
     assert_eq!(
-        root.line(10, Rect::new(0, 0, 10, 1), false, Color::Cyan)
+        root.line(10, Rect::new(0, 0, 10, 1), false, Color::Cyan, Color::White)
             .to_string(),
         "…/fixture"
     );
@@ -11215,7 +11274,9 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
     crumbs.sync(&app.root, &app.model, 1);
     let area = Rect::new(4, 2, 80, 1);
     assert_eq!(
-        crumbs.line(80, area, false, Color::Cyan).to_string(),
+        crumbs
+            .line(80, area, false, Color::Cyan, Color::White)
+            .to_string(),
         "/outside/界\\nroot/folder"
     );
     let root = crumbs.hits.iter().find(|(_, id)| *id == ROOT).unwrap().0;
@@ -11227,7 +11288,7 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
             .any(|(hit, _)| hit.contains(ratatui::layout::Position::new(root.right(), area.y)))
     );
     for width in 0..80 {
-        let line = crumbs.line(width, area, false, Color::Cyan);
+        let line = crumbs.line(width, area, false, Color::Cyan, Color::White);
         assert!(line.width() <= width);
         assert!(
             crumbs.hits.iter().all(
@@ -11239,7 +11300,7 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
     crumbs.sync(&app.root, &app.model, ROOT);
     assert_eq!(
         crumbs
-            .line(1, Rect::new(0, 0, 1, 1), false, Color::Cyan)
+            .line(1, Rect::new(0, 0, 1, 1), false, Color::Cyan, Color::White)
             .to_string(),
         "/"
     );
@@ -11306,7 +11367,7 @@ fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
         *state = ready;
         let text = header(&mut app, &mut queue, batch.as_ref());
         assert!(
-            text.contains("1 selected") && text.contains("[D] delete") && text.contains("? help")
+            text.contains("1 selected") && text.contains("[d] delete") && text.contains("? help")
         );
         assert!(
             !text.contains("deleting…") && !text.contains("queued"),
@@ -11316,7 +11377,7 @@ fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
     let queued = queue.enqueue(2, Arc::clone(&anchor), "root-file".into());
     assert!(queued.inserted);
     let text = header(&mut app, &mut queue, batch.as_ref());
-    assert!(text.contains("1 selected") && text.contains("[D] delete"));
+    assert!(text.contains("1 selected") && text.contains("[d] delete"));
     assert!(queue.remove_pending(queued.id).is_some());
     assert!(matches!(
         app.key(
@@ -11368,7 +11429,7 @@ fn visual_header_restores_controls_without_idle_selection_hints() {
             let screen = rendered(&terminal);
             let header = screen.lines().next().unwrap();
             assert!(header.contains("1 selected") && header.contains("? help"));
-            assert!(header.contains("[D] delete"));
+            assert!(header.contains("[d] delete"));
             assert!(!header.contains("Esc clear") && !header.contains("Visual"));
             assert!(!header.contains("Selecting") && !header.contains("removed"));
             assert!(!header.contains("v select") && !header.contains("D queue"));
@@ -13197,10 +13258,10 @@ fn header_controls_use_exact_labels_and_preserve_visual_and_filter_modes() {
     app.queue_view.status = "2 queued".to_owned();
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     assert_eq!(app.help_area.width, 6);
-    assert_eq!(app.header_queue_area.width, 3);
+    assert_eq!(app.header_queue_area.width, 12);
     let help = app.help_area;
     let queue = app.header_queue_area;
-    for (area, text) in [(help, "? help"), (queue, "[D]")] {
+    for (area, text) in [(help, "? help"), (queue, "2 queued [D]")] {
         for (column, expected) in text.chars().enumerate() {
             assert_eq!(
                 terminal.backend().buffer()[(area.x + column as u16, area.y)].symbol(),
@@ -13425,6 +13486,161 @@ fn dialog_close_controls_follow_cancel_fifo_and_shutdown_semantics() {
 }
 
 #[test]
+fn outside_dialog_clicks_cancel_noncritical_modals_but_preserve_error_reports() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    let dialogs = [
+        Modal::help(false),
+        Modal::Queue {
+            selected: None,
+            offset: None,
+        },
+        Modal::Delete {
+            id: 1,
+            anchor,
+            relative: PathBuf::from("child"),
+            target: "child".to_owned(),
+            scroll: 0,
+            reviewable: false,
+            confirm_requested: true,
+            confirmed: None,
+            capture: None,
+            guard_until: None,
+        },
+        Modal::Batch {
+            target: "selected".to_owned(),
+            count: 3,
+            ready: false,
+            reviewable: false,
+            confirm_requested: true,
+            scroll: 0,
+        },
+        Modal::ConfirmQuit {
+            previous: Box::new(None),
+            reviewable: false,
+        },
+    ];
+    let outside = Rect::new(0, 23, 1, 1);
+    for (index, dialog) in dialogs.into_iter().enumerate() {
+        app.modal = Some(dialog);
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert!(
+            !app.dialog_mouse
+                .popup
+                .contains(ratatui::layout::Position::new(outside.x, outside.y))
+        );
+        assert!(matches!(
+            app.modal_option_mouse(
+                control_event(MouseEventKind::Down(MouseButton::Left), outside),
+                true
+            ),
+            Some(Action::Continue)
+        ));
+        assert!(app.modal.is_some(), "press alone must not dismiss");
+        let action = app.modal_option_mouse(
+            control_event(MouseEventKind::Up(MouseButton::Left), outside),
+            true,
+        );
+        assert!(if index == 3 {
+            matches!(action, Some(Action::BatchCancel))
+        } else {
+            matches!(action, Some(Action::Continue))
+        });
+        assert!(app.modal.is_none());
+    }
+    for dialog in [
+        Modal::Enqueueing,
+        Modal::Quit { reviewable: false },
+        Modal::Stopping,
+        Modal::notice("Selection incomplete", "Keep this warning".to_owned()),
+    ] {
+        app.modal = Some(dialog);
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert!(
+            app.modal_option_mouse(
+                control_event(MouseEventKind::Down(MouseButton::Left), outside),
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            app.modal_option_mouse(
+                control_event(MouseEventKind::Up(MouseButton::Left), outside),
+                true
+            )
+            .is_none()
+        );
+        assert!(app.modal.is_some());
+    }
+    app.modal = None;
+    app.delete_notices.push_back(DeleteReport::single(
+        PathBuf::from("failed"),
+        "permission denied".to_owned(),
+    ));
+    app.show_delete_notice();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            app.modal_option_mouse(control_event(kind, outside), false)
+                .is_none()
+        );
+    }
+    assert_eq!(app.delete_notices.len(), 1);
+    assert!(matches!(app.modal, Some(Modal::DeleteErrors { .. })));
+}
+
+#[test]
+fn outside_dialog_dismissal_rejects_drag_resize_and_replacement() {
+    for interruption in 0..3 {
+        let mut app = browser_fixture();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        app.modal = Some(Modal::help(false));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let outside = Rect::new(0, 23, 1, 1);
+        app.modal_option_mouse(
+            control_event(MouseEventKind::Down(MouseButton::Left), outside),
+            false,
+        );
+        match interruption {
+            0 => {
+                app.modal_option_mouse(
+                    control_event(MouseEventKind::Drag(MouseButton::Left), outside),
+                    false,
+                );
+            }
+            1 => {
+                terminal.backend_mut().resize(70, 24);
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+            }
+            _ => {
+                app.modal = Some(Modal::Queue {
+                    selected: None,
+                    offset: None,
+                });
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+            }
+        }
+        app.modal_option_mouse(
+            control_event(MouseEventKind::Up(MouseButton::Left), outside),
+            false,
+        );
+        assert!(app.modal.is_some(), "interruption={interruption}");
+    }
+}
+
+#[test]
 fn selected_count_hover_keeps_hitbox_and_clear_exits_even_while_selection_waits() {
     let mut app = browser_fixture();
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
@@ -13439,7 +13655,7 @@ fn selected_count_hover_keeps_hitbox_and_clear_exits_even_while_selection_waits(
         assert!(before.width >= 10);
         let header = rendered(&terminal).lines().next().unwrap().to_owned();
         assert!(header.contains(&format!("{count} selected")));
-        assert!(header.contains("[D] delete"));
+        assert!(header.contains("[d] delete"));
         assert!(
             !header.contains("Selecting")
                 && !header.contains("Visual")
@@ -13470,7 +13686,7 @@ fn selected_count_hover_keeps_hitbox_and_clear_exits_even_while_selection_waits(
             (
                 app.header_delete_area,
                 if app.header_delete_area.width == 10 {
-                    "[D] delete"
+                    "[d] delete"
                 } else {
                     "delete"
                 },
@@ -14069,6 +14285,313 @@ fn quit_prompt_suspends_auto_confirmation_but_keeps_validation_results() {
             ..
         })
     ));
+}
+
+#[test]
+fn render_header_uses_readable_colors_and_adjacent_selection_action() {
+    let mut app = browser_fixture_at(PathBuf::from("/outside/fixture"));
+    app.theme.header_foreground = Color::Rgb(255, 255, 255);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let root = app
+        .breadcrumbs
+        .hits
+        .iter()
+        .find(|(_, id)| *id == ROOT)
+        .unwrap()
+        .0;
+    assert_eq!(buffer[(root.x, root.y)].fg, Color::Rgb(255, 255, 255));
+    assert_eq!(buffer[(1, 0)].fg, Color::Gray);
+    assert!(!buffer[(1, 0)].modifier.contains(Modifier::DIM));
+    app.visual.enter(ROOT, None);
+    app.visual.toggle(1);
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(
+        app.header_delete_area.x,
+        app.selection_clear_area.right() + 2
+    );
+    assert_eq!(app.header_delete_area.width, 10);
+    assert!(
+        rendered(&terminal)
+            .lines()
+            .next()
+            .unwrap()
+            .contains("1 selected  [d] delete")
+    );
+    app.visual.exit();
+    app.queue_view.pending = 12;
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let queue = app.header_queue_area;
+    assert_eq!(queue.width, 13);
+    for x in queue.x..queue.right() {
+        assert_eq!(
+            app.control_at(x, queue.y, true).map(|(control, _)| control),
+            Some(MouseControl::Queue)
+        );
+    }
+}
+
+#[test]
+fn render_dialog_buttons_share_a_row_and_scroll_controls_use_only_overflow_border() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    app.modal = Some(Modal::Batch {
+        target: "/fixture".to_owned(),
+        count: 1,
+        ready: true,
+        reviewable: false,
+        confirm_requested: false,
+        scroll: 0,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let options: Vec<_> = app.dialog_mouse.options.iter().flatten().copied().collect();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[0].area.y, options[1].area.y);
+    assert!(rendered(&terminal).contains("[ Yes · Enter ]  [ Cancel · Esc ]"));
+    assert!(!rendered(&terminal).contains("PgUp/PgDn"));
+    assert_eq!(app.dialog_mouse.popup.height, 5);
+    app.modal = Some(Modal::Text {
+        title: "Info",
+        text: "Fits on one line".to_owned(),
+        scroll: 0,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(app.dialog_mouse.popup.height, 3);
+    assert!(app.dialog_mouse.options.iter().all(Option::is_none));
+    app.modal = Some(Modal::help(false));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let down = app
+        .dialog_mouse
+        .options
+        .iter()
+        .flatten()
+        .find(|option| option.key.code == KeyCode::Down)
+        .unwrap();
+    assert_eq!(down.area.y, app.dialog_mouse.popup.bottom() - 1);
+    assert!(rendered(&terminal).contains("wheel · PgUp/PgDn"));
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Down, false),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(app.modal, Some(Modal::Text { scroll: 1, .. })));
+}
+
+#[test]
+fn render_error_dialog_hints_reflect_visible_content_overflow() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    app.delete_notices.push_back(DeleteReport::single(
+        PathBuf::from("/fixture/item"),
+        "permission denied".to_owned(),
+    ));
+    app.modal = Some(Modal::DeleteErrors {
+        scroll: 0,
+        horizontal: 0,
+        page: 1,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(app.dialog_mouse.popup.height, 7);
+    assert!(app.dialog_mouse.options.iter().all(Option::is_none));
+    app.delete_notices.front_mut().unwrap().errors = (0..100)
+        .map(|index| DeleteError {
+            path: PathBuf::from(format!(
+                "/fixture/{}/entry-{index}",
+                "long-path-".repeat(12)
+            )),
+            message: "permission denied".to_owned(),
+        })
+        .collect();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    for key in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+        let option = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == key)
+            .unwrap();
+        assert_eq!(option.area.y, app.dialog_mouse.popup.bottom() - 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn render_two_row_confirmation_keeps_refusal_and_close_without_affirmative_choices() {
+    for kind in 0..4 {
+        let mut app = browser_fixture();
+        app.modal = Some(match kind {
+            0 => Modal::Batch {
+                target: "/fixture".to_owned(),
+                count: 1,
+                ready: true,
+                reviewable: true,
+                confirm_requested: true,
+                scroll: 0,
+            },
+            1 => Modal::Delete {
+                id: 1,
+                anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
+                relative: PathBuf::from("never-delete"),
+                target: "/fixture/never-delete".to_owned(),
+                scroll: 0,
+                reviewable: true,
+                confirm_requested: true,
+                confirmed: None,
+                capture: None,
+                guard_until: None,
+            },
+            2 => Modal::ConfirmQuit {
+                previous: Box::new(None),
+                reviewable: true,
+            },
+            _ => Modal::Quit { reviewable: true },
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 2)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(rendered(&terminal).contains("Resize to review"));
+        assert!(
+            !app.dialog_mouse
+                .options
+                .iter()
+                .flatten()
+                .any(|option| option.key.code == KeyCode::Enter)
+        );
+        assert!(matches!(
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false
+            ),
+            Action::Continue
+        ));
+        assert!(app.modal.is_some());
+        let close = app.dialog_close_area;
+        assert_eq!(
+            terminal.backend().buffer()[(close.x + 1, close.y)].symbol(),
+            "x"
+        );
+        let action = click_control(&mut app, close, false);
+        if kind == 0 {
+            // Batch cancellation also retires its asynchronous selection work.
+            assert!(matches!(action, Some(Action::BatchCancel)));
+        } else {
+            assert!(matches!(action, Some(Action::Continue)));
+        }
+        assert!(app.modal.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn render_narrow_queue_wraps_both_buttons_and_keeps_remove_clickable() {
+    for width in [20, 32, 35, 80] {
+        for paused in [false, true] {
+            let area = Rect::new(0, 0, width, 12);
+            let (mut app, mut queue, ids) = queue_mouse_fixture(3, area);
+            if !paused {
+                queue.toggle_pause();
+            }
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.sync_queue(&mut queue, frame.area());
+                    app.draw(frame, false, true);
+                })
+                .unwrap();
+            let option = |code| {
+                app.dialog_mouse
+                    .options
+                    .iter()
+                    .flatten()
+                    .find(|option| option.key.code == code)
+                    .unwrap()
+                    .area
+            };
+            let pause = option(KeyCode::Char(' '));
+            let remove = option(KeyCode::Char('d'));
+            let wrapped = width < 35 || (width == 35 && paused);
+            assert_eq!(remove.y, pause.y + u16::from(wrapped));
+            assert_eq!(remove.height, 1);
+            assert!(rendered(&terminal).contains("[ Remove · d ]"));
+            assert_eq!(
+                rendered(&terminal).contains("Click: pause/resume"),
+                !wrapped
+            );
+            assert_eq!(app.queue_area, queue_layout(area).2[1]);
+            assert_eq!(app.queue_selection(), Some(ids[0]));
+            assert!(matches!(
+                click_dialog_option(&mut app, KeyCode::Char('d'), true),
+                Some(Action::QueueDelete)
+            ));
+            assert_eq!(app.queue_selection(), Some(ids[0]));
+            queue
+                .remove_pending(app.queue_selection().unwrap())
+                .unwrap();
+            app.sync_queue(&mut queue, area);
+            assert_eq!(app.queue_selection(), Some(ids[1]));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn render_tiny_queue_never_places_footer_controls_outside_painted_rows() {
+    let area = Rect::new(0, 0, 32, 5);
+    let (mut app, mut queue, _) = queue_mouse_fixture(3, area);
+    for width in [1, 2, 4, 10, 20, 32] {
+        for height in 1..=5 {
+            let area = Rect::new(0, 0, width, height);
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.sync_queue(&mut queue, frame.area());
+                    app.draw(frame, false, true);
+                })
+                .unwrap();
+            let footer = queue_layout(area).2[2];
+            for option in app
+                .dialog_mouse
+                .options
+                .iter()
+                .flatten()
+                .filter(|option| matches!(option.key.code, KeyCode::Char(' ' | 'd')))
+            {
+                assert_eq!(option.area.height, 1);
+                assert!(option.area.x >= footer.x && option.area.right() <= footer.right());
+                assert!(option.area.y >= footer.y && option.area.bottom() <= footer.bottom());
+                let label: String = (option.area.x..option.area.right())
+                    .map(|x| terminal.backend().buffer()[(x, option.area.y)].symbol())
+                    .collect();
+                assert_eq!(
+                    label,
+                    if option.key.code == KeyCode::Char('d') {
+                        "[ Remove · d ]"
+                    } else {
+                        "[ Resume · Space ]"
+                    }
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -307,9 +307,10 @@ struct DialogOptionPress {
 struct DialogMouse {
     accent: Color,
     guard_warning: bool,
-    options: [Option<DialogOption>; 4],
+    options: [Option<DialogOption>; 6],
     press: Option<DialogOptionPress>,
     hovered: Option<KeyEvent>,
+    popup: Rect,
     scroll_area: Rect,
     scroll_max: usize,
 }
@@ -697,7 +698,14 @@ impl Breadcrumbs {
         });
     }
 
-    fn line(&mut self, width: usize, area: Rect, modal: bool, accent: Color) -> Line<'static> {
+    fn line(
+        &mut self,
+        width: usize,
+        area: Rect,
+        modal: bool,
+        accent: Color,
+        foreground: Color,
+    ) -> Line<'static> {
         self.hits.clear();
         let mut line = Line::default();
         if width == 0 || area.height == 0 {
@@ -716,7 +724,7 @@ impl Breadcrumbs {
                 self.add_hit(area, 1, shown - 1, target);
                 line.spans.push(Span::styled(
                     text['…'.len_utf8()..].to_owned(),
-                    self.style(target, modal, accent),
+                    self.style(target, modal, accent, foreground),
                 ));
             }
             return line;
@@ -745,7 +753,7 @@ impl Breadcrumbs {
             let part_width = part.width;
             line.spans.push(Span::styled(
                 part.text.clone(),
-                self.style(target, modal, accent),
+                self.style(target, modal, accent, foreground),
             ));
             self.add_hit(area, offset, part_width, target);
             offset += part_width;
@@ -753,16 +761,26 @@ impl Breadcrumbs {
         line
     }
 
-    fn style(&self, target: Option<NodeId>, modal: bool, accent: Color) -> Style {
+    fn style(
+        &self,
+        target: Option<NodeId>,
+        modal: bool,
+        accent: Color,
+        foreground: Color,
+    ) -> Style {
         if target.is_none() {
-            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+            Style::default()
+                .fg(Color::Gray)
+                .remove_modifier(Modifier::DIM)
         } else if !modal && self.hovered == target {
             Style::default()
                 .bg(accent)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default()
+                .fg(foreground)
+                .remove_modifier(Modifier::DIM)
         }
     }
 
@@ -3296,7 +3314,7 @@ impl App {
         if steps == 0 {
             return;
         }
-        for _ in 0..steps.min(12) {
+        for _ in 0..steps {
             if !queue.move_pending(id, direction) {
                 return;
             }
@@ -4248,9 +4266,31 @@ impl App {
                     .flatten()
                     .copied()
                     .find(|option| option.area.contains(position))
+                    .or_else(|| {
+                        (matches!(
+                            self.modal,
+                            Some(
+                                Modal::Text {
+                                    title: "Help" | "Info",
+                                    ..
+                                } | Modal::Queue { .. }
+                                    | Modal::Delete { .. }
+                                    | Modal::Batch { .. }
+                                    | Modal::ConfirmQuit { .. }
+                            )
+                        ) && !self.dialog_mouse.popup.is_empty()
+                            && self.control_frame.contains(position)
+                            && !self.dialog_mouse.popup.contains(position))
+                        .then_some(DialogOption {
+                            key: KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            area: Rect::new(mouse.column, mouse.row, 1, 1),
+                        })
+                    })
             })
             .flatten();
-        self.dialog_mouse.hovered = hit.map(|option| option.key);
+        self.dialog_mouse.hovered = hit
+            .filter(|option| self.dialog_mouse.options.contains(&Some(*option)))
+            .map(|option| option.key);
         if let Some(press) = self.dialog_mouse.press {
             if press.dialog != dialog
                 || (matches!(self.modal, Some(Modal::Queue { .. }))
@@ -5195,20 +5235,22 @@ impl App {
         let header = Rect::new(area.x, area.y, area.width, area.height.min(1));
         let visual = self.visual.active();
         let selection_label = visual.then(|| format!("{} selected", self.visual.len()));
-        let hint = if let Some(count) = selection_label.as_ref() {
-            ["[D] delete  ? help", "delete  ? help", "delete"]
-                .into_iter()
-                .find(|hint| count.len() + hint.len() + 2 <= usize::from(area.width))
-                .unwrap_or("")
+        let available = usize::from(area.width);
+        let count_width = selection_label.as_ref().map_or(0, String::len);
+        let (delete_label, hint) = if visual {
+            if count_width + 2 + 10 + 2 + 6 <= available {
+                ("[d] delete", "? help")
+            } else if count_width + 2 + 6 + 2 + 6 <= available {
+                ("delete", "? help")
+            } else if count_width + 2 + 10 <= available {
+                ("[d] delete", "")
+            } else if count_width + 2 + 6 <= available {
+                ("delete", "")
+            } else {
+                ("", "")
+            }
         } else {
-            "? help"
-        };
-        let delete_label = if hint.starts_with("[D]") {
-            "[D] delete"
-        } else if hint.starts_with("delete") {
-            "delete"
-        } else {
-            ""
+            ("", "? help")
         };
         let columns = split_edges(
             header,
@@ -5245,14 +5287,11 @@ impl App {
         } else {
             self.phase(refreshing, false).to_owned()
         };
+        if visual && !delete_label.is_empty() {
+            let _ = write!(phase_text, "  {delete_label}");
+        }
         if (!self.filter_editing || visual) && !self.filter.is_empty() {
             let _ = write!(phase_text, " · /{}", self.filter);
-        }
-        if busy && !visual {
-            if self.filter_editing {
-                let _ = write!(phase_text, " · {queue_status}");
-            }
-            phase_text.push_str(" [D]");
         }
         let width = usize::from(columns[1].width);
         let phase_budget = if visual || self.filter_editing {
@@ -5260,11 +5299,24 @@ impl App {
         } else {
             width.saturating_sub(width.min(12) + 2)
         };
-        let phase_text = if busy && !visual && phase_budget >= 4 {
-            format!(
-                "{} [D]",
-                clipped(phase_text.trim_end_matches(" [D]"), phase_budget - 4)
-            )
+        let queue_label = if busy && !visual && phase_budget >= 4 {
+            format!("{} [D]", clipped(&queue_status, phase_budget - 4))
+        } else {
+            String::new()
+        };
+        let phase_text = if !queue_label.is_empty() {
+            let queue_width = Line::from(queue_label.as_str()).width();
+            let filter_width = phase_budget.saturating_sub(queue_width + 3);
+            if filter_width > 0 && (self.filter_editing || !self.filter.is_empty()) {
+                let filter_text = if self.filter_editing {
+                    phase_text.clone()
+                } else {
+                    format!("/{}", self.filter)
+                };
+                format!("{} · {queue_label}", clipped(&filter_text, filter_width))
+            } else {
+                queue_label.clone()
+            }
         } else {
             clipped(&phase_text, phase_budget)
         };
@@ -5278,6 +5330,7 @@ impl App {
             columns[1],
             self.modal.is_some(),
             self.theme.accent,
+            self.theme.header_foreground,
         );
         if label.width() > 0 && !phase.is_empty() {
             label.spans.push(Span::raw("  "));
@@ -5285,7 +5338,10 @@ impl App {
         let phase_offset = label.width();
         label.spans.push(Span::raw(phase.to_owned()));
         let label_width = label.width();
-        let header_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+        let header_style = Style::default()
+            .bg(Color::DarkGray)
+            .fg(self.theme.header_foreground)
+            .remove_modifier(Modifier::DIM);
         if self.filter_editing && self.modal.is_none() && columns[1].width > 0 {
             let x = label_width.min(usize::from(columns[1].width - 1));
             frame.set_cursor_position((columns[1].x + x as u16, columns[1].y));
@@ -5308,32 +5364,33 @@ impl App {
         } else {
             Rect::default()
         };
-        self.header_queue_area = if busy
-            && !visual
-            && phase.ends_with("[D]")
-            && label_width >= 3
+        let queue_width = Line::from(queue_label.as_str()).width();
+        self.header_queue_area = if !queue_label.is_empty()
+            && phase.ends_with(&queue_label)
             && label_width <= usize::from(columns[1].width)
         {
             Rect::new(
-                columns[1].x + label_width as u16 - 3,
+                columns[1].x + (label_width - queue_width) as u16,
                 columns[1].y,
-                3,
+                queue_width as u16,
                 columns[1].height,
             )
         } else {
             Rect::default()
         };
-        self.header_delete_area =
-            if !delete_label.is_empty() && columns[2].width >= hint.len() as u16 {
-                Rect::new(
-                    columns[2].right() - hint.len() as u16,
-                    columns[2].y,
-                    delete_label.len() as u16,
-                    columns[2].height,
-                )
-            } else {
-                Rect::default()
-            };
+        self.header_delete_area = if !delete_label.is_empty()
+            && count_width + 2 + delete_label.len() <= phase_budget
+            && label_width <= width
+        {
+            Rect::new(
+                columns[1].x + (phase_offset + count_width + 2) as u16,
+                columns[1].y,
+                delete_label.len() as u16,
+                columns[1].height,
+            )
+        } else {
+            Rect::default()
+        };
         self.selection_clear_area = if let Some(label) = selection_label
             .as_ref()
             .filter(|label| label.len() <= phase_budget && label_width <= width)
@@ -5359,7 +5416,11 @@ impl App {
         }
         for (control, label, hitbox) in [
             (MouseControl::Help, "? help", self.help_area),
-            (MouseControl::Queue, "[D]", self.header_queue_area),
+            (
+                MouseControl::Queue,
+                queue_label.as_str(),
+                self.header_queue_area,
+            ),
             (
                 MouseControl::VisualDelete,
                 delete_label,
@@ -5722,7 +5783,7 @@ impl App {
                 .bg(self.theme.warning_background)
                 .fg(self.theme.warning_foreground);
             frame.buffer_mut().set_style(area, style);
-            let popup = self.dialog_mouse.scroll_area;
+            let popup = self.dialog_mouse.popup;
             if !popup.is_empty() {
                 frame
                     .buffer_mut()
@@ -5754,22 +5815,6 @@ fn spinner_frame(tick: u128) -> &'static str {
     FRAMES[(tick % FRAMES.len() as u128) as usize]
 }
 
-fn controls(keys: &'static str, action: &'static str, accent: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            keys,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            action,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-    ])
-}
-
-/// Split fixed edges around the remaining space without a general layout solver.
 fn split_edges(area: Rect, direction: Direction, leading: u16, trailing: u16) -> [Rect; 3] {
     let available = match direction {
         Direction::Horizontal => area.width,
@@ -5796,6 +5841,8 @@ fn split_edges(area: Rect, direction: Direction, leading: u16, trailing: u16) ->
 fn queue_layout(area: Rect) -> (Rect, Rect, [Rect; 3]) {
     let popup = centered(area, area.width.min(76), area.height.min(20));
     let inner = Block::bordered().inner(popup);
+    // Two footer rows hold either both buttons plus the mouse hint, or the
+    // stacked buttons alone when the terminal is narrow.
     let regions = split_edges(inner, Direction::Vertical, 1, 2);
     (popup, inner, regions)
 }
@@ -5819,22 +5866,136 @@ fn dialog_close_area(popup: Rect) -> Rect {
     Rect::new(popup.right() - border - width, popup.y, width, 1)
 }
 
-fn dialog_option(
-    mouse: &mut DialogMouse,
-    area: Rect,
-    row: u16,
-    key: KeyEvent,
-    keys: &'static str,
-    action: &'static str,
-) -> Line<'static> {
-    let mut line = controls(keys, action, mouse.accent);
-    mouse.option(area, row, key, &line);
-    if mouse.hovered == Some(key) {
-        for span in &mut line.spans {
-            span.style = mouse_control_style(span.style, true, mouse.accent);
+#[derive(Clone, Copy)]
+struct DialogButton {
+    key: Option<KeyEvent>,
+    label: &'static str,
+    hint: &'static str,
+}
+
+impl DialogButton {
+    fn new(code: KeyCode, label: &'static str, hint: &'static str) -> Self {
+        Self {
+            key: Some(KeyEvent::new(code, KeyModifiers::NONE)),
+            label,
+            hint,
         }
     }
-    line
+
+    fn width(self) -> usize {
+        Line::from(self.label).width()
+            + 4
+            + if self.hint.is_empty() {
+                0
+            } else {
+                Line::from(self.hint).width() + 3
+            }
+    }
+}
+
+fn dialog_button_rows(width: u16, buttons: &[DialogButton]) -> u16 {
+    let needed = buttons.iter().map(|button| button.width()).sum::<usize>()
+        + buttons.len().saturating_sub(1) * 2;
+    if needed <= usize::from(width) {
+        1
+    } else {
+        buttons.len() as u16
+    }
+}
+
+fn draw_dialog_buttons(
+    frame: &mut Frame<'_>,
+    mouse: &mut DialogMouse,
+    area: Rect,
+    buttons: &[DialogButton],
+    style: Style,
+) {
+    let rows = dialog_button_rows(area.width, buttons);
+    let mut x = area.x;
+    for (index, button) in buttons.iter().enumerate() {
+        let y = area.y + if rows == 1 { 0 } else { index as u16 };
+        let rect = Rect::new(
+            x,
+            y,
+            area.right().saturating_sub(x),
+            u16::from(y < area.bottom()),
+        );
+        let mut line = Line::from(vec![
+            Span::raw("[ "),
+            Span::styled(
+                button.label,
+                Style::default()
+                    .fg(mouse.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        if !button.hint.is_empty() {
+            line.spans.push(Span::styled(
+                format!(" · {}", button.hint),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        line.spans.push(Span::raw(" ]"));
+        if let Some(key) = button.key {
+            mouse.option(rect, 0, key, &line);
+            if mouse.hovered == Some(key) {
+                line = line.style(mouse_control_style(style, true, mouse.accent));
+                for span in &mut line.spans {
+                    span.style = Style::default();
+                }
+            }
+        }
+        frame.render_widget(Paragraph::new(line).style(style), rect);
+        if rows == 1 {
+            x = x.saturating_add(button.width() as u16 + 2);
+        }
+    }
+}
+
+fn draw_dialog_scroll_controls(
+    frame: &mut Frame<'_>,
+    mouse: &mut DialogMouse,
+    popup: Rect,
+    vertical: bool,
+    horizontal: bool,
+) {
+    if popup.width < 8 || popup.height < 2 || (!vertical && !horizontal) {
+        return;
+    }
+    let rail = Rect::new(popup.x + 1, popup.bottom() - 1, popup.width - 2, 1);
+    let style = Style::default().bg(Color::Black).fg(Color::Gray);
+    let mut x = rail.x;
+    for (enabled, code, text) in [
+        (vertical, KeyCode::Up, " ↑ "),
+        (vertical, KeyCode::Down, " ↓ "),
+        (horizontal, KeyCode::Left, " ← "),
+        (horizontal, KeyCode::Right, " → "),
+    ] {
+        if !enabled || x.saturating_add(3) > rail.right() {
+            continue;
+        }
+        let rect = Rect::new(x, rail.y, 3, 1);
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        let line = Line::from(text);
+        mouse.option(rect, 0, key, &line);
+        frame.render_widget(
+            Paragraph::new(line).style(mouse_control_style(
+                style,
+                mouse.hovered == Some(key),
+                mouse.accent,
+            )),
+            rect,
+        );
+        x += 3;
+    }
+    let hint = " wheel · PgUp/PgDn ";
+    let hint_width = Line::from(hint).width() as u16;
+    if vertical && rail.right().saturating_sub(x) > hint_width {
+        frame.render_widget(
+            Paragraph::new(hint).style(style),
+            Rect::new(rail.right() - hint_width, rail.y, hint_width, 1),
+        );
+    }
 }
 
 fn draw_dialog_scrollbar(
@@ -5866,6 +6027,39 @@ fn draw_dialog_scrollbar(
     }
 }
 
+fn draw_review_size_notice(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    inner: Rect,
+    close: Rect,
+    style: Style,
+) {
+    let area = if !inner.is_empty() {
+        Rect::new(inner.x, inner.y, inner.width, 1)
+    } else if !popup.is_empty() {
+        // Two-row terminals have no dialog interior. Use the lower border for
+        // the refusal; on a single row reserve the close control's exact cells.
+        let y = popup.bottom() - 1;
+        let x = popup.x.saturating_add(u16::from(popup.width > 1));
+        let right = if close.y == y {
+            close.x
+        } else {
+            popup.right().saturating_sub(1)
+        };
+        Rect::new(x, y, right.saturating_sub(x), 1)
+    } else {
+        Rect::default()
+    };
+    let text = if area.width >= 16 {
+        "Resize to review"
+    } else if area.width >= 6 {
+        "Resize"
+    } else {
+        "…"
+    };
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
+
 fn draw_modal(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -5876,6 +6070,7 @@ fn draw_modal(
     mouse: &mut DialogMouse,
 ) {
     mouse.options.fill(None);
+    mouse.popup = Rect::default();
     mouse.scroll_area = Rect::default();
     mouse.scroll_max = 0;
     let width = area.width.min(76);
@@ -5901,13 +6096,17 @@ fn draw_modal(
             let Some(report) = report else {
                 return;
             };
-            let popup = centered(area, width, area.height.min(24));
+            let height = u16::try_from(report.lines())
+                .unwrap_or(u16::MAX)
+                .saturating_add(5);
+            let popup = centered(area, width, area.height.min(24).min(height));
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Delete failed");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let regions = split_edges(inner, Direction::Vertical, 3, 1);
+            let regions = split_edges(inner, Direction::Vertical, 3, 0);
             *page = usize::from(regions[1].height).max(1);
             *scroll = (*scroll).min(report.lines().saturating_sub(*page));
             let first = if report.errors.is_empty() {
@@ -5947,13 +6146,25 @@ fn draw_modal(
             );
             mouse.scroll(popup, report.lines(), regions[1].height);
             draw_dialog_scrollbar(frame, popup, regions[1], *scroll, report.lines(), accent);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("↑↓ / wheel / PgUp/PgDown  ←→: scroll")
-                        .style(Style::default().fg(Color::DarkGray)),
-                ])
-                .style(style),
-                regions[2],
+            let horizontal_overflow = *horizontal > 0
+                || Line::from(report.target.as_str()).width() > usize::from(inner.width)
+                || report
+                    .errors
+                    .iter()
+                    .skip(*scroll / 2)
+                    .take(page.div_ceil(2) + 1)
+                    .any(|error| {
+                        Line::from(printable(error.path.as_os_str())).width()
+                            > usize::from(inner.width)
+                            || Line::from(printable(OsStr::new(&error.message))).width()
+                                > usize::from(inner.width)
+                    });
+            draw_dialog_scroll_controls(
+                frame,
+                mouse,
+                popup,
+                report.lines() > usize::from(regions[1].height),
+                horizontal_overflow,
             );
         }
         Modal::Batch {
@@ -5964,38 +6175,44 @@ fn draw_modal(
             confirm_requested,
             scroll,
         } => {
+            let buttons = [
+                DialogButton::new(KeyCode::Enter, "Yes", "Enter"),
+                DialogButton::new(KeyCode::Esc, "Cancel", "Esc"),
+            ];
+            let button_rows = dialog_button_rows(inner_width, &buttons);
             let paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
             let target_lines = paragraph.line_count(inner_width);
             let height = area.height.min(14).min(
                 u16::try_from(target_lines)
                     .unwrap_or(u16::MAX)
-                    .saturating_add(6),
+                    .saturating_add(3 + button_rows),
             );
             let popup = centered(area, width, height);
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Delete selection?");
             let inner = block.inner(popup);
-            let regions = split_edges(inner, Direction::Vertical, 1, 3);
-            let geometry = inner.width >= 32 && regions[1].height > 0 && regions[2].height == 3;
+            let regions = split_edges(inner, Direction::Vertical, 1, button_rows);
+            let geometry =
+                inner.width >= 32 && regions[1].height > 0 && regions[2].height == button_rows;
             *reviewable = geometry;
             *confirm_requested &= geometry;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             if !geometry {
-                frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::from("Resize to review"),
-                        dialog_option(
-                            mouse,
-                            inner,
-                            1,
-                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                            "n / Esc",
-                            ": cancel",
-                        ),
-                    ])
-                    .style(style),
-                    inner,
+                draw_review_size_notice(frame, popup, inner, *close_area, style);
+                let cancel_area = Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    inner.height.saturating_sub(1),
+                );
+                draw_dialog_buttons(
+                    frame,
+                    mouse,
+                    cancel_area,
+                    &[DialogButton::new(KeyCode::Esc, "Cancel", "Esc")],
+                    style,
                 );
                 return;
             }
@@ -6024,33 +6241,18 @@ fn draw_modal(
                 target_lines,
                 accent,
             );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
-                        .style(Style::default().fg(Color::DarkGray)),
-                    dialog_option(
-                        mouse,
-                        regions[2],
-                        1,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        "y / Enter",
-                        ": enqueue selected",
-                    ),
-                    dialog_option(
-                        mouse,
-                        regions[2],
-                        2,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": cancel",
-                    ),
-                ])
-                .style(style),
-                regions[2],
+            draw_dialog_buttons(frame, mouse, regions[2], &buttons, style);
+            draw_dialog_scroll_controls(
+                frame,
+                mouse,
+                popup,
+                target_lines > usize::from(regions[1].height),
+                false,
             );
         }
         Modal::Queue { .. } => {
             let (popup, inner, regions) = queue_layout(area);
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Deletion queue");
             frame.render_widget(Clear, popup);
@@ -6107,185 +6309,135 @@ fn draw_modal(
                     .saturating_add(usize::from(queue.marks.active.is_some())),
                 accent,
             );
-            let mut actions = dialog_option(
+            let buttons = [
+                DialogButton::new(
+                    KeyCode::Char(' '),
+                    if queue.paused { "Resume" } else { "Pause" },
+                    "Space",
+                ),
+                DialogButton::new(KeyCode::Char('d'), "Remove", "d"),
+            ];
+            let button_rows = dialog_button_rows(regions[2].width, &buttons);
+            draw_dialog_buttons(
+                frame,
                 mouse,
-                regions[2],
-                0,
-                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-                "Click / Space",
-                if queue.paused {
-                    ": resume waiting"
-                } else {
-                    ": pause waiting"
-                },
+                Rect::new(
+                    regions[2].x,
+                    regions[2].y,
+                    regions[2].width,
+                    button_rows.min(regions[2].height),
+                ),
+                &buttons,
+                style,
             );
-            let remove_x = u16::try_from(actions.width())
-                .unwrap_or(u16::MAX)
-                .saturating_add(3);
-            let remove_area = Rect::new(
-                regions[2].x.saturating_add(remove_x),
-                regions[2].y,
-                regions[2].width.saturating_sub(remove_x),
-                regions[2].height,
-            );
-            let remove = dialog_option(
+            if regions[2].height > button_rows {
+                frame.render_widget(
+                    Paragraph::new("Click: pause/resume · right-click: remove · drag: reorder")
+                        .style(style.fg(Color::Gray)),
+                    Rect::new(
+                        regions[2].x,
+                        regions[2].y + button_rows,
+                        regions[2].width,
+                        1,
+                    ),
+                );
+            }
+            let total = queue
+                .pending
+                .saturating_add(usize::from(queue.marks.active.is_some()));
+            draw_dialog_scroll_controls(
+                frame,
                 mouse,
-                remove_area,
-                0,
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-                "Right-click / d",
-                ": remove/cancel",
-            );
-            actions.spans.push(Span::raw(" · "));
-            actions.spans.extend(remove.spans);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    actions,
-                    Line::from(vec![
-                        Span::styled("Hover", Style::default().fg(Color::Yellow)),
-                        Span::raw(": select · "),
-                        Span::styled("Drag / Shift+↑↓", Style::default().fg(Color::Yellow)),
-                        Span::raw(": reorder"),
-                    ]),
-                ])
-                .style(style),
-                regions[2],
+                popup,
+                total > usize::from(regions[1].height),
+                false,
             );
         }
         Modal::ConfirmQuit { reviewable, .. } => {
-            let popup = centered(area, width.min(24), area.height.min(4));
+            let buttons = [
+                DialogButton::new(KeyCode::Enter, "Yes", "Enter"),
+                DialogButton::new(KeyCode::Esc, "No", "Esc"),
+            ];
+            let popup_width = width.min(38);
+            let rows = dialog_button_rows(popup_width.saturating_sub(2), &buttons);
+            let popup = centered(area, popup_width, area.height.min(rows + 2));
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Quit LDU?");
             let inner = block.inner(popup);
-            *reviewable = inner.width >= 14 && inner.height >= 2;
+            *reviewable = inner.width >= 15 && inner.height >= rows;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let lines = if *reviewable {
-                vec![
-                    dialog_option(
-                        mouse,
-                        inner,
-                        0,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        "y / Enter",
-                        ": yes",
-                    ),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        1,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": no",
-                    ),
-                ]
+            if *reviewable {
+                draw_dialog_buttons(frame, mouse, inner, &buttons, style);
             } else {
-                vec![Line::from("Resize to review")]
-            };
-            frame.render_widget(Paragraph::new(lines).style(style), inner);
+                draw_review_size_notice(frame, popup, inner, *close_area, style);
+            }
         }
         Modal::Quit { reviewable } => {
-            let popup = centered(area, width, area.height.min(6));
+            let buttons = [
+                DialogButton::new(KeyCode::Enter, "Exit now", "Enter"),
+                DialogButton::new(KeyCode::Esc, "Browse", "Esc"),
+            ];
+            let rows = dialog_button_rows(inner_width, &buttons);
+            let popup = centered(area, width, area.height.min(rows + 3));
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
-            let block = border("Exit after deletion?");
+            let block = border("Finishing deletions");
             let inner = block.inner(popup);
-            *reviewable = inner.width >= 32 && inner.height >= 4;
+            *reviewable = inner.width >= 32 && inner.height > rows;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let lines = if *reviewable {
-                vec![
-                    Line::from("Finishing deletions before exit."),
-                    Line::from(if queue.status.is_empty() {
-                        "Waiting for deletion.".to_owned()
+            if *reviewable {
+                frame.render_widget(
+                    Paragraph::new(if queue.status.is_empty() {
+                        "Waiting for queued deletions"
                     } else {
-                        queue.status.clone()
+                        &queue.status
                     })
-                    .style(Style::default().fg(accent)),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        2,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        "Enter / q",
-                        ": cancel and exit",
-                    ),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        3,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": keep browsing",
-                    ),
-                ]
+                    .style(style.fg(accent)),
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                draw_dialog_buttons(
+                    frame,
+                    mouse,
+                    Rect::new(inner.x, inner.y + 1, inner.width, rows),
+                    &buttons,
+                    style,
+                );
             } else {
-                vec![
-                    Line::from("Resize to review"),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        1,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": keep browsing",
-                    ),
-                ]
-            };
-            frame.render_widget(Paragraph::new(lines).style(style), inner);
+                draw_review_size_notice(frame, popup, inner, *close_area, style);
+            }
         }
         Modal::Enqueueing => {
-            let popup = centered(area, width, area.height.min(5));
+            let buttons = [
+                DialogButton::new(KeyCode::Esc, "Stop adding", "Esc"),
+                DialogButton::new(KeyCode::Char('q'), "Quit", "q"),
+            ];
+            let rows = dialog_button_rows(inner_width, &buttons);
+            let popup = centered(area, width, area.height.min(rows + 2));
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
-            let block = border("Enqueueing selection");
+            let block = border("Adding selection to queue");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("Adding selection to the queue."),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        1,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": stop adding",
-                    ),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        2,
-                        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                        "q / Ctrl-C",
-                        ": exit options",
-                    ),
-                ])
-                .style(style),
-                inner,
-            );
+            draw_dialog_buttons(frame, mouse, inner, &buttons, style);
         }
         Modal::Stopping => {
-            let popup = centered(area, width, area.height.min(4));
+            let popup = centered(area, width, area.height.min(3));
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
-            let block = border("Stopping deletions");
+            let block = border("Stopping deletions…");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("Cancelling deletions…"),
-                    dialog_option(
-                        mouse,
-                        inner,
-                        1,
-                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                        "Ctrl-C",
-                        ": exit now",
-                    ),
-                ])
-                .style(style),
-                inner,
-            );
+            let buttons = [DialogButton {
+                key: Some(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                label: "Exit now",
+                hint: "Ctrl-C",
+            }];
+            draw_dialog_buttons(frame, mouse, inner, &buttons, style);
         }
         Modal::Delete {
             target,
@@ -6296,6 +6448,19 @@ fn draw_modal(
             ..
         } => {
             let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
+            let buttons = [
+                if guarded {
+                    DialogButton {
+                        key: None,
+                        label: "Please wait…",
+                        hint: "",
+                    }
+                } else {
+                    DialogButton::new(KeyCode::Enter, "Yes", "Enter")
+                },
+                DialogButton::new(KeyCode::Esc, "Cancel", "Esc"),
+            ];
+            let button_rows = dialog_button_rows(inner_width, &buttons);
             let target_paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
             let target_lines = target_paragraph.line_count(inner_width);
             let prompt = Paragraph::new(if guarded && mouse.guard_warning {
@@ -6309,36 +6474,37 @@ fn draw_modal(
                 u16::try_from(target_lines)
                     .unwrap_or(u16::MAX)
                     .saturating_add(prompt_height)
-                    .saturating_add(5),
+                    .saturating_add(2 + button_rows),
             );
             let popup = centered(area, width, height);
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Delete?");
             let inner = block.inner(popup);
-            let regions = split_edges(inner, Direction::Vertical, prompt_height, 3);
-            let geometry = inner.width >= 18 && regions[1].height > 0 && regions[2].height == 3;
+            let regions = split_edges(inner, Direction::Vertical, prompt_height, button_rows);
+            let geometry =
+                inner.width >= 18 && regions[1].height > 0 && regions[2].height == button_rows;
             *reviewable = geometry;
             *confirm_requested &= geometry;
             frame.render_widget(Clear, popup);
+            frame.render_widget(block, popup);
             if !geometry {
-                frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::from("Resize to review"),
-                        dialog_option(
-                            mouse,
-                            popup,
-                            1,
-                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                            "n / Esc",
-                            ": cancel",
-                        ),
-                    ])
-                    .style(style),
-                    popup,
+                draw_review_size_notice(frame, popup, inner, *close_area, style);
+                let cancel_area = Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    inner.height.saturating_sub(1),
+                );
+                draw_dialog_buttons(
+                    frame,
+                    mouse,
+                    cancel_area,
+                    &[DialogButton::new(KeyCode::Esc, "Cancel", "Esc")],
+                    style,
                 );
                 return;
             }
-            frame.render_widget(block, popup);
             frame.render_widget(prompt.style(style), regions[0]);
             clamp_scroll(scroll, target_lines, regions[1].height);
             frame.render_widget(
@@ -6356,33 +6522,13 @@ fn draw_modal(
                 target_lines,
                 accent,
             );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
-                        .style(Style::default().fg(Color::DarkGray)),
-                    if guarded {
-                        Line::from("Please wait…")
-                    } else {
-                        dialog_option(
-                            mouse,
-                            regions[2],
-                            1,
-                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                            "y / Enter",
-                            ": delete",
-                        )
-                    },
-                    dialog_option(
-                        mouse,
-                        regions[2],
-                        2,
-                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                        "n / Esc",
-                        ": cancel",
-                    ),
-                ])
-                .style(style),
-                regions[2],
+            draw_dialog_buttons(frame, mouse, regions[2], &buttons, style);
+            draw_dialog_scroll_controls(
+                frame,
+                mouse,
+                popup,
+                target_lines > usize::from(regions[1].height),
+                false,
             );
         }
         Modal::Text {
@@ -6421,34 +6567,32 @@ fn draw_modal(
             let height = area.height.min(22).min(
                 u16::try_from(line_count)
                     .unwrap_or(u16::MAX)
-                    .saturating_add(3),
+                    .saturating_add(2),
             );
             let popup = centered(area, width, height);
+            mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border(title);
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let [_, content, footer] = split_edges(inner, Direction::Vertical, 0, 1);
-            let regions = [content, footer];
-            clamp_scroll(scroll, line_count, regions[0].height);
-            frame.render_widget(paragraph.scroll((*scroll, 0)).style(style), regions[0]);
-            mouse.scroll(popup, line_count, regions[0].height);
+            clamp_scroll(scroll, line_count, inner.height);
+            frame.render_widget(paragraph.scroll((*scroll, 0)).style(style), inner);
+            mouse.scroll(popup, line_count, inner.height);
             draw_dialog_scrollbar(
                 frame,
                 popup,
-                regions[0],
+                inner,
                 usize::from(*scroll),
                 line_count,
                 accent,
             );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
-                        .style(Style::default().fg(Color::DarkGray)),
-                ])
-                .style(style),
-                regions[1],
+            draw_dialog_scroll_controls(
+                frame,
+                mouse,
+                popup,
+                line_count > usize::from(inner.height),
+                false,
             );
         }
     }

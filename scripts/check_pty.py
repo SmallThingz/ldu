@@ -476,6 +476,25 @@ def modal_box(session):
     return painted_modal_box(session.screen)
 
 
+def click_outside_modal(session):
+    """Click an actual browser cell immediately beside the painted popup."""
+    left, top, right, bottom = modal_box(session)
+    assert left > 0, "outside-click fixture needs space beside its dialog"
+    mouse_click(session, left - 1, (top + bottom) // 2)
+
+
+def assert_modal_scroll_controls(session, overflow):
+    left, top, right, bottom = modal_box(session)
+    rail = "".join(session.screen.cells[bottom][left + 1:right])
+    body = "\n".join("".join(session.screen.cells[row][left + 1:right])
+                     for row in range(top + 1, bottom))
+    assert ("↑" in rail and "↓" in rail) == overflow, \
+        f"dialog bottom-border scroll controls do not match overflow: {rail!r}"
+    assert ("wheel · PgUp/PgDn" in rail) == overflow, \
+        f"dialog bottom-border scroll hint does not match overflow: {rail!r}"
+    assert "wheel · PgUp/PgDn" not in body, "scroll hints consumed a dialog content row"
+
+
 def click_modal_option(session, label):
     left, top, right, bottom = modal_box(session)
 
@@ -657,18 +676,18 @@ def check_owned_modal_geometry(session, root):
     session.wait(lambda: "Delete?" in session.screen.text(), "long-path deletion confirmation missing")
     session.key(b"\x1b[F")
     session.wait(lambda: "END-OF-OWNED-NAME" in session.screen.text()
-                 and "y / Enter: delete" in session.screen.words(), "deletion End did not reveal the full path")
-    assert "y / Enter: delete" in session.screen.words() and "n / Esc: cancel" in session.screen.words()
-    click_modal_option(session, "n / Esc: cancel")
+                 and "Yes · Enter" in session.screen.words(), "deletion End did not reveal the full path")
+    assert "Yes · Enter" in session.screen.words() and "Cancel · Esc" in session.screen.words()
+    click_modal_option(session, "Cancel · Esc")
     session.wait(lambda: "Delete?" not in session.screen.text() and session.screen.normal_view(), "long-path deletion click did not cancel")
     assert fixture_file.is_file(), "modal geometry check deleted its fixture"
     # Shrink an already reviewable dialog: previously visible confirmation must reset.
     session.key(b"d")
     session.wait(lambda: "Delete?" in session.screen.text()
-                 and "y / Enter: delete" in session.screen.words(), "deletion confirmation did not reopen")
+                 and "Yes · Enter" in session.screen.words(), "deletion confirmation did not reopen")
     session.resize(2, 20)
-    session.wait(lambda: "Resize to review" in session.screen.words()
-                 and "n / Esc: cancel" in session.screen.words(), "tiny deletion refusal was not visible")
+    session.wait(lambda: "Resize to review" in session.screen.words(),
+                 "tiny deletion refusal was not visible")
     session.key(b"y\rn")
     try:
         session.wait(lambda: "Resize to review" not in session.screen.words() and session.screen.normal_view(), "tiny deletion dialog did not cancel")
@@ -708,9 +727,9 @@ def check_hidden_and_delete(session, root):
                      "victim ordering did not become visible")
         session.key(b"d")
         session.wait(lambda: "Delete?" in session.screen.text() and filename in session.screen.text()
-                     and "y / Enter: delete" in session.screen.words(),
+                     and "Yes · Enter" in session.screen.words(),
                      "delete confirmation did not identify the selected victim")
-        assert "y / Enter: delete" in session.screen.words() and "n / Esc: cancel" in session.screen.words()
+        assert "Yes · Enter" in session.screen.words() and "Cancel · Esc" in session.screen.words()
         victim = directory / filename
         session.key(b"n")
         session.wait(lambda: "Delete?" not in session.screen.text() and session.screen.normal_view(), "n did not cancel deletion")
@@ -722,7 +741,7 @@ def check_hidden_and_delete(session, root):
         assert victim.is_file(), "Escape cancellation changed the file"
         session.key(b"d")
         session.wait(lambda: "Delete?" in session.screen.text()
-                     and "y / Enter: delete" in session.screen.words(), "delete confirmation missing")
+                     and "Yes · Enter" in session.screen.words(), "delete confirmation missing")
         transcript = len(session.raw)
         session.key(confirm)
         session.wait(lambda: not victim.exists(), "confirmed asynchronous deletion did not remove the owned victim")
@@ -813,7 +832,7 @@ def open_queue(session, expected):
     # Wait for the whole popup, without assuming whether its queue is paused.
     modal_box(session)
     session.wait(lambda: any(action in session.screen.words() for action in (
-                     "Click / Space: pause waiting", "Click / Space: resume waiting")),
+                     "Pause · Space", "Resume · Space")),
                  "deletion queue pause/resume control did not finish painting")
 
 
@@ -828,7 +847,7 @@ def enqueue_fixture(session, name, directory=False):
     session.key(b"d")
     session.wait(lambda: session.screen.has_modal_title("Delete?")
                  and printable(name) in session.screen.text()
-                 and "y / Enter: delete" in session.screen.words(),
+                 and "Yes · Enter" in session.screen.words(),
                  f"deletion confirmation did not identify {name}")
     session.key(b"y")
     session.wait(lambda: session.screen.normal_view(),
@@ -838,7 +857,7 @@ def enqueue_fixture(session, name, directory=False):
 def pause_empty_queue(session):
     open_queue(session, [])
     session.key(b" ")
-    session.wait(lambda: "resume waiting" in session.screen.words(),
+    session.wait(lambda: "Resume · Space" in session.screen.words(),
                  "Space did not pause an empty deletion queue")
     close_queue(session)
 
@@ -904,7 +923,7 @@ def check_owned_immediate_confirmation(binary, work, threads):
                          == {name: name in expected for name in names},
                          f"{mode} buffered d/Enter did not enqueue its exact targets")
             open_queue(session, expected)
-            assert "resume waiting" in session.screen.words(), \
+            assert "Resume · Space" in session.screen.words(), \
                 f"{mode} immediate confirmation changed queue pause"
             assert all((root / name).is_file() for name in names), \
                 f"{mode} immediate confirmation bypassed queue pause"
@@ -946,7 +965,7 @@ def check_owned_queue(binary, work, threads):
         fixture_selection(session, "alpha")
         session.key(b"d")
         session.wait(lambda: session.screen.has_modal_title("Delete?")
-                     and "y / Enter: delete" in session.screen.words(),
+                     and "Yes · Enter" in session.screen.words(),
                      "close-control deletion fixture did not open confirmation")
         close_modal_mouse(session)
         session.wait(lambda: session.screen.normal_view(),
@@ -996,7 +1015,7 @@ def check_owned_queue(binary, work, threads):
         session.wait(lambda: queue_paths(session) == ["alpha", "beta", "gamma"]
                      and queue_selected(session) == "alpha",
                      "queue mouse drag did not move the last waiting job to the front")
-        assert "resume waiting" in session.screen.words()
+        assert "Resume · Space" in session.screen.words()
         assert all((root / name).is_file() for name in ("alpha", "beta", "gamma"))
         session.key(b"d")
         session.wait(lambda: queue_paths(session) == ["beta", "gamma"],
@@ -1037,7 +1056,7 @@ def check_owned_queue(binary, work, threads):
         session.wait(lambda: fixture_directory(session, root), "unqueued descendant check lost parent")
         enqueue_fixture(session, "branch", directory=True)
         open_queue(session, ["beta", "gamma", "branch"])
-        assert "resume waiting" in session.screen.words(), "enqueue resumed a paused queue"
+        assert "Resume · Space" in session.screen.words(), "enqueue resumed a paused queue"
         transcript = len(session.raw)
         column, row = queue_path_cell(session, "branch")
         mouse_click(session, column, row)
@@ -1085,7 +1104,7 @@ def check_owned_queue_resize(binary, work, threads):
 
         def queue_ready(paths, selected):
             return (session.screen.has_modal_title("Deletion queue")
-                    and "resume waiting" in session.screen.words()
+                    and "Resume · Space" in session.screen.words()
                     and "Updating queue" not in session.screen.words()
                     and queue_paths(session) == paths
                     and queue_selected(session) == selected)
@@ -1116,6 +1135,86 @@ def check_owned_queue_resize(binary, work, threads):
         return {"case": "stationary-paused-queue-resize",
                 "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed,
                 "input": [], "idle": samples}
+    finally:
+        session.close()
+
+
+def check_owned_modal_mouse_cancel(binary, work, threads):
+    root = work / "mouse-modal-outside"
+    root.mkdir()
+    names = ["alpha", "beta"]
+    for name in names:
+        (root / name).write_bytes(b"unconfirmed mouse target")
+    session = Session(binary, root, threads)
+    samples = []
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "outside-click fixture scan did not complete")
+        fixture_selection(session, "alpha")
+        for key, title, overflow in ((b"?", "Help", True), (b"i", "Info", False),
+                                     (b"d", "Delete?", False)):
+            session.key(key)
+            session.wait(lambda: session.screen.has_modal_title(title),
+                         f"{title} did not open for outside cancellation")
+            assert_modal_scroll_controls(session, overflow)
+            click_outside_modal(session)
+            session.wait(lambda: session.screen.normal_view(),
+                         f"outside click did not cancel {title}")
+            assert (root / "alpha").is_file(), f"outside {title} click deleted its target"
+        enter_visual_mark(session)
+        wait_visual(session, names, ["alpha"], cursor="alpha")
+        open_batch_confirmation(session, count=1, key=b"d")
+        assert_modal_scroll_controls(session, False)
+        click_outside_modal(session)
+        session.wait(lambda: session.screen.normal_view(), "outside click did not cancel batch confirmation")
+        wait_visual(session, names, ["alpha"], cursor="alpha")
+        assert all((root / name).is_file() for name in names), "outside batch click confirmed deletion"
+        session.key(b"\x1b")
+        session.wait(lambda: visual_count(session) is None, "outside-click fixture did not clear visual mode")
+
+        pause_empty_queue(session)
+        enqueue_fixture(session, "alpha")
+        # The number, word and bracketed shortcut all belong to one control.
+        label = "1 queued [D]"
+        for offset in (0, 2, len(label) - 1):
+            session.wait(lambda: label in session.screen.text(header=True), "queued status did not paint")
+            start = session.screen.text(header=True).index(label)
+            column = start + offset
+            mouse_click(session, column, 0)
+            session.wait(lambda: session.screen.has_modal_title("Deletion queue")
+                         and queue_paths(session) == ["alpha"],
+                         f"queued status cell {offset} was not clickable")
+            session.wait(lambda: "Resume · Space" in session.screen.words(), "queue controls did not paint")
+            assert_modal_scroll_controls(session, False)
+            assert "pending running" not in session.screen.words() and "Esc / Enter: close" not in session.screen.words()
+            click_outside_modal(session)
+            session.wait(lambda: session.screen.normal_view(), "outside click did not close the queue")
+            assert (root / "alpha").is_file(), "outside queue click resumed paused work"
+
+        mouse_click(session, 0, 0, button=2)
+        session.wait(lambda: session.screen.has_modal_title("Quit LDU?"), "right-click quit prompt did not open")
+        assert_modal_scroll_controls(session, False)
+        click_outside_modal(session)
+        session.wait(lambda: session.screen.normal_view(), "outside click did not cancel quit confirmation")
+        session.key(b"q")
+        wait_quit_warning(session, paused=True)
+        click_outside_modal(session)
+        samples.append(stationary_sample(
+            session, lambda: session.screen.has_modal_title("Finishing deletions")
+            and "Exit now · Enter" in session.screen.words()
+            and (root / "alpha").is_file(), "outside click retains deletion progress"))
+        click_modal_option(session, "Browse · Esc")
+        session.wait(lambda: session.screen.normal_view(), "Browse did not dismiss deletion progress")
+        open_queue(session, ["alpha"])
+        session.key(b"d")
+        session.wait(lambda: not queue_paths(session) and "No deletions queued" in session.screen.words(),
+                     "mouse-cancel fixture did not remove its paused job")
+        close_queue(session)
+        assert all((root / name).is_file() for name in names), "mouse dialog cancellation changed fixture files"
+        elapsed = session.finish(key=b"q")
+        return {"case": "outside-dialog-cancel-and-full-queue-status", "first_frame_ms": session.first_frame_ms,
+                "quit_ms": elapsed, "input": [], "idle": samples}
     finally:
         session.close()
 
@@ -1152,6 +1251,10 @@ def check_owned_error_queue(binary, work, threads):
                          f"queued failure did not show the full {name} path")
             assert (root / name).read_bytes() == b"replacement", \
                 "deletion changed an unconfirmed replacement"
+            click_outside_modal(session)
+            stationary_sample(session, lambda: session.screen.has_modal_title("Delete failed")
+                              and path in session.screen.text(),
+                              f"outside click retains the {name} error report")
             session.key(b"\r")
         session.wait(lambda: session.screen.normal_view(),
                      "Enter did not dismiss exactly the two queued error reports")
@@ -1443,7 +1546,7 @@ def check_owned_mouse_guard(binary, work, threads):
                     assert b"38;2;" not in session.raw and b"48;2;" not in session.raw, "RGB fallback ignored terminal support"
                 session.wait(lambda: "Please wait" not in session.screen.text()
                              and session.screen.has_modal_title("Delete?")
-                             and "y / Enter: delete" in session.screen.words(),
+                             and "Yes · Enter" in session.screen.words(),
                              f"{mode} guard did not unlock without input")
                 assert warning not in session.screen.words(), "expired guard warning stayed visible"
                 assert all((root / name).is_file() for name in names), "early Enter deleted a target"
@@ -1454,7 +1557,7 @@ def check_owned_mouse_guard(binary, work, threads):
                          and deletion_marks(session, names) == {name: name == expected for name in names},
                          f"{mode} fresh confirmation did not enqueue the intended target")
             open_queue(session, [expected])
-            assert "resume waiting" in session.screen.words(), "guard changed queue pause state"
+            assert "Resume · Space" in session.screen.words(), "guard changed queue pause state"
             session.key(b" ")
             session.wait(lambda: not (root / expected).exists() and not queue_paths(session),
                          f"{mode} confirmed target did not finish deletion")
@@ -1697,7 +1800,10 @@ def check_owned_parent_row(binary, work, threads):
         session.wait(lambda: visual_count(session) == len(names)
                      and set(visual_paths(session, names)) == set(names),
                      "second parent toggle did not restore all entries")
-        click_header_label(session, "[D] delete")
+        header = session.screen.text(header=True)
+        assert f"{len(names)} selected  [d] delete" in header, "delete control was not next to selected count"
+        assert "Escape" not in header and "visual" not in header.lower(), "selection header retained redundant hints"
+        click_header_label(session, "[d] delete")
         wait_batch_confirmation(session, count=len(names))
         close_modal_mouse(session)
         session.wait(lambda: session.screen.normal_view()
@@ -1705,9 +1811,9 @@ def check_owned_parent_row(binary, work, threads):
                      "batch close control did not preserve parent-row selection")
         assert all((root / name.rstrip("/")).exists() for name in names), \
             "closing parent-row confirmation changed its entries"
-        click_header_label(session, "[D] delete")
+        click_header_label(session, "[d] delete")
         wait_batch_confirmation(session, count=len(names))
-        click_modal_option(session, "y / Enter: enqueue selected")
+        click_modal_option(session, "Yes · Enter")
         session.wait(lambda: not any(root.iterdir())
                      and session.screen.normal_view() and visual_count(session) is None,
                      "parent-row deletion did not remove hidden and excluded entries")
@@ -1746,13 +1852,13 @@ def check_owned_cancellation(binary, work, threads):
         # Resume the first job and immediately pause its successor before
         # waiting for output. A fast worker may finish before cancellation.
         session.key(b"  ")
-        session.wait(lambda: "resume waiting" in session.screen.words()
+        session.wait(lambda: "Resume · Space" in session.screen.words()
                      and (any(state == "active" and path == "slow"
                               for state, path, _ in queue_rows(session)) or not slow.exists()),
                      "deletion attempt did not preserve paused waiting work")
         session.key(b"c")
         session.wait(lambda: queue_paths(session) == ["waiting"]
-                     and "resume waiting" in session.screen.words(),
+                     and "Resume · Space" in session.screen.words(),
                      "cancellation attempt lost or started the retained waiting job")
         assert waiting.is_file(), "cancellation deleted the retained waiting item"
         cancellation_observed = slow.is_dir() and any(path.is_file() for path in slow.rglob("*"))
@@ -1765,18 +1871,17 @@ def check_owned_cancellation(binary, work, threads):
                          "naturally completed deletion retained its model row")
 
         session.key(b"q")
-        session.wait(lambda: session.screen.has_modal_title("Exit after deletion?"),
+        session.wait(lambda: session.screen.has_modal_title("Finishing deletions"),
                      "q did not guard queued deletion on quit")
         session.key(b"n")
         session.wait(lambda: session.screen.normal_view(), "n did not cancel guarded quit")
         assert session.child.poll() is None and waiting.is_file()
         session.key(b"q")
-        session.wait(lambda: session.screen.has_modal_title("Exit after deletion?"),
+        session.wait(lambda: session.screen.has_modal_title("Finishing deletions"),
                      "guarded quit did not reopen")
         session.resize(4, 24)
-        session.wait(lambda: "Resize to review" in session.screen.words()
-                     and "n / Esc" in session.screen.words(),
-                     "tiny guarded quit did not show its review refusal and cancellation")
+        session.wait(lambda: "Resize to review" in session.screen.words(),
+                     "tiny guarded quit did not show its review refusal")
         session.key(b"q\rn")
         session.wait(lambda: not session.screen.has_modal_border(), "tiny guarded quit did not cancel")
         assert session.child.poll() is None and waiting.is_file(), "unreviewable quit discarded the queue"
@@ -1847,7 +1952,7 @@ def check_owned_mouse_quit(binary, work, threads):
                     session.key(b"D")
                     session.wait(lambda: session.screen.has_modal_title("Deletion queue")
                                  and "48 queued" in session.screen.words()
-                                 and "resume waiting" in session.screen.words(),
+                                 and "Resume · Space" in session.screen.words(),
                                  "mouse quit FIFO did not retain its paused work")
                     # Resume confirmed work and close its queue without an
                     # Escape-prefix ambiguity before the header gesture.
@@ -1858,13 +1963,13 @@ def check_owned_mouse_quit(binary, work, threads):
             def open_quit(column):
                 mouse_click(session, column, 0, button=2)
                 session.wait(lambda: session.screen.has_modal_title("Quit LDU?")
-                             and "y / Enter: yes" in session.screen.words()
-                             and "n / Esc: no" in session.screen.words(),
+                             and "Yes · Enter" in session.screen.words()
+                             and "No · Esc" in session.screen.words(),
                              f"{mode} header right click did not open explicit quit")
 
             if mode == "idle":
                 open_quit(0)
-                click_modal_option(session, "n / Esc: no")
+                click_modal_option(session, "No · Esc")
                 session.wait(lambda: session.screen.normal_view(),
                              "mouse quit No did not keep browsing")
                 open_quit(session.screen.cols - 1)
@@ -1872,7 +1977,7 @@ def check_owned_mouse_quit(binary, work, threads):
                 session.wait(lambda: session.screen.normal_view(),
                              "mouse quit close control did not keep browsing")
             open_quit(session.screen.cols // 2)
-            click_modal_option(session, "y / Enter: yes")
+            click_modal_option(session, "Yes · Enter")
             if mode == "paused":
                 wait_quit_warning(session, paused=True)
                 assert (root / names[0]).is_file(), "mouse quit Yes resumed paused work"
@@ -1894,9 +1999,9 @@ def check_owned_mouse_quit(binary, work, threads):
 
 
 def wait_quit_warning(session, paused=False):
-    session.wait(lambda: session.screen.has_modal_title("Exit after deletion?")
-                 and "Finishing deletions before exit." in session.screen.words()
-                 and "Enter / q: cancel and exit" in session.screen.words()
+    session.wait(lambda: session.screen.has_modal_title("Finishing deletions")
+                 and "Browse · Esc" in session.screen.words()
+                 and "Exit now · Enter" in session.screen.words()
                  and (not paused or "queued" in session.screen.words()),
                  "first interrupt did not keep confirmed work and show its shutdown progress")
 
@@ -1943,6 +2048,7 @@ def check_owned_quit_interrupts(binary, work, threads):
         finally:
             session.close()
     return metrics
+
 
 
 def check_owned_terminal_hangup(binary, work, threads):
@@ -2033,7 +2139,7 @@ def check_owned_quit_completion(binary, work, threads, replacement_error=False):
         session.key(b"D")
         session.wait(lambda: session.screen.has_modal_title("Deletion queue")
                      and "64 queued" in session.screen.words()
-                     and "resume waiting" in session.screen.words(),
+                     and "Resume · Space" in session.screen.words(),
                      "finishing-quit did not retain its paused batch")
         if replacement_error:
             # Keep every confirmed inode alive, then replace its path while
@@ -2421,7 +2527,7 @@ def check_owned_idle(binary, work, threads):
         open_queue(session, ["victim"])
         samples.append(stationary_sample(
             session, lambda: session.screen.has_modal_title("Deletion queue")
-            and "resume waiting" in session.screen.words()
+            and "Resume · Space" in session.screen.words()
             and queue_paths(session) == ["victim"],
             "paused deletion queue"))
         assert victim.exists(), "stationary paused queue deleted its target"
@@ -2443,7 +2549,7 @@ def check_owned_idle(binary, work, threads):
             "refresh blocked by paused queued directory"))
         assert (victim / "leaf").exists(), "paused overlapping refresh deleted its target"
         open_queue(session, ["victim"])
-        assert "resume waiting" in session.screen.words(), \
+        assert "Resume · Space" in session.screen.words(), \
             "refresh unexpectedly resumed the paused queue"
         session.key(b" ")
         session.wait(lambda: not victim.exists() and queue_paths(session) == []
@@ -2611,7 +2717,7 @@ def batch_count(session):
 def wait_batch_confirmation(session, count=2):
     session.wait(lambda: session.screen.has_modal_title("Delete selection?")
                  and batch_count(session) == count
-                 and "y / Enter: enqueue selected" in session.screen.words(),
+                 and "Yes · Enter" in session.screen.words(),
                  "batch confirmation did not finish checking selected targets")
 
 
@@ -3010,7 +3116,7 @@ def check_owned_batch_queue(binary, work, threads):
         session.key(b"D")
         session.wait(lambda: session.screen.has_modal_title("Deletion queue")
                      and "32 queued" in session.screen.words()
-                     and "resume waiting" in session.screen.words(),
+                     and "Resume · Space" in session.screen.words(),
                      "batch FIFO did not retain all 32 paused jobs")
         assert all(victim.is_file() for victim in victims), "paused FIFO changed a confirmed target"
         # Each event-loop iteration handles one key and can start at most two
@@ -3028,7 +3134,7 @@ def check_owned_batch_queue(binary, work, threads):
         session.wait(lambda: all(not victim.exists() for victim in victims)
                      and session.screen.has_modal_title("Delete selection?")
                      and batch_count(session) == 1
-                     and "y / Enter: enqueue selected" in session.screen.words(),
+                     and "Yes · Enter" in session.screen.words(),
                      "unconfirmed batch paused previously confirmed FIFO work")
         assert review.is_file(), "FIFO completion deleted the unconfirmed batch target"
         session.key(b"n")
@@ -3083,7 +3189,7 @@ def check_owned_completion_input(binary, work, threads):
         session.key(b"D")
         session.wait(lambda: session.screen.has_modal_title("Deletion queue")
                      and f"{len(names)} queued" in session.screen.words()
-                     and "resume waiting" in session.screen.words(),
+                     and "Resume · Space" in session.screen.words(),
                      "completion/input did not retain every paused target")
         # Input is already buffered when deletion starts. There are more jobs
         # than twice the key count, so per-event dispatch cannot exhaust the
@@ -3185,7 +3291,7 @@ def check_owned_visual_ranges(binary, work, threads):
         session.key(f"\x1b[<0;35;{edge}md".encode())
         session.wait(lambda: session.screen.has_modal_title("Delete selection?")
                      and (batch_count(session) or 0) > session.screen.rows
-                     and "y / Enter: enqueue selected" in session.screen.words(),
+                     and "Yes · Enter" in session.screen.words(),
                      "released edge drag did not produce a complete batch selection")
         selected = batch_count(session)
         session.key(b"\x1b")
@@ -3268,7 +3374,7 @@ def check_owned_resize_confirmation(binary, work, threads, cases=("single", "bat
                 session.key(b"d")
                 session.wait(lambda: session.screen.has_modal_title("Delete?")
                              and "alpha" in session.screen.text()
-                             and "y / Enter: delete" in session.screen.words(),
+                             and "Yes · Enter" in session.screen.words(),
                              "single resize confirmation did not become reviewable")
             elif case == "batch":
                 enter_visual_mark(session)
@@ -3277,8 +3383,8 @@ def check_owned_resize_confirmation(binary, work, threads, cases=("single", "bat
             elif case == "quit":
                 enqueue_fixture(session, "alpha")
                 session.key(b"q")
-                session.wait(lambda: session.screen.has_modal_title("Exit after deletion?")
-                             and "Enter / q: cancel and exit" in session.screen.words(),
+                session.wait(lambda: session.screen.has_modal_title("Finishing deletions")
+                             and "Exit now · Enter" in session.screen.words(),
                              "quit resize confirmation did not become reviewable")
             else:
                 raise AssertionError(f"unknown resize confirmation case: {case}")
@@ -3312,7 +3418,7 @@ def check_owned_resize_confirmation(binary, work, threads, cases=("single", "bat
                              "resize batch cancellation did not leave visual mode")
             expected = ["alpha"] if case == "quit" else []
             open_queue(session, expected)
-            assert "resume waiting" in session.screen.words(), "resize confirmation changed queue pause"
+            assert "Resume · Space" in session.screen.words(), "resize confirmation changed queue pause"
             assert all((root / name).is_file() for name in names), "resize confirmation changed fixture files"
             close_queue(session)
             elapsed = session.finish(key=b"q\r" if case == "quit" else b"q")
@@ -3611,9 +3717,13 @@ def check(binary, root, owned_fixture, max_input_ms, threads):
                 session.wait(lambda: path_in_header(session.screen, root),
                              "parent navigation did not return to root")
                 session.resize(5, 18)
-                session.wait(lambda: session.screen.text().strip() != "", "small terminal did not redraw")
+                # Wait for output positioned at the new right edge: pending bytes
+                # from the preceding wide frame must not acknowledge this resize.
+                session.wait(lambda: session.screen.help_at_edge(),
+                             "small terminal did not paint its resized header")
                 session.resize(28, 100)
-                session.wait(lambda: session.screen.help_at_edge(), "normal terminal did not redraw")
+                session.wait(lambda: path_in_header(session.screen, root),
+                             "normal terminal did not redraw")
                 elapsed = session.finish(key=b"q")
             elif quit_action == "ctrl-c":
                 elapsed = session.finish(key=b"\x03")
@@ -3677,6 +3787,7 @@ def main():
             metrics.extend(check_owned_immediate_confirmation(args.binary, Path(work), args.threads))
             metrics.append(check_owned_queue(args.binary, Path(work), args.threads))
             metrics.append(check_owned_queue_resize(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_modal_mouse_cancel(args.binary, Path(work), args.threads))
             metrics.append(check_owned_error_queue(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_helper_shutdown(args.binary, Path(work), args.threads))
             metrics.append(check_owned_special_previews(args.binary, Path(work), args.threads))
@@ -3723,6 +3834,7 @@ def main():
             checks.append("buffered d/Enter in normal, visual and pending-range deletion with tiny-dialog guards")
             checks.append("clickable header help/queue/delete, selection clear, modal options/scrollbar, queue hover/right-click/click/drag")
             checks.append("pinned ../ navigation and reversible select-all including hidden/filter-excluded entries")
+            checks.append("full queued-status clicks, outside ordinary-dialog cancellation, retained errors/progress, overflow-only border scroll hints")
             checks.append("header right-click quit Yes/No with idle, paused and finishing deletions")
             checks.append("target-replacement error after terminal restoration")
             checks.append("stationary paused queue growth and shrink without input")
