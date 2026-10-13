@@ -1713,7 +1713,7 @@ impl App {
         }
         // Finishing direct enumeration need not wait for descendant sizes.
         let listed = self.model.listing_complete(self.directory);
-        let stopped = !listed && self.model.finished;
+        let stopped = self.model.listing_failed(self.directory) || (!listed && self.model.finished);
         if stopped {
             self.finish_parent_selection(true);
             return true;

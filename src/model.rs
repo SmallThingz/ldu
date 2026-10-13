@@ -104,6 +104,7 @@ impl Node {
     const OVERFLOW_REPORTED: u8 = 4;
     const METADATA_UNCERTAIN: u8 = 8;
     const SCAN_SUPPRESSED: u8 = 16;
+    const LISTING_FAILED: u8 = 32;
 
     fn new(name: Arc<OsStr>, parent: Option<NodeId>, kind: NodeKind, sizes: Sizes) -> Self {
         let complete = kind != NodeKind::Directory;
@@ -455,7 +456,10 @@ impl Model {
         node.items = 0;
         node.error_count = 0;
         node.complete = false;
-        node.flags &= !(Node::READ_DONE | Node::OVERFLOW_REPORTED | Node::METADATA_UNCERTAIN);
+        node.flags &= !(Node::READ_DONE
+            | Node::OVERFLOW_REPORTED
+            | Node::METADATA_UNCERTAIN
+            | Node::LISTING_FAILED);
         node.pending_dirs = 0;
         node.first_child = NO_NODE;
         node.last_child = NO_NODE;
@@ -797,9 +801,14 @@ impl Model {
         all > if show_hidden { 0 } else { hidden }
     }
 
-    /// Enumeration can finish before descendants finish contributing their sizes.
+    /// Enumeration has ended, including errors; descendant sizes may still be pending.
     pub fn listing_complete(&self, id: NodeId) -> bool {
         self.is_live(id) && self.node(id).read_done()
+    }
+
+    /// This directory's listing failed, independently of child metadata or subtree errors.
+    pub fn listing_failed(&self, id: NodeId) -> bool {
+        self.is_live(id) && self.node(id).flags & Node::LISTING_FAILED != 0
     }
 
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
@@ -1045,6 +1054,7 @@ impl Model {
                     return changed;
                 }
                 if let Some(error) = error {
+                    self.nodes[id as usize].flags |= Node::LISTING_FAILED;
                     self.record_error(id, error);
                 }
                 self.nodes[id as usize].flags |= Node::READ_DONE;
@@ -1196,6 +1206,10 @@ impl Model {
                 );
             }
             node.error_count = u64::from(entry.error.is_some());
+            if entry.kind == NodeKind::Directory && entry.error.is_some() {
+                // Repeated directory aliases are admitted but never enumerated.
+                node.flags |= Node::LISTING_FAILED;
+            }
             if let Some(error) = entry.error {
                 self.last_error = Some(error);
                 self.last_error_id = Some(entry.id);
@@ -1470,6 +1484,54 @@ mod tests {
             error: None,
         });
         model
+    }
+
+    #[test]
+    fn failed_listing_finishes_work_and_scoped_refresh_clears_failure() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "still-scanning", NodeKind::Directory, 0, 0)],
+        });
+        model.apply(ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: Some("directory read failed after one entry".into()),
+        });
+        assert!(model.listing_complete(ROOT) && model.listing_failed(ROOT));
+        assert!(!model.node(ROOT).complete && !model.finished);
+        done(&mut model, ROOT, 0, 1);
+        finish(&mut model, ROOT, 0);
+        assert!(model.node(ROOT).complete && model.finished);
+        assert!(model.listing_failed(ROOT));
+
+        model.begin_rescan(ROOT, 1);
+        assert!(!model.listing_complete(ROOT) && !model.listing_failed(ROOT));
+        scoped_root(&mut model, ROOT, 1, 0);
+        done(&mut model, ROOT, 1, ROOT);
+        finish(&mut model, ROOT, 1);
+        assert!(model.node(ROOT).complete && model.finished);
+        assert!(model.listing_complete(ROOT) && !model.listing_failed(ROOT));
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn skipped_directory_listing_failure_is_local_and_removed_nodes_are_ignored() {
+        let mut model = model();
+        let mut skipped = entry(1, "alias", NodeKind::Directory, 0, 0);
+        skipped.error = Some("directory already visited; contents skipped".into());
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![skipped],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, ROOT);
+        assert!(model.listing_complete(1) && model.listing_failed(1));
+        assert!(model.listing_complete(ROOT) && !model.listing_failed(ROOT));
+        assert!(model.node(ROOT).complete);
+        assert_eq!(model.node(ROOT).error_count, 1);
+        model.remove(1);
+        assert!(!model.listing_failed(1));
+        assert!(!model.listing_complete(1));
     }
 
     #[test]

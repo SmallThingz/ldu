@@ -1805,6 +1805,138 @@ fn stopped_incomplete_parent_listing_preserves_known_marks_and_cancels_confirmat
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_parent_listing_cancels_retained_confirmation_while_other_directories_scan() {
+    for failed_before_activation in [false, true] {
+        let mut app = browser_fixture();
+        if failed_before_activation {
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: ROOT,
+                    error: Some("directory read failed after known entries".into()),
+                },
+            );
+        }
+        app.focus_parent(true);
+        app.visual.enter(ROOT, None);
+        app.select_parent_contents(false);
+        app.enqueue_visual(VisualIntent::ToggleParent);
+        let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+        let mut batch = None;
+        let retired = VecDeque::new();
+        prepare_batch(&mut app, Some(anchor), &mut batch, &retired);
+        assert!(app.waiting_batch.is_some() && batch.is_none());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Batch {
+                confirm_requested: true,
+                ..
+            })
+        ));
+        if !failed_before_activation {
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: ROOT,
+                    error: Some("directory read failed after known entries".into()),
+                },
+            );
+        }
+        finish_visual(&mut app);
+        resume_batch(&mut app, &mut batch, &retired);
+        assert!(!app.model.finished && !app.model.node(1).complete);
+        assert!(app.model.listing_complete(ROOT) && app.model.listing_failed(ROOT));
+        assert!(app.visual.active() && app.visual.contains(1) && app.visual.contains(2));
+        assert_eq!(app.visual.len(), 2);
+        assert!(!app.visual.contains(ROOT));
+        assert!(app.parent_select_view.is_none() && !app.parent_select_pending);
+        assert!(
+            app.visual_intents.is_empty()
+                && app.waiting_batch.is_none()
+                && app.deferred_batch.is_none()
+                && batch.is_none()
+        );
+        assert!(
+            matches!(app.modal.as_ref(), Some(Modal::Text { title: "Selection incomplete", text, .. })
+            if text == "Folder listing incomplete. Refresh to select all entries.")
+        );
+    }
+}
+
+#[test]
+fn successful_parent_listing_selects_all_despite_child_metadata_or_descendant_errors() {
+    for descendant_failure in [false, true] {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        apply(
+            &mut app,
+            ScanEvent::RootInfo {
+                file_identity: None,
+                kind: NodeKind::Directory,
+                sizes: Default::default(),
+                error: None,
+            },
+        );
+        let mut failed = entry(
+            2,
+            "failed-child",
+            if descendant_failure {
+                NodeKind::Directory
+            } else {
+                NodeKind::Unknown
+            },
+            0,
+        );
+        if !descendant_failure {
+            failed.error = Some("child metadata unavailable".into());
+        }
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "known-file", NodeKind::File, 10), failed],
+            },
+        );
+        if descendant_failure {
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: 2,
+                    error: Some("child directory read failed".into()),
+                },
+            );
+            assert!(app.model.listing_failed(2));
+        }
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+        );
+        wait_cache(&mut app, ROOT, &[1, 2]);
+        app.focus_parent(true);
+        app.visual.enter(ROOT, None);
+        app.select_parent_contents(false);
+        finish_visual(&mut app);
+        assert!(app.model.listing_complete(ROOT) && !app.model.listing_failed(ROOT));
+        assert_eq!(app.model.node(ROOT).error_count, 1);
+        assert_eq!(app.visual.len(), 2);
+        assert!(app.visual.contains(1) && app.visual.contains(2));
+        assert!(!app.parent_select_pending && app.modal.is_none());
+    }
+}
+
 #[test]
 fn incomplete_parent_selection_preserves_header_quit_question_and_restores_notice() {
     for stopped_before_question in [false, true] {
