@@ -2,7 +2,7 @@ use crate::backend::{self, Backend, EntryMetadata, RootAnchor};
 use crate::types::{Entry, NodeId, NodeKind, ScanEvent, Sizes};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, hash_map::Entry as MapEntry};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry as MapEntry};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -650,6 +650,9 @@ impl HardlinkState {
 struct Emitter {
     sender: Sender<ScanEvent>,
     next_id: NodeId,
+    // Existing directory metadata suffices even for same-device bind mounts.
+    // Keep this per scan: a scoped refresh must be allowed to revisit its root.
+    visited_directories: HashSet<(u64, u64)>,
     hardlinks: Arc<HardlinkRegistry>,
 }
 
@@ -682,6 +685,7 @@ impl Emitter {
     ) -> io::Result<Vec<DirectoryTask>> {
         let mut entries = Vec::with_capacity(discovered.len());
         let mut directories = Vec::new();
+        let mut skipped_directories = Vec::new();
         let mut hardlinks = None;
         for (name, metadata) in discovered {
             // Filter before allocating an ID. Already allocated IDs must still be
@@ -695,6 +699,12 @@ impl Emitter {
             })?;
             let (kind, sizes, hardlink_group, hardlink_duplicate, error) = match metadata {
                 Ok(metadata) => {
+                    // No additional I/O or per-file lookup. Device changes alone
+                    // miss bind mounts and directory hardlinks on one filesystem.
+                    let repeated_directory = metadata.kind == NodeKind::Directory
+                        && metadata
+                            .identity
+                            .is_some_and(|identity| !self.visited_directories.insert(identity));
                     let (group, duplicate) = if metadata.kind == NodeKind::File {
                         match metadata.identity.filter(|_| metadata.links != 0) {
                             Some(identity) => {
@@ -712,7 +722,14 @@ impl Emitter {
                     } else {
                         (None, false)
                     };
-                    (metadata.kind, metadata.sizes, group, duplicate, None)
+                    (
+                        metadata.kind,
+                        metadata.sizes,
+                        group,
+                        duplicate,
+                        repeated_directory
+                            .then(|| "directory already visited; contents skipped".to_owned()),
+                    )
                 }
                 Err(error) => (
                     NodeKind::Unknown,
@@ -723,10 +740,14 @@ impl Emitter {
                 ),
             };
             if kind == NodeKind::Directory {
-                directories.push(DirectoryTask {
-                    id,
-                    path: task.path.join(name.as_ref()),
-                });
+                if error.is_some() {
+                    skipped_directories.push(id);
+                } else {
+                    directories.push(DirectoryTask {
+                        id,
+                        path: task.path.join(name.as_ref()),
+                    });
+                }
             }
             entries.push(Entry {
                 id,
@@ -749,6 +770,11 @@ impl Emitter {
             cancel,
             false,
         )?;
+        // Preserve visible aliases and their partial-read errors, while releasing
+        // every skipped directory's pending token after its entry is delivered.
+        for id in skipped_directories {
+            self.send(ScanEvent::DirectoryDone { id, error: None }, cancel, false)?;
+        }
         Ok(directories)
     }
 }
@@ -854,6 +880,7 @@ fn run(
     let emitter = Arc::new(Mutex::new(Emitter {
         sender,
         next_id: 1,
+        visited_directories: HashSet::new(),
         hardlinks: Arc::clone(&hardlinks),
     }));
 
@@ -885,6 +912,11 @@ fn run(
             };
             Ok((metadata, file_identity))
         });
+        let directory_identity = metadata
+            .as_ref()
+            .ok()
+            .filter(|(metadata, _)| metadata.kind == NodeKind::Directory)
+            .and_then(|(metadata, _)| metadata.identity);
         let (kind, sizes, file_identity, mut error) = match metadata {
             Ok((metadata, file_identity)) => (metadata.kind, metadata.sizes, file_identity, None),
             Err(error) => (
@@ -897,20 +929,26 @@ fn run(
         if control.excludes(&relative) {
             error = None;
         }
-        let root_sent = emitter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .send(
-                ScanEvent::RootInfo {
-                    file_identity,
-                    kind,
-                    sizes,
-                    error,
-                },
-                &cancel,
-                false,
-            )
-            .is_ok();
+        let root_sent = {
+            let mut emitter = emitter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(identity) = directory_identity {
+                emitter.visited_directories.insert(identity);
+            }
+            emitter
+                .send(
+                    ScanEvent::RootInfo {
+                        file_identity,
+                        kind,
+                        sizes,
+                        error,
+                    },
+                    &cancel,
+                    false,
+                )
+                .is_ok()
+        };
 
         if root_sent && kind == NodeKind::Directory && !cancel.load(Ordering::Acquire) {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -1112,7 +1150,7 @@ fn anchored_metadata(
     if relative.as_os_str().is_empty() {
         return anchor.metadata();
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let parent = anchor.open_parent_cancellable(relative, cancel)?;
         control.wait_unpaused(cancel, None)?;
@@ -1120,7 +1158,7 @@ fn anchored_metadata(
             io::Error::new(io::ErrorKind::InvalidInput, "scan path has no final entry")
         })?)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         backend::root_metadata(&anchor.root_path().join(relative))
     }
@@ -1850,6 +1888,7 @@ mod tests {
         let emitter = Mutex::new(Emitter {
             sender,
             next_id: 1,
+            visited_directories: HashSet::new(),
             hardlinks: Arc::new(HardlinkRegistry::default()),
         });
         let mut checked = Vec::new();
@@ -1888,6 +1927,7 @@ mod tests {
                 let emitter = Mutex::new(Emitter {
                     sender,
                     next_id: 1,
+                    visited_directories: HashSet::new(),
                     hardlinks: Arc::new(HardlinkRegistry::default()),
                 });
                 let (paused_sender, paused_receiver) = bounded(1);
@@ -2099,6 +2139,7 @@ mod tests {
         let mut emitter = Emitter {
             sender,
             next_id: 1,
+            visited_directories: HashSet::new(),
             hardlinks: Arc::new(HardlinkRegistry::default()),
         };
         let control = ScanControl::default();
@@ -2149,6 +2190,7 @@ mod tests {
         let emitter = Mutex::new(Emitter {
             sender,
             next_id: 1,
+            visited_directories: HashSet::new(),
             hardlinks: Arc::new(HardlinkRegistry::default()),
         });
         let next = Mutex::new(Vec::new());
@@ -2202,6 +2244,7 @@ mod tests {
         let emitter = Arc::new(Mutex::new(Emitter {
             sender,
             next_id: 1,
+            visited_directories: HashSet::new(),
             hardlinks: Arc::new(HardlinkRegistry::default()),
         }));
         let control = Arc::new(ScanControl::default());
@@ -2302,22 +2345,76 @@ mod tests {
         ));
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(unix)]
     #[test]
-    fn fallback_root_refresh_observes_symlink_replacement_and_missing_root() {
+    fn scoped_root_refresh_retains_original_directory_after_symlink_replacement() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new();
         let root = fixture.0.join("root");
         fs::create_dir(&root).unwrap();
+        fs::write(root.join("original"), b"held inode").unwrap();
         fs::create_dir(fixture.0.join("outside")).unwrap();
         fs::write(fixture.0.join("outside/payload"), b"must not traverse").unwrap();
         let initial = spawn(root.clone(), options());
         collect(&initial);
         let anchor = Arc::clone(initial.anchor.get().unwrap());
-        fs::remove_dir(&root).unwrap();
+        let identity = anchor.metadata().unwrap().identity;
+        fs::rename(&root, fixture.0.join("held-root")).unwrap();
         symlink("outside", &root).unwrap();
 
+        for display_path_exists in [true, false] {
+            if !display_path_exists {
+                fs::remove_file(&root).unwrap();
+            }
+            let scoped = spawn_subtree(
+                Arc::clone(&anchor),
+                PathBuf::new(),
+                options(),
+                initial.hardlinks(),
+            );
+            let events = collect(&scoped);
+            assert!(matches!(
+                events.first(),
+                Some(ScanEvent::RootInfo {
+                    kind: NodeKind::Directory,
+                    error: None,
+                    ..
+                }),
+            ));
+            let names: Vec<_> = events
+                .iter()
+                .flat_map(|event| match event {
+                    ScanEvent::Entries { entries, .. } => entries.as_slice(),
+                    _ => &[],
+                })
+                .map(|entry| entry.name.as_ref())
+                .collect();
+            assert_eq!(names, [OsStr::new("original")]);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ScanEvent::DirectoryDone { id: 0, error: None },))
+            );
+            assert!(matches!(
+                events.last(),
+                Some(ScanEvent::Finished { cancelled: false })
+            ));
+            assert_eq!(anchor.metadata().unwrap().identity, identity);
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fallback_root_refresh_observes_file_replacement_and_missing_root() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let initial = spawn(root.clone(), options());
+        collect(&initial);
+        let anchor = Arc::clone(initial.anchor.get().unwrap());
+        fs::remove_dir(&root).unwrap();
+        fs::write(&root, b"replacement").unwrap();
         let scoped = spawn_subtree(
             Arc::clone(&anchor),
             PathBuf::new(),
@@ -2328,15 +2425,14 @@ mod tests {
             collect(&scoped).as_slice(),
             [
                 ScanEvent::RootInfo {
-                    kind: NodeKind::Symlink,
+                    kind: NodeKind::File,
                     error: None,
                     ..
                 },
                 ScanEvent::DirectoryDone { id: 0, error: None },
-                ScanEvent::Finished { cancelled: false }
-            ]
+                ScanEvent::Finished { cancelled: false },
+            ],
         ));
-
         fs::remove_file(&root).unwrap();
         let missing = spawn_subtree(anchor, PathBuf::new(), options(), initial.hardlinks());
         assert!(matches!(
@@ -2348,8 +2444,8 @@ mod tests {
                     ..
                 },
                 ScanEvent::DirectoryDone { id: 0, error: None },
-                ScanEvent::Finished { cancelled: false }
-            ]
+                ScanEvent::Finished { cancelled: false },
+            ],
         ));
     }
 
@@ -2564,6 +2660,162 @@ mod tests {
     }
 
     #[test]
+    fn repeated_directories_finish_as_partial_leaves_without_blocking_siblings() {
+        let (sender, receiver) = bounded(64);
+        let hardlinks = Arc::new(HardlinkRegistry::default());
+        let mut emitter = Emitter {
+            sender,
+            next_id: 1,
+            visited_directories: HashSet::from([(7, 10)]),
+            hardlinks: Arc::clone(&hardlinks),
+        };
+        let cancel = AtomicBool::new(false);
+        let control = ScanControl::default();
+        let metadata = |name: &str, kind, identity| {
+            (
+                Arc::<OsStr>::from(OsStr::new(name)),
+                Ok(EntryMetadata {
+                    kind,
+                    sizes: Sizes {
+                        apparent: 16,
+                        allocated: 512,
+                    },
+                    identity: Some(identity),
+                    links: 1,
+                }),
+            )
+        };
+        emitter
+            .send(
+                ScanEvent::RootInfo {
+                    file_identity: None,
+                    kind: NodeKind::Directory,
+                    sizes: Sizes::default(),
+                    error: None,
+                },
+                &cancel,
+                false,
+            )
+            .unwrap();
+        let directories = emitter
+            .entries(
+                &task(0, ""),
+                vec![
+                    metadata("root-cycle", NodeKind::Directory, (7, 10)),
+                    metadata("branch", NodeKind::Directory, (7, 11)),
+                    metadata("branch-alias", NodeKind::Directory, (7, 11)),
+                    metadata("other-device", NodeKind::Directory, (8, 11)),
+                    metadata("file", NodeKind::File, (7, 11)),
+                    metadata("link", NodeKind::Symlink, (7, 10)),
+                ],
+                &cancel,
+                &control,
+            )
+            .unwrap();
+        assert_eq!(
+            directories.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [2, 4],
+        );
+        let nested = emitter
+            .entries(
+                &directories[0],
+                vec![
+                    metadata("self-cycle", NodeKind::Directory, (7, 11)),
+                    metadata("ancestor-cycle", NodeKind::Directory, (7, 10)),
+                    metadata("ordinary", NodeKind::Directory, (7, 12)),
+                    metadata("new-device", NodeKind::Directory, (8, 12)),
+                ],
+                &cancel,
+                &control,
+            )
+            .unwrap();
+        assert_eq!(
+            nested.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [9, 10]
+        );
+        assert_eq!(emitter.visited_directories.len(), 5);
+        // File and directory identities have independent registries.
+        assert_eq!(hardlinks.group((7, 11)).unwrap(), (1, true));
+        for id in [0, 2, 4, 9, 10] {
+            emitter
+                .send(ScanEvent::DirectoryDone { id, error: None }, &cancel, false)
+                .unwrap();
+        }
+        emitter
+            .send(ScanEvent::Finished { cancelled: false }, &cancel, true)
+            .unwrap();
+        let mut model = crate::model::Model::new(PathBuf::from("fixture"));
+        let mut skipped = Vec::new();
+        for event in receiver.try_iter() {
+            if let ScanEvent::Entries { entries, .. } = &event {
+                for entry in entries.iter().filter(|entry| entry.error.is_some()) {
+                    assert_eq!(entry.kind, NodeKind::Directory);
+                    assert!(entry.error.as_deref().unwrap().contains("already visited"));
+                    skipped.push(entry.id);
+                }
+            }
+            model.apply(event);
+        }
+        assert_eq!(skipped, [1, 3, 7, 8]);
+        for id in skipped {
+            assert!(
+                model.node(id).complete,
+                "a skipped alias must stop spinning"
+            );
+            assert_eq!(model.node(id).error_count, 1);
+        }
+        assert!(model.finished);
+        assert!(model.node(0).complete);
+        assert_eq!(model.node(0).error_count, 4);
+        assert_eq!(model.node(5).sizes.apparent, 16);
+        assert!(!model.node(5).hardlink_duplicate);
+        assert_eq!(model.node(6).kind, NodeKind::Symlink);
+    }
+
+    #[test]
+    fn directory_visits_do_not_cross_scan_scopes_or_excluded_paths() {
+        let hardlinks = Arc::new(HardlinkRegistry::default());
+        for excluded in [true, false] {
+            let (sender, receiver) = bounded(4);
+            let mut emitter = Emitter {
+                sender,
+                next_id: 1,
+                visited_directories: HashSet::from([(1, 1)]),
+                hardlinks: Arc::clone(&hardlinks),
+            };
+            let control = ScanControl::default();
+            if excluded {
+                control.exclude(Path::new("first"));
+            }
+            let discovered = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        Arc::from(OsStr::new(name)),
+                        Ok(EntryMetadata {
+                            kind: NodeKind::Directory,
+                            sizes: Sizes::default(),
+                            identity: Some((1, 2)),
+                            links: 2,
+                        }),
+                    )
+                })
+                .collect();
+            let directories = emitter
+                .entries(&task(0, ""), discovered, &AtomicBool::new(false), &control)
+                .unwrap();
+            assert_eq!(directories.len(), 1);
+            assert_eq!(directories[0].id, 1);
+            assert_eq!(
+                directories[0].path,
+                Path::new(if excluded { "second" } else { "first" }),
+            );
+            let events: Vec<_> = receiver.try_iter().collect();
+            assert_eq!(events.len(), if excluded { 1 } else { 2 });
+        }
+    }
+
+    #[test]
     fn hardlink_batch_preserves_order_and_releases_registry_before_delivery() {
         let (sender, receiver) = bounded(0);
         let hardlinks = Arc::new(HardlinkRegistry::default());
@@ -2572,6 +2824,7 @@ mod tests {
             let mut emitter = Emitter {
                 sender,
                 next_id: 1,
+                visited_directories: HashSet::new(),
                 hardlinks: worker_hardlinks,
             };
             let discovered = [("first", 42), ("alias", 42), ("second", 43)]
@@ -2643,6 +2896,7 @@ mod tests {
         let mut emitter = Emitter {
             sender,
             next_id: 1,
+            visited_directories: HashSet::new(),
             hardlinks: Arc::new(HardlinkRegistry::default()),
         };
         let cancel = AtomicBool::new(false);

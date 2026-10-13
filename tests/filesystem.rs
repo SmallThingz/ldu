@@ -196,13 +196,12 @@ fn streamed_scan_conserves_inode_totals_preserves_names_and_never_follows_symlin
     }
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn scanner_traverses_deep_relative_paths_beyond_the_kernel_pathname_limit() {
-    use std::os::fd::AsRawFd;
+/// Build and charge deep paths through retained descriptors, including on systems
+/// whose PATH_MAX is shorter than the logical fixture path.
+fn deep_fixture(root: &Path, depth: usize, padding: &str, payload: &[u8]) -> (PathBuf, Sizes) {
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+    use std::io::Write;
 
-    let work = fixture();
-    let root = work.path();
     let mut parent = File::open(root).unwrap();
     let mut relative = PathBuf::new();
     let mut expected = Sizes::default();
@@ -210,29 +209,50 @@ fn scanner_traverses_deep_relative_paths_beyond_the_kernel_pathname_limit() {
         apparent: metadata.len(),
         allocated: metadata.blocks() * 512,
     };
-    // Keep every filesystem operation short while the logical path exceeds 4096 bytes.
-    for n in 0..96 {
-        let name = format!("layer-{n:03}-{}", "x".repeat(40));
-        let short_parent = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
-        let child = short_parent.join(&name);
-        fs::create_dir(&child).unwrap();
+    for level in 0..depth {
+        let name = format!("d-{level:03}{padding}");
+        mkdirat(&parent, name.as_str(), Mode::RWXU).unwrap();
         let own = charge(parent.metadata().unwrap());
         expected.apparent += own.apparent;
         expected.allocated += own.allocated;
-        parent = File::open(child).unwrap();
+        parent = File::from(
+            openat(
+                &parent,
+                name.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
         relative.push(name);
     }
-    assert!(relative.as_os_str().as_encoded_bytes().len() > 4096);
-    let short_leaf = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join("leaf");
-    fs::write(&short_leaf, b"deep scanner payload").unwrap();
+    let mut leaf = File::from(
+        openat(
+            &parent,
+            "leaf",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap(),
+    );
+    leaf.write_all(payload).unwrap();
     for own in [
         charge(parent.metadata().unwrap()),
-        charge(fs::symlink_metadata(&short_leaf).unwrap()),
+        charge(leaf.metadata().unwrap()),
     ] {
         expected.apparent += own.apparent;
         expected.allocated += own.allocated;
     }
-    let leaf_path = root.join(relative).join("leaf");
+    (relative.join("leaf"), expected)
+}
+
+#[test]
+fn scanner_traverses_deep_relative_paths_beyond_the_kernel_pathname_limit() {
+    let work = fixture();
+    let root = work.path();
+    let (relative, expected) = deep_fixture(root, 96, &"x".repeat(40), b"deep scanner payload");
+    assert!(relative.as_os_str().as_encoded_bytes().len() > 4096);
+    let leaf_path = root.join(relative);
     for backend in [Backend::Auto, Backend::Std, Backend::Native] {
         let model = scan_model(root, backend);
         assert_eq!(model.node(ROOT).sizes, expected);
@@ -348,6 +368,20 @@ fn cli_error_with_disconnected_stderr_keeps_failure_exit_status() {
 
 fn export_scan(path: &Path) -> std::process::Output {
     ldu_command()
+        .args(["-o", "-", "--threads", "2"])
+        .arg(path)
+        .output()
+        .unwrap()
+}
+
+fn export_scan_from(directory: &Path, path: &Path) -> std::process::Output {
+    // Resolve before changing cwd, including a relative LDU_TEST_BIN override.
+    let original = ldu_command();
+    let binary = std::path::absolute(Path::new(original.get_program())).unwrap();
+    Command::new(binary)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .current_dir(directory)
         .args(["-o", "-", "--threads", "2"])
         .arg(path)
         .output()
@@ -485,6 +519,76 @@ fn headless_export_exports_the_full_ncdu_tree_with_counted_own_sizes() {
         assert!(record.get("dev").is_none());
         assert!(record.get("nlink").is_none());
     }
+}
+
+#[test]
+fn cli_normalizes_current_and_child_paths_before_exporting() {
+    let work = fixture();
+    fs::create_dir_all(work.path().join("child/nested")).unwrap();
+    fs::write(work.path().join("child/nested/payload"), b"contents").unwrap();
+    let physical = work.path().canonicalize().unwrap();
+    for (argument, suffix) in [
+        (".", ""),
+        ("./child", "child"),
+        ("././child//./nested//.", "child/nested"),
+        ("./child/nested/../.", "child/nested/.."),
+    ] {
+        let output = export_scan_from(work.path(), Path::new(argument));
+        assert!(
+            output.status.success(),
+            "{argument}: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let document = ncdu_document(&output);
+        let expected = if suffix.is_empty() {
+            physical.clone()
+        } else {
+            physical.join(suffix)
+        };
+        assert_eq!(
+            document[3][0]["name"],
+            expected.to_string_lossy().as_ref(),
+            "{argument}",
+        );
+        let records = ncdu_records(&document[3]);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["name"] == "payload")
+                .count(),
+            1,
+        );
+        assert!(records.iter().all(|record| record["read_error"] != true));
+    }
+}
+
+#[test]
+fn cli_normalization_keeps_final_symlinks_as_leaves() {
+    let work = fixture();
+    fs::create_dir(work.path().join("target")).unwrap();
+    fs::write(work.path().join("target/must-not-open"), b"outside").unwrap();
+    symlink("target", work.path().join("alias")).unwrap();
+    let physical = work.path().canonicalize().unwrap();
+    for argument in ["./alias", "./alias/", "./alias/.", "././alias//./"] {
+        let output = export_scan_from(work.path(), Path::new(argument));
+        assert!(
+            output.status.success(),
+            "{argument}: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let document = ncdu_document(&output);
+        let records = ncdu_records(&document[3]);
+        assert_eq!(records.len(), 2, "only the parent wrapper and symlink");
+        assert_eq!(document[3][0]["name"], physical.to_string_lossy().as_ref());
+        assert_eq!(document[3][1]["name"], "alias");
+        assert_eq!(document[3][1]["notreg"], true);
+        assert_eq!(document[3][1]["asize"], 6);
+        assert!(records.iter().all(|record| record["read_error"] != true));
+    }
+    assert_eq!(
+        fs::read(work.path().join("target/must-not-open")).unwrap(),
+        b"outside"
+    );
 }
 
 #[test]
@@ -639,13 +743,7 @@ fn json_delimiter(input: &[u8], delimiter: u8) -> &[u8] {
 #[test]
 fn headless_export_exports_deep_trees_without_recursive_serialization() {
     let work = fixture();
-    let mut leaf = work.path().to_owned();
-    for level in 0..192 {
-        leaf.push(format!("d-{level:03}"));
-        fs::create_dir(&leaf).unwrap();
-    }
-    fs::write(leaf.join("leaf"), b"deep").unwrap();
-    let expected = reference(work.path(), &mut HashSet::new());
+    let (_, expected) = deep_fixture(work.path(), 192, "", b"deep");
     let output = export_scan(work.path());
     assert!(
         output.status.success(),
@@ -682,8 +780,7 @@ fn headless_export_exports_deep_trees_without_recursive_serialization() {
         input = json_delimiter(input, b']');
     }
     assert!(input.trim_ascii().is_empty());
-    assert_eq!(total, expected.0);
-    assert_eq!(expected.1, 193);
+    assert_eq!(total, expected);
 }
 
 #[cfg(target_os = "linux")]

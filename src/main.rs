@@ -119,6 +119,8 @@ fn run(args: Args) -> io::Result<bool> {
     } else {
         std::env::current_dir()?.join(args.path)
     };
+    // Normalize display and scan roots together without resolving symlink targets.
+    let root = ldu::backend::normalize_root_path(&root);
     let Some(output) = args.output else {
         ldu::tui::run(root, options, mode, settings)?;
         return Ok(false);

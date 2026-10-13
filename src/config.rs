@@ -292,7 +292,8 @@ mod tests {
 
     #[test]
     fn missing_config_is_optional_but_invalid_or_oversized_files_fail() {
-        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
         let path = fixture.path().join("config");
         assert_eq!(load_path(&path).unwrap().ui, Settings::default());
         std::fs::write(&path, b"mouse=false\n").unwrap();
@@ -320,8 +321,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn config_fifo_is_rejected_without_waiting_for_a_writer() {
-        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
         let path = fixture.path().join("config");
+        #[cfg(not(target_vendor = "apple"))]
         rustix::fs::mknodat(
             rustix::fs::CWD,
             &path,
@@ -330,6 +333,20 @@ mod tests {
             0,
         )
         .unwrap();
+        #[cfg(target_vendor = "apple")]
+        {
+            // Darwin has mkfifo but rustix does not expose mkfifoat there.
+            let output = std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mkfifo failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         assert!(
             load_path(&path)
                 .err()

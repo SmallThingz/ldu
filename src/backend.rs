@@ -1,14 +1,17 @@
-//! Directory enumeration and no-follow metadata, with a buffered Linux backend.
+//! Anchored directory enumeration and no-follow metadata on Unix.
 
 use std::{
     ffi::OsStr,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+#[cfg(any(target_os = "linux", not(unix), test))]
+use std::fs;
 
 use crate::types::{NodeKind, Sizes};
 
@@ -31,16 +34,16 @@ pub struct EntryMetadata {
 /// Shared by metadata jobs; native lookups remain relative to the open directory.
 #[derive(Debug)]
 pub enum MetadataReader {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Native(rustix::fd::OwnedFd),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     Std(PathBuf),
 }
 
 impl MetadataReader {
     pub fn metadata(&self, name: &OsStr) -> io::Result<EntryMetadata> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Native(fd) => {
                 use rustix::fs::{AtFlags, statat};
                 loop {
@@ -51,19 +54,23 @@ impl MetadataReader {
                     }
                 }
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             Self::Std(path) => std_path_metadata(&path.join(name)),
         }
     }
 }
 
-/// A scan's root object. Linux operations resolve through its descriptor, never
+/// A scan's root object. Unix operations resolve through its descriptor, never
 /// through the display path after opening it in the scanner thread.
 #[derive(Debug)]
 pub struct RootAnchor {
     path: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fd: rustix::fd::OwnedFd,
+    // Platforms without O_PATH retain a snapshot for a non-directory root. Such
+    // a root cannot be traversed, so its parent descriptor is never used as it.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+    leaf: Option<EntryMetadata>,
     #[cfg(target_os = "linux")]
     openat2_available: AtomicBool,
 }
@@ -84,10 +91,10 @@ impl RootAnchor {
                 "empty scan root",
             ));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            use rustix::fs::{Mode, OFlags, open};
-            let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+            use rustix::fs::{Mode, open};
+            let flags = search_directory_flags();
             let base_name = if path.is_absolute() { "/" } else { "." };
             let base = loop {
                 check_cancel(cancel)?;
@@ -101,20 +108,28 @@ impl RootAnchor {
             } else {
                 path.as_path()
             };
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             let fd = component_open_cancellable(
                 &base,
                 relative,
-                OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
                 cancel,
             )?;
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            let (fd, leaf) = open_portable_root(&base, relative, cancel)?;
             check_cancel(cancel)?;
             Ok(Self {
                 path,
                 fd,
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                leaf,
+                #[cfg(target_os = "linux")]
                 openat2_available: AtomicBool::new(true),
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             loop {
                 check_cancel(cancel)?;
@@ -134,8 +149,12 @@ impl RootAnchor {
     }
 
     pub fn metadata(&self) -> io::Result<EntryMetadata> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            if let Some(metadata) = self.leaf {
+                return Ok(metadata);
+            }
             loop {
                 match rustix::fs::fstat(&self.fd) {
                     Ok(stat) => return Ok(native_metadata(stat)),
@@ -144,20 +163,20 @@ impl RootAnchor {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             std_path_metadata(&self.path)
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn open_directory(&self, relative: &Path) -> io::Result<rustix::fd::OwnedFd> {
         self.open_directory_cancellable(relative, &AtomicBool::new(false))
     }
 
     /// Preserve anchored resolution while allowing cancellation between opens
     /// and interrupted retries, including the deep-path component fallback.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn open_directory_cancellable(
         &self,
         relative: &Path,
@@ -171,60 +190,120 @@ impl RootAnchor {
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn open_directory_with_flags_cancellable(
         &self,
         relative: &Path,
         cancel: &AtomicBool,
         flags: rustix::fs::OFlags,
     ) -> io::Result<rustix::fd::OwnedFd> {
-        use rustix::fs::{Mode, ResolveFlags, openat2};
         check_open_cancel(cancel)?;
         validate_relative(relative)?;
-        let path = if relative.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            relative
-        };
-        if self.openat2_available.load(Ordering::Relaxed) {
-            loop {
-                check_open_cancel(cancel)?;
-                match openat2(
-                    &self.fd,
-                    path,
-                    flags,
-                    Mode::empty(),
-                    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-                ) {
-                    Ok(fd) => {
-                        check_open_cancel(cancel)?;
-                        return Ok(fd);
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        if self.leaf.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "the scan root is not a directory",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, ResolveFlags, openat2};
+            let path = if relative.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative
+            };
+            if self.openat2_available.load(Ordering::Relaxed) {
+                loop {
+                    check_open_cancel(cancel)?;
+                    match openat2(
+                        &self.fd,
+                        path,
+                        flags,
+                        Mode::empty(),
+                        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+                    ) {
+                        Ok(fd) => {
+                            check_open_cancel(cancel)?;
+                            return Ok(fd);
+                        }
+                        Err(rustix::io::Errno::INTR) => continue,
+                        // Whole paths can exceed PATH_MAX while each component is valid.
+                        Err(rustix::io::Errno::NAMETOOLONG) => break,
+                        Err(
+                            rustix::io::Errno::NOSYS
+                            | rustix::io::Errno::INVAL
+                            | rustix::io::Errno::PERM,
+                        ) => {
+                            self.openat2_available.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
                     }
-                    Err(rustix::io::Errno::INTR) => continue,
-                    // Whole paths can exceed PATH_MAX while each component is valid.
-                    Err(rustix::io::Errno::NAMETOOLONG) => break,
-                    Err(
-                        rustix::io::Errno::NOSYS
-                        | rustix::io::Errno::INVAL
-                        | rustix::io::Errno::PERM,
-                    ) => {
-                        self.openat2_available.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
                 }
             }
         }
         component_open_cancellable(&self.fd, relative, flags, cancel)
     }
 
+    /// Record the logical ancestors of a directory deletion without reopening
+    /// the display path. The caller retains its parent descriptor throughout
+    /// this walk; a changed parent fails rather than retargeting the operation.
+    #[cfg(unix)]
+    pub(crate) fn parent_ancestors_cancellable(
+        &self,
+        relative: &Path,
+        expected_parent: (u64, u64),
+        cancel: &AtomicBool,
+    ) -> io::Result<std::collections::HashSet<(u64, u64)>> {
+        check_open_cancel(cancel)?;
+        validate_relative(relative)?;
+        let Some(parent_path) = relative.parent().filter(|_| relative.file_name().is_some()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the scan root has no selectable parent",
+            ));
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        if self.leaf.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "the scan root is not a directory",
+            ));
+        }
+        let mut ancestors = std::collections::HashSet::new();
+        let mut identity = record_parent_ancestor(&self.fd, &mut ancestors, cancel)?;
+        let mut current = None;
+        for component in parent_path.components() {
+            let std::path::Component::Normal(name) = component else {
+                continue;
+            };
+            let next = open_component_cancellable(
+                current.as_ref().unwrap_or(&self.fd),
+                name,
+                search_directory_flags(),
+                cancel,
+            )?;
+            identity = record_parent_ancestor(&next, &mut ancestors, cancel)?;
+            current = Some(next);
+        }
+        if identity != expected_parent {
+            return Err(io::Error::other(
+                "the deletion parent changed during ancestor checks",
+            ));
+        }
+        check_open_cancel(cancel)?;
+        Ok(ancestors)
+    }
+
     /// Open a selected entry's parent while retaining the original scan root.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn open_parent(&self, relative: &Path) -> io::Result<rustix::fd::OwnedFd> {
         self.open_parent_cancellable(relative, &AtomicBool::new(false))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn open_parent_cancellable(
         &self,
         relative: &Path,
@@ -238,15 +317,12 @@ impl RootAnchor {
                 "the scan root has no selectable parent",
             ));
         }
-        // Identity capture and unlinkat only need a searchable, retained parent;
-        // requiring read permission rejects otherwise deletable entries.
+        // Keep searchable-only descriptors where the OS supports them; requiring
+        // read permission would reject otherwise deletable entries.
         self.open_directory_with_flags_cancellable(
             relative.parent().unwrap_or(Path::new("")),
             cancel,
-            rustix::fs::OFlags::PATH
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC
-                | rustix::fs::OFlags::NOFOLLOW,
+            search_directory_flags(),
         )
     }
 }
@@ -274,14 +350,63 @@ fn validate_relative(relative: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Retain ancestors without reading them where supported. Darwin O_EVTONLY
+/// still requires read permission unless its process I/O policy disables that
+/// requirement; every platform preserves no-follow descriptor resolution.
+#[cfg(unix)]
+fn search_directory_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let access = OFlags::PATH;
+    #[cfg(target_os = "macos")]
+    let access = OFlags::from_bits_retain(libc::O_EVTONLY as _);
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+    let access = OFlags::RDONLY;
+    access | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+fn open_portable_root(
+    base: &rustix::fd::OwnedFd,
+    relative: &Path,
+    cancel: &AtomicBool,
+) -> io::Result<(rustix::fd::OwnedFd, Option<EntryMetadata>)> {
+    let Some(name) = relative.file_name() else {
+        let fd = component_open_cancellable(base, relative, search_directory_flags(), cancel)?;
+        return Ok((fd, None));
+    };
+    let parent = component_open_cancellable(
+        base,
+        relative.parent().unwrap_or(Path::new("")),
+        search_directory_flags(),
+        cancel,
+    )?;
+    let metadata = loop {
+        check_open_cancel(cancel)?;
+        match rustix::fs::statat(&parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => break native_metadata(stat),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    check_open_cancel(cancel)?;
+    if metadata.kind == NodeKind::Directory {
+        let fd = open_component_cancellable(&parent, name, search_directory_flags(), cancel)?;
+        Ok((fd, None))
+    } else {
+        // Never open a FIFO, device, or symlink merely to retain root metadata.
+        // The captured parent stays alive, but every traversal rejects this root.
+        Ok((parent, Some(metadata)))
+    }
+}
+
+#[cfg(unix)]
 fn component_open_cancellable(
     base: &rustix::fd::OwnedFd,
     path: &Path,
     final_flags: rustix::fs::OFlags,
     cancel: &AtomicBool,
 ) -> io::Result<rustix::fd::OwnedFd> {
-    use rustix::fs::OFlags;
     use std::path::Component;
     let mut components = path
         .components()
@@ -302,7 +427,7 @@ fn component_open_cancellable(
         let flags = if components.peek().is_none() {
             final_flags
         } else {
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+            search_directory_flags()
         };
         let next =
             open_component_cancellable(current.as_ref().unwrap_or(base), name, flags, cancel)?;
@@ -314,7 +439,7 @@ fn component_open_cancellable(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_component_cancellable(
     parent: &rustix::fd::OwnedFd,
     name: &OsStr,
@@ -334,7 +459,37 @@ fn open_component_cancellable(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // Stat field widths differ between Unix targets.
+fn record_parent_ancestor(
+    fd: &rustix::fd::OwnedFd,
+    ancestors: &mut std::collections::HashSet<(u64, u64)>,
+    cancel: &AtomicBool,
+) -> io::Result<(u64, u64)> {
+    let stat = loop {
+        check_open_cancel(cancel)?;
+        match rustix::fs::fstat(fd) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => break result.map_err(io::Error::from)?,
+        }
+    };
+    check_open_cancel(cancel)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "a deletion ancestor is not a directory",
+        ));
+    }
+    let identity = (stat.st_dev as u64, stat.st_ino as u64);
+    if !ancestors.insert(identity) {
+        return Err(io::Error::other(
+            "deletion parent path refers to an ancestor directory",
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
 fn check_open_cancel(cancel: &AtomicBool) -> io::Result<()> {
     if cancel.load(Ordering::Relaxed) {
         Err(io::Error::new(
@@ -347,17 +502,17 @@ fn check_open_cancel(cancel: &AtomicBool) -> io::Result<()> {
 }
 
 pub fn root_metadata(path: &Path) -> io::Result<EntryMetadata> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         RootAnchor::open(path)?.metadata()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         std_path_metadata(&normalize_root_path(path))
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn std_path_metadata(path: &Path) -> io::Result<EntryMetadata> {
     loop {
         match fs::symlink_metadata(path) {
@@ -428,7 +583,13 @@ pub fn enumerate_anchored(
         let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
         enumerate_std(&path, &reader, batch_size, cancel, &mut emit)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (backend, buffer_size);
+        let reader = MetadataReader::Native(anchor.open_directory_cancellable(relative, cancel)?);
+        enumerate_portable(&reader, batch_size, cancel, &mut emit)
+    }
+    #[cfg(not(unix))]
     {
         validate_relative(relative)?;
         let _ = buffer_size;
@@ -451,6 +612,7 @@ pub fn enumerate_anchored(
     }
 }
 
+#[cfg(any(target_os = "linux", not(unix)))]
 fn enumerate_std(
     path: &Path,
     reader: &MetadataReader,
@@ -475,6 +637,57 @@ fn enumerate_std(
                 return Err(error);
             }
         }
+        if batch.len() == batch_size {
+            flush(&mut batch, reader, emit)?;
+        }
+    }
+    check_cancel(cancel)?;
+    flush(&mut batch, reader, emit)
+}
+
+/// fdopendir/readdir supplies the platform's buffered directory stream on BSD
+/// and macOS. Keeping metadata on the original descriptor preserves anchoring.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn enumerate_portable(
+    reader: &MetadataReader,
+    batch_size: usize,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let MetadataReader::Native(fd) = reader;
+    let mut entries = loop {
+        check_cancel(cancel)?;
+        match rustix::fs::Dir::read_from(fd) {
+            Ok(entries) => break entries,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut batch = Vec::new();
+    loop {
+        check_cancel(cancel)?;
+        let Some(entry) = entries.read() else {
+            break;
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // Dir permanently stops after any error, including EINTR. Do
+                // not turn a partial listing into a successful empty tail.
+                flush(&mut batch, reader, emit)?;
+                return Err(error.into());
+            }
+        };
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        if batch.is_empty() {
+            batch.reserve_exact(batch_size);
+        }
+        batch.push(Arc::from(OsStr::from_bytes(bytes)));
         if batch.len() == batch_size {
             flush(&mut batch, reader, emit)?;
         }
@@ -631,7 +844,7 @@ fn unsupported(error: &io::Error) -> bool {
         )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn std_metadata(metadata: fs::Metadata) -> EntryMetadata {
     let file_type = metadata.file_type();
     let kind = if file_type.is_dir() {
@@ -666,8 +879,8 @@ fn std_metadata(metadata: fs::Metadata) -> EntryMetadata {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[allow(clippy::unnecessary_cast)] // Stat field widths differ between Linux targets.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // Stat field widths differ between Unix targets.
 pub(crate) fn native_metadata(stat: rustix::fs::Stat) -> EntryMetadata {
     use rustix::fs::FileType;
     let kind = match FileType::from_raw_mode(stat.st_mode) {
@@ -694,13 +907,171 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn fixture() -> tempfile::TempDir {
         fs::create_dir_all(".tmp").unwrap();
         tempfile::Builder::new()
             .prefix("backend-")
             .tempdir_in(".tmp")
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_stream_keeps_metadata_anchored_and_bounds_batches() {
+        use std::os::unix::fs::symlink;
+
+        let directory = fixture();
+        fs::create_dir(directory.path().join("root")).unwrap();
+        fs::create_dir(directory.path().join("outside")).unwrap();
+        fs::write(directory.path().join("root/file"), b"original").unwrap();
+        fs::write(directory.path().join("root/.hidden"), b"hidden").unwrap();
+        fs::write(directory.path().join("outside/file"), b"replacement").unwrap();
+        symlink("../outside", directory.path().join("root/link")).unwrap();
+        let anchor = RootAnchor::open(&directory.path().join("root")).unwrap();
+        let reader = MetadataReader::Native(anchor.open_directory(Path::new("")).unwrap());
+        fs::rename(
+            directory.path().join("root"),
+            directory.path().join("saved"),
+        )
+        .unwrap();
+        symlink("outside", directory.path().join("root")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut seen = std::collections::HashMap::new();
+        enumerate_portable(&reader, 1, &cancel, &mut |names, reader| {
+            assert_eq!(names.len(), 1);
+            for name in names {
+                assert!(seen.insert(name.clone(), reader.metadata(&name)?).is_none());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[OsStr::new("file")].sizes.apparent, 8);
+        assert_eq!(seen[OsStr::new("link")].kind, NodeKind::Symlink);
+
+        let mut calls = 0;
+        let error = enumerate_portable(&reader, 1, &cancel, &mut |_, _| {
+            calls += 1;
+            Err(io::Error::other("callback stopped"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "callback stopped");
+        assert_eq!(calls, 1);
+        cancel.store(true, Ordering::Relaxed);
+        let error = enumerate_portable(&reader, 1, &cancel, &mut |_, _| {
+            panic!("cancelled stream must not emit")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_operations_reject_replaced_descendants_and_cancel_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let directory = fixture();
+        fs::create_dir_all(directory.path().join("root/branch/nested")).unwrap();
+        fs::create_dir_all(directory.path().join("outside/nested")).unwrap();
+        let anchor = RootAnchor::open(&directory.path().join("root")).unwrap();
+        fs::rename(
+            directory.path().join("root/branch"),
+            directory.path().join("root/saved"),
+        )
+        .unwrap();
+        symlink("../outside", directory.path().join("root/branch")).unwrap();
+        assert!(anchor.open_directory(Path::new("branch/nested")).is_err());
+        assert!(anchor.open_parent(Path::new("branch/nested/file")).is_err());
+        assert!(anchor.open_directory(Path::new("../outside")).is_err());
+        assert!(anchor.open_parent(Path::new("")).is_err());
+        let cancel = AtomicBool::new(true);
+        for relative in [Path::new(""), Path::new("missing")] {
+            let error = anchor
+                .open_directory_cancellable(relative, &cancel)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+        let error = anchor
+            .open_parent_cancellable(Path::new("missing/file"), &cancel)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+    #[test]
+    fn unreadable_directory_anchor_keeps_identity_when_the_os_allows_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = fixture();
+        let root = directory.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let expected = root_metadata(&root).unwrap().identity;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o0)).unwrap();
+        let result = RootAnchor::open(&root);
+        // Restore permissions even when an unexpected open failure is asserted.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(target_os = "macos")]
+        if let Err(error) = &result {
+            // Darwin's inherited O_EVTONLY I/O policy can require read access.
+            // Keep that failure closed instead of resolving through the path.
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            return;
+        }
+        let anchor = result.unwrap();
+        assert_eq!(anchor.metadata().unwrap().identity, expected);
+        fs::rename(&root, directory.path().join("saved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("replacement"), b"outside the retained root").unwrap();
+        assert_eq!(anchor.metadata().unwrap().identity, expected);
+        enumerate_anchored(
+            &anchor,
+            Path::new(""),
+            Backend::Auto,
+            4096,
+            1,
+            &AtomicBool::new(false),
+            |_, _| panic!("a replacement root must not supply directory entries"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_roots_keep_their_kind_without_opening_or_traversing_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = fixture();
+        fs::write(directory.path().join("file"), b"payload").unwrap();
+        symlink("file", directory.path().join("link")).unwrap();
+        let _socket =
+            std::os::unix::net::UnixListener::bind(directory.path().join("socket")).unwrap();
+        for (name, kind) in [
+            ("file", NodeKind::File),
+            ("link", NodeKind::Symlink),
+            ("socket", NodeKind::Other),
+        ] {
+            let anchor = RootAnchor::open(&directory.path().join(name)).unwrap();
+            assert_eq!(anchor.metadata().unwrap().kind, kind);
+            assert!(anchor.open_directory(Path::new("")).is_err());
+            assert!(anchor.open_parent(Path::new("child")).is_err());
+        }
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn fifo_root_is_not_opened_for_reading() {
+        let directory = fixture();
+        let path = directory.path().join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let anchor = RootAnchor::open(&path).unwrap();
+        assert_eq!(anchor.metadata().unwrap().kind, NodeKind::Other);
+        assert!(anchor.open_directory(Path::new("")).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -792,7 +1163,7 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn native_and_std_agree_on_raw_names_sparse_files_and_symlinks() {
         use std::collections::HashMap;
@@ -849,7 +1220,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn directory_symlink_is_rejected_without_fallback_or_entries() {
         use std::os::unix::fs::symlink;
@@ -890,7 +1261,7 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn callback_error_does_not_trigger_duplicate_fallback() {
         let directory = fixture();
@@ -908,7 +1279,31 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
+    #[test]
+    fn root_normalization_preserves_parent_resolution_and_rejects_alias_ancestors() {
+        use std::os::unix::fs::symlink;
+        let directory = fixture();
+        fs::create_dir_all(directory.path().join("real/child")).unwrap();
+        symlink("real", directory.path().join("alias")).unwrap();
+        let root = directory.path().join("real/./child//../.");
+        let anchor = RootAnchor::open(&root).unwrap();
+        assert_eq!(anchor.root_path(), directory.path().join("real/child/.."));
+        assert_eq!(
+            anchor.metadata().unwrap().identity,
+            root_metadata(&directory.path().join("real"))
+                .unwrap()
+                .identity,
+        );
+        for suffix in ["alias/../real", "missing/../real"] {
+            assert!(
+                RootAnchor::open(&directory.path().join(suffix)).is_err(),
+                "normalization must not erase an unresolved ancestor",
+            );
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn trailing_symlink_root_components_never_follow_the_target() {
         use std::os::unix::fs::symlink;
@@ -935,7 +1330,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn captured_root_survives_display_ancestor_replacement_for_all_backends() {
         use std::os::unix::fs::symlink;
@@ -975,6 +1370,134 @@ mod tests {
             assert_eq!(count, 1);
             assert_eq!(anchor.metadata().unwrap().identity, original_identity);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_ancestors_retain_the_whole_logical_chain_after_root_replacement() {
+        use std::os::unix::fs::symlink;
+        let directory = fixture();
+        let root = directory.path().join("root");
+        fs::create_dir_all(root.join("branch/parent")).unwrap();
+        let anchor = RootAnchor::open(&root).unwrap();
+        let root_identity = anchor.metadata().unwrap().identity.unwrap();
+        let branch = anchor.open_directory(Path::new("branch")).unwrap();
+        let branch_identity = native_metadata(rustix::fs::fstat(&branch).unwrap())
+            .identity
+            .unwrap();
+        let parent = anchor
+            .open_parent(Path::new("branch/parent/target"))
+            .unwrap();
+        let parent_identity = native_metadata(rustix::fs::fstat(&parent).unwrap())
+            .identity
+            .unwrap();
+        fs::rename(&root, directory.path().join("saved")).unwrap();
+        fs::create_dir_all(directory.path().join("outside/branch/parent")).unwrap();
+        symlink("outside", &root).unwrap();
+        let ancestors = anchor
+            .parent_ancestors_cancellable(
+                Path::new("branch/parent/target"),
+                parent_identity,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            ancestors,
+            std::collections::HashSet::from([root_identity, branch_identity, parent_identity,])
+        );
+        assert_eq!(
+            anchor
+                .parent_ancestors_cancellable(
+                    Path::new("target"),
+                    root_identity,
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+            std::collections::HashSet::from([root_identity])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_ancestor_walk_rejects_replaced_parents_symlinks_and_cancellation() {
+        use std::os::unix::fs::symlink;
+        let directory = fixture();
+        fs::create_dir_all(directory.path().join("parent")).unwrap();
+        let anchor = RootAnchor::open(directory.path()).unwrap();
+        let parent = anchor.open_parent(Path::new("parent/target")).unwrap();
+        let identity = native_metadata(rustix::fs::fstat(&parent).unwrap())
+            .identity
+            .unwrap();
+        fs::rename(
+            directory.path().join("parent"),
+            directory.path().join("saved"),
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("parent")).unwrap();
+        let result = anchor.parent_ancestors_cancellable(
+            Path::new("parent/target"),
+            identity,
+            &AtomicBool::new(false),
+        );
+        assert!(result.unwrap_err().to_string().contains("changed"));
+        fs::remove_dir(directory.path().join("parent")).unwrap();
+        symlink("saved", directory.path().join("parent")).unwrap();
+        assert!(
+            anchor
+                .parent_ancestors_cancellable(
+                    Path::new("parent/target"),
+                    identity,
+                    &AtomicBool::new(false),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            anchor
+                .parent_ancestors_cancellable(
+                    Path::new("saved/target"),
+                    identity,
+                    &AtomicBool::new(true),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        for path in ["", ".", "../target", "/target"] {
+            assert!(
+                anchor
+                    .parent_ancestors_cancellable(
+                        Path::new(path),
+                        identity,
+                        &AtomicBool::new(false),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_ancestor_walk_rejects_repeated_directory_identity_and_leaf_roots() {
+        let directory = fixture();
+        fs::write(directory.path().join("leaf"), b"keep").unwrap();
+        let anchor = RootAnchor::open(directory.path()).unwrap();
+        let mut ancestors = std::collections::HashSet::new();
+        let cancel = AtomicBool::new(false);
+        record_parent_ancestor(&anchor.fd, &mut ancestors, &cancel).unwrap();
+        let error = record_parent_ancestor(&anchor.fd, &mut ancestors, &cancel).unwrap_err();
+        assert!(error.to_string().contains("ancestor directory"));
+        assert_eq!(ancestors.len(), 1);
+        let leaf = RootAnchor::open(&directory.path().join("leaf")).unwrap();
+        assert_eq!(
+            leaf.parent_ancestors_cancellable(
+                Path::new("target"),
+                anchor.metadata().unwrap().identity.unwrap(),
+                &cancel,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::NotADirectory
+        );
     }
 
     #[cfg(target_os = "linux")]
