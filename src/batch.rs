@@ -18,6 +18,7 @@ enum Request {
     Entry(NodeId, PathBuf, usize),
     Finish,
     Confirm,
+    Cancel,
 }
 
 pub enum BatchEvent {
@@ -150,6 +151,9 @@ impl BatchCapture {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
+        // A full input channel already wakes the receiver. Output backpressure
+        // observes the flag, so cancellation never needs to wait for capacity.
+        let _ = self.requests.try_send(Request::Cancel);
     }
 
     pub fn is_finished(&self) -> bool {
@@ -254,7 +258,7 @@ fn prepare(
         if cancel.load(Ordering::Acquire) {
             return;
         }
-        match input.recv_timeout(INTERVAL) {
+        match input.recv() {
             Ok(Request::Entry(node, relative, ordinal)) => {
                 if cancel.load(Ordering::Acquire) {
                     return;
@@ -284,8 +288,7 @@ fn prepare(
                 let _ = send(&output, BatchEvent::Done, &cancel);
                 return;
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Ok(Request::Cancel) | Err(_) => return,
         }
     }
     // Display positions and legacy input ordinals are unique. Sorting here
@@ -301,15 +304,8 @@ fn prepare(
     ) {
         return;
     }
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            return;
-        }
-        match input.recv_timeout(INTERVAL) {
-            Ok(Request::Confirm) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            _ => return,
-        }
+    if cancel.load(Ordering::Acquire) || !matches!(input.recv(), Ok(Request::Confirm)) {
+        return;
     }
     for (_, node, relative, target) in entries {
         if !send(
@@ -360,6 +356,37 @@ mod tests {
             assert!(Instant::now() < deadline, "batch cancellation timed out");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Keep both channels connected so shutdown must come from cancellation,
+    /// including when dropping the public handle. Bound the cancel call itself
+    /// as well as worker completion, since either channel may be saturated.
+    fn cancel_or_drop(batch: BatchCapture, drop_handle: bool) -> Option<BatchCapture> {
+        let finished = Arc::clone(&batch.finished);
+        let requests = batch.requests.clone();
+        let events = batch.events.clone();
+        let (done, completion) = bounded(1);
+        let action = thread::spawn(move || {
+            let batch = if drop_handle {
+                drop(batch);
+                None
+            } else {
+                batch.cancel();
+                Some(batch)
+            };
+            assert!(done.send(batch).is_ok());
+        });
+        let batch = completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation blocked on a full channel");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "cancelled worker did not stop");
+            thread::sleep(Duration::from_millis(1));
+        }
+        action.join().unwrap();
+        drop((requests, events));
+        batch
     }
 
     #[test]
@@ -494,8 +521,15 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_releases_unconfirmed_and_backpressured_selections() {
-        for count in [1, CAPACITY * 2] {
+    fn cancellation_and_drop_release_idle_and_backpressured_selections() {
+        for (count, drop_handle) in [
+            (0, false),
+            (0, true),
+            (1, false),
+            (1, true),
+            (CAPACITY * 2, false),
+            (CAPACITY * 2, true),
+        ] {
             let work = fixture();
             let anchor = Arc::new(RootAnchor::open(work.path()).unwrap());
             let batch = BatchCapture::new(anchor).unwrap();
@@ -511,21 +545,33 @@ mod tests {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
-            while !batch.finish_input() {
-                assert!(Instant::now() < deadline, "batch finish timed out");
-                thread::sleep(Duration::from_millis(1));
+            // Zero entries leaves the input phase open. One waits at Ready;
+            // the large case reaches confirmed output backpressure below.
+            if count > 0 {
+                while !batch.finish_input() {
+                    assert!(Instant::now() < deadline, "batch finish timed out");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    matches!(next(&batch), BatchEvent::Ready { count: ready } if ready == count)
+                );
             }
-            assert!(matches!(next(&batch), BatchEvent::Ready { count: ready } if ready == count));
             if count > CAPACITY {
                 assert!(batch.confirm());
                 while batch.events.len() < CAPACITY {
                     assert!(Instant::now() < deadline, "batch output did not fill");
                     thread::sleep(Duration::from_millis(1));
                 }
+                // The worker cannot consume more input while output is full.
+                // Saturate requests too: Cancel must never block on capacity.
+                for _ in 0..CAPACITY {
+                    assert!(batch.requests.try_send(Request::Confirm).is_ok());
+                }
+                assert!(batch.requests.is_full());
             }
-            batch.cancel();
-            stopped(&batch);
-            if count == 1 {
+            if let Some(batch) = cancel_or_drop(batch, drop_handle)
+                && count <= 1
+            {
                 assert!(!batch.confirm());
                 assert!(batch.event().is_none());
             }
