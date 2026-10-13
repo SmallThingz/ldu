@@ -187,6 +187,7 @@ fn delete_long_spaced_target_can_scroll_to_last_component_with_pinned_choices() 
         confirm_requested: false,
         confirmed: Some(test_confirmed_target()),
         capture: None,
+        guard_until: None,
     });
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(38, 10)).unwrap();
     terminal
@@ -271,6 +272,7 @@ fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
                 confirm_requested: false,
                 confirmed: None,
                 capture: Some(receiver),
+                guard_until: None,
             });
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
             terminal
@@ -349,6 +351,667 @@ fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn guarded_delete_capture(
+    app: &mut App,
+    until: Instant,
+) -> crossbeam_channel::Sender<io::Result<ConfirmedTarget>> {
+    let (sender, receiver) = bounded(1);
+    app.modal = Some(Modal::Delete {
+        id: 2,
+        anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
+        relative: PathBuf::from("root-file"),
+        target: "/fixture/root-file".to_owned(),
+        scroll: 0,
+        reviewable: false,
+        confirm_requested: false,
+        confirmed: None,
+        capture: Some(receiver),
+        guard_until: Some(until),
+    });
+    sender
+}
+
+#[test]
+fn hover_guard_tracks_changed_entries_without_extending_for_same_row_motion() {
+    let mut app = browser_fixture();
+    app.selected = Some(1);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let event = |row, column| MouseEvent {
+        kind: MouseEventKind::Moved,
+        row,
+        column,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.mouse(event(app.list_area.y, 10));
+    assert_eq!(app.selected, Some(1));
+    assert!(app.recent_mouse_entry.is_none());
+    app.mouse(event(app.list_area.y + 1, 10));
+    assert_eq!(app.selected, Some(2));
+    let (id, changed) = app
+        .recent_mouse_entry
+        .expect("changed painted entry arms guard");
+    assert_eq!(id, 2);
+    app.mouse(event(app.list_area.y + 1, 11));
+    app.mouse(event(app.list_area.y + 1, 12));
+    assert_eq!(app.recent_mouse_entry, Some((2, changed)));
+    let within = changed + Duration::from_millis(249);
+    assert_eq!(
+        app.mouse_delete_guard(2, within),
+        Some(within + Duration::from_millis(1250))
+    );
+    assert!(app.mouse_delete_guard(1, within).is_none());
+    assert!(
+        app.mouse_delete_guard(2, changed + Duration::from_millis(250))
+            .is_none()
+    );
+    app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), None, false);
+    assert_eq!(app.selected, Some(1));
+    assert!(app.recent_mouse_entry.is_none());
+}
+
+#[test]
+fn hover_guard_uses_configured_window_and_zero_disables_it() {
+    let mut app = browser_fixture();
+    let changed = Instant::now();
+    app.selected = Some(2);
+    app.settings.mouse_debounce_ms = 17;
+    app.settings.mouse_debounce_delay_ms = 31;
+    app.record_mouse_entry_change(Some(1), 2, changed);
+    let within = changed + Duration::from_millis(16);
+    assert_eq!(
+        app.mouse_delete_guard(2, within),
+        Some(within + Duration::from_millis(31))
+    );
+    assert!(
+        app.mouse_delete_guard(2, changed + Duration::from_millis(17))
+            .is_none()
+    );
+    app.settings.mouse_debounce_ms = 0;
+    assert!(app.mouse_delete_guard(2, changed).is_none());
+    app.settings.mouse_debounce_ms = 17;
+    app.settings.mouse_debounce_delay_ms = 0;
+    assert!(app.mouse_delete_guard(2, changed).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_delete_discards_early_confirmation_before_or_after_capture_arrives() {
+    for warning in [false, true] {
+        for capture_before_expiry in [false, true] {
+            for code in [KeyCode::Enter, KeyCode::Char('y')] {
+                let mut app = browser_fixture();
+                app.settings.mouse_debounce_warning = warning;
+                let until = Instant::now() + Duration::from_secs(60);
+                let sender = guarded_delete_capture(&mut app, until);
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                if capture_before_expiry {
+                    sender.send(Ok(test_confirmed_target())).unwrap();
+                    app.pump_confirmation();
+                }
+                for _ in 0..2 {
+                    assert!(matches!(
+                        app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false),
+                        Action::Continue
+                    ));
+                    assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+                }
+                assert!(matches!(
+                    app.modal,
+                    Some(Modal::Delete {
+                        confirm_requested: false,
+                        ..
+                    })
+                ));
+                assert!(!app.expire_delete_guard(until - Duration::from_millis(1)));
+                assert!(app.expire_delete_guard(until));
+                assert!(!app.expire_delete_guard(until));
+                assert!(app.delete_guard_deadline().is_none());
+                if !capture_before_expiry {
+                    sender.send(Ok(test_confirmed_target())).unwrap();
+                    app.pump_confirmation();
+                }
+                assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                assert!(matches!(
+                    app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false),
+                    Action::Delete(2, _, _, _)
+                ));
+                assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn expired_hover_guard_keeps_fresh_confirmation_while_capture_finishes() {
+    let mut app = browser_fixture();
+    let until = Instant::now() + Duration::from_secs(60);
+    let sender = guarded_delete_capture(&mut app, until);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(app.expire_delete_guard(until));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false
+        ),
+        Action::Continue
+    ));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            confirm_requested: true,
+            ..
+        })
+    ));
+    sender.send(Ok(test_confirmed_target())).unwrap();
+    app.pump_confirmation();
+    assert!(matches!(
+        app.take_ready_confirmation(),
+        Action::Delete(2, _, _, _)
+    ));
+    assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_delete_can_cancel_immediately_by_key_option_or_close() {
+    for cancellation in 0..4 {
+        let mut app = browser_fixture();
+        let until = Instant::now() + Duration::from_secs(60);
+        let sender = guarded_delete_capture(&mut app, until);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let result = match cancellation {
+            0 => Some(app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false)),
+            1 => Some(app.key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                None,
+                false,
+            )),
+            2 => click_dialog_option(&mut app, KeyCode::Esc, false),
+            _ => {
+                let close = app.dialog_close_area;
+                click_control(&mut app, close, false)
+            }
+        };
+        assert!(matches!(result, Some(Action::Continue)));
+        assert!(app.modal.is_none() && app.deferred_delete.is_none());
+        assert!(app.delete_guard_deadline().is_none());
+        let _ = sender.try_send(Ok(test_confirmed_target()));
+        app.pump_confirmation();
+        assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+        assert!(app.modal.is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn quit_question_keeps_guard_with_target_without_blocking_quit_or_retaining_enter() {
+    for approve in [false, true] {
+        let mut app = browser_fixture();
+        let until = Instant::now() + Duration::from_secs(60);
+        let sender = guarded_delete_capture(&mut app, until);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false,
+        );
+        app.request_quit_confirmation();
+        sender.send(Ok(test_confirmed_target())).unwrap();
+        app.pump_confirmation();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+        assert!(!app.confirmation_ready());
+        if approve {
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::Quit
+            ));
+        } else {
+            assert!(matches!(
+                app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false),
+                Action::Continue
+            ));
+            assert!(
+                matches!(app.modal, Some(Modal::Delete { guard_until: Some(deadline), confirm_requested: false, confirmed: Some(_), .. }) if deadline == until)
+            );
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::Continue
+            ));
+            assert!(app.expire_delete_guard(until));
+            assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(matches!(
+                click_dialog_option(&mut app, KeyCode::Enter, false),
+                Some(Action::Delete(2, _, _, _))
+            ));
+        }
+    }
+}
+
+#[test]
+fn recent_hover_does_not_lock_visual_confirmation_or_the_queue() {
+    for visual in [false, true] {
+        let mut app = browser_fixture();
+        app.selected = Some(2);
+        app.record_mouse_entry_change(Some(1), 2, Instant::now());
+        if visual {
+            app.visual.enter(ROOT, Some(2));
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::BatchPrepare
+            ));
+            app.modal = Some(Modal::Batch {
+                target: "/fixture".to_owned(),
+                count: 1,
+                ready: true,
+                reviewable: false,
+                confirm_requested: false,
+                scroll: 0,
+            });
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::BatchConfirm
+            ));
+        } else {
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT),
+                    None,
+                    false
+                ),
+                Action::Continue
+            ));
+            assert!(matches!(app.modal, Some(Modal::Queue { .. })));
+            assert!(matches!(
+                app.key(
+                    KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                    None,
+                    false
+                ),
+                Action::QueuePause
+            ));
+        }
+        assert!(app.delete_guard_deadline().is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hover_guard_stays_with_deferred_delete_target_when_capture_worker_is_busy() {
+    std::fs::create_dir_all(".tmp").unwrap();
+    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    std::fs::write(fixture.path().join("root-file"), b"target").unwrap();
+    let mut app = browser_fixture_at(fixture.path().to_path_buf());
+    app.selected = Some(2);
+    app.settings.mouse_debounce_ms = 60_000;
+    app.settings.mouse_debounce_delay_ms = 60_000;
+    app.record_mouse_entry_change(Some(1), 2, Instant::now());
+    let busy = Arc::new(AtomicBool::new(false));
+    app.capture_inflight = Some(Arc::clone(&busy));
+    let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(anchor),
+            false
+        ),
+        Action::Continue
+    ));
+    let until = app
+        .delete_guard_deadline()
+        .expect("normal d uses recent hover");
+    assert_eq!(
+        app.deferred_delete.as_ref().unwrap().guard_until,
+        Some(until)
+    );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            confirm_requested: false,
+            ..
+        })
+    ));
+    app.selected = Some(1);
+    busy.store(true, Ordering::Release);
+    app.pump_confirmation();
+    assert!(app.deferred_delete.is_none());
+    assert!(
+        matches!(app.modal, Some(Modal::Delete { id: 2, guard_until: Some(deadline), confirm_requested: false, .. }) if deadline == until)
+    );
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+    assert!(app.modal.is_none() && app.delete_guard_deadline().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn display_toggles_and_help_preserve_recent_hover_guard_for_delete() {
+    std::fs::create_dir_all(".tmp").unwrap();
+    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    std::fs::write(fixture.path().join("root-file"), b"target").unwrap();
+    let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+    for code in ['g', 'c', 'b', '?'] {
+        let mut app = browser_fixture_at(fixture.path().to_path_buf());
+        app.selected = Some(2);
+        app.settings.mouse_debounce_ms = 60_000;
+        app.settings.mouse_debounce_delay_ms = 60_000;
+        let changed = Instant::now();
+        app.record_mouse_entry_change(Some(1), 2, changed);
+        app.key(
+            KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+            None,
+            false,
+        );
+        if code == '?' {
+            assert!(matches!(app.modal, Some(Modal::Text { title: "Help", .. })));
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        }
+        assert!(app.modal.is_none());
+        assert_eq!(app.recent_mouse_entry, Some((2, changed)));
+        assert_eq!(app.selected, Some(2));
+        app.capture_inflight = Some(Arc::new(AtomicBool::new(false)));
+        app.key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(Arc::clone(&anchor)),
+            false,
+        );
+        assert!(app.delete_guard_deadline().is_some());
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Delete {
+                id: 2,
+                guard_until: Some(_),
+                ..
+            })
+        ));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+        assert!(app.modal.is_none() && app.deferred_delete.is_none());
+    }
+}
+
+#[test]
+fn disabled_mouse_ignores_hover_wheel_and_selection_gestures() {
+    for visual in [false, true] {
+        let mut app = navigation_fixture(40, 41..=41);
+        app.selected = Some(2);
+        app.offset = 0;
+        if visual {
+            app.visual.enter(ROOT, Some(2));
+        }
+        app.settings.mouse = false;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let before = (app.selected, app.offset, app.visual.len());
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            app.mouse(MouseEvent {
+                kind,
+                column: app.list_area.x + 3,
+                row: app.list_area.y + 5,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!((app.selected, app.offset, app.visual.len()), before);
+            assert_eq!(app.visual.active(), visual);
+            assert!(app.hover_position.is_none() && app.recent_mouse_entry.is_none());
+            assert!(
+                app.normal_click.is_none()
+                    && app.mouse_press_view.is_none()
+                    && app.right_press.is_none()
+            );
+        }
+        app.record_mouse_entry_change(Some(1), 2, Instant::now());
+        assert!(app.recent_mouse_entry.is_none());
+        assert!(app.mouse_delete_guard(2, Instant::now()).is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guarded_warning_tints_blank_cells_and_popup_and_can_be_suppressed() {
+    for warning in [false, true] {
+        let mut app = browser_fixture();
+        app.settings.mouse_debounce_warning = warning;
+        let until = Instant::now() + Duration::from_secs(60);
+        let _sender = guarded_delete_capture(&mut app, until);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let text = rendered(&terminal);
+        assert_eq!(
+            text.contains("Mouse changed selection. Check the target."),
+            warning
+        );
+        assert!(text.contains("/fixture/root-file"));
+        assert!(text.contains("Please wait"));
+        assert!(
+            !app.dialog_mouse
+                .options
+                .iter()
+                .flatten()
+                .any(|option| option.key.code == KeyCode::Enter)
+        );
+        let buffer = terminal.backend().buffer();
+        if warning {
+            assert_eq!(buffer[(79, 17)].bg, app.theme.warning_background);
+            assert_eq!(
+                buffer[(app.dialog_close_area.x, app.dialog_close_area.y)].bg,
+                app.theme.warning_dialog_background
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .all(|cell| cell.bg == app.theme.warning_background
+                        || cell.bg == app.theme.warning_dialog_background)
+            );
+        } else {
+            assert_ne!(buffer[(79, 17)].bg, app.theme.warning_background);
+            assert_ne!(
+                buffer[(app.dialog_close_area.x, app.dialog_close_area.y)].bg,
+                app.theme.warning_dialog_background
+            );
+        }
+        assert!(app.expire_delete_guard(until));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(!rendered(&terminal).contains("Mouse changed selection"));
+        assert!(!rendered(&terminal).contains("Please wait"));
+        assert!(
+            app.dialog_mouse
+                .options
+                .iter()
+                .flatten()
+                .any(|option| option.key.code == KeyCode::Enter)
+        );
+        assert_ne!(
+            terminal.backend().buffer()[(79, 17)].bg,
+            app.theme.warning_background
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mouse_press_during_guard_cannot_confirm_when_released_after_expiry() {
+    for paint_guard in [false, true] {
+        let mut app = browser_fixture();
+        let until = Instant::now() + Duration::from_secs(60);
+        let sender = guarded_delete_capture(&mut app, until);
+        sender.send(Ok(test_confirmed_target())).unwrap();
+        app.pump_confirmation();
+        // Locate the eventual affirmative choice, then also exercise a stale
+        // hitbox whose guarded frame has not been painted yet.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        app.expire_delete_guard(until);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let choice = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == KeyCode::Enter)
+            .unwrap()
+            .area;
+        let Some(Modal::Delete { guard_until, .. }) = app.modal.as_mut() else {
+            panic!("delete target lost");
+        };
+        *guard_until = Some(until);
+        if paint_guard {
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+        }
+        let down = control_event(MouseEventKind::Down(MouseButton::Left), choice);
+        assert!(!matches!(
+            app.modal_option_mouse(down, false),
+            Some(Action::Delete(..))
+        ));
+        assert!(app.expire_delete_guard(until));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(!matches!(
+            app.modal_option_mouse(
+                control_event(MouseEventKind::Up(MouseButton::Left), choice),
+                false
+            ),
+            Some(Action::Delete(..))
+        ));
+        assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+        assert!(matches!(
+            click_dialog_option(&mut app, KeyCode::Enter, false),
+            Some(Action::Delete(2, _, _, _))
+        ));
+    }
+}
+
+#[test]
+fn configured_accent_reaches_directory_graphs_breadcrumbs_and_dialog_choices() {
+    let mut app = browser_fixture();
+    app.settings.color = "magenta".parse().unwrap();
+    app.theme = Theme::detect(app.settings.color);
+    let line = app.row(1, 24, 80, false, spinner_frame(0), DeleteState::default());
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content.contains("folder/") && span.style.fg == Some(Color::Magenta))
+    );
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content.contains('█') && span.style.fg == Some(Color::Magenta))
+    );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let root = app
+        .breadcrumbs
+        .hits
+        .iter()
+        .find(|(_, id)| *id == ROOT)
+        .unwrap()
+        .0;
+    app.mouse(control_event(MouseEventKind::Moved, root));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(root.x, root.y)].bg,
+        Color::Magenta
+    );
+    app.request_quit_confirmation();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    for option in app.dialog_mouse.options.iter().flatten() {
+        assert_eq!(
+            terminal.backend().buffer()[(option.area.right() - 1, option.area.y)].fg,
+            Color::Magenta
+        );
+    }
+    assert_eq!(app.dialog_mouse.options.iter().flatten().count(), 2);
+}
+
 #[test]
 fn pending_batch_confirmation_advances_once_after_identity_checks() {
     for key in [KeyCode::Enter, KeyCode::Char('y')] {
@@ -399,6 +1062,7 @@ fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
             confirm_requested: false,
             confirmed: Some(test_confirmed_target()),
             capture: None,
+            guard_until: None,
         });
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(
@@ -2378,6 +3042,7 @@ fn single_target_capture_admission_survives_confirmation_cancellation() {
             Some(Modal::Delete {
                 confirmed: None,
                 capture: None,
+                guard_until: None,
                 ..
             })
         ));
@@ -2961,6 +3626,7 @@ fn quit_warning_preserves_confirmed_admission_and_clears_later_requests() {
             anchor: Arc::clone(&anchor),
             relative: "root-file".into(),
             target: "root-file".to_owned(),
+            guard_until: None,
         });
         app.enqueue_visual(VisualIntent::Parent(Some(false)));
         let known = app.visual.snapshot();
@@ -8460,6 +9126,7 @@ fn removal_invalidates_visible_and_suspended_target_dialogs_only() {
                         confirm_requested: false,
                         confirmed: Some(test_confirmed_target()),
                         capture: None,
+                        guard_until: None,
                     },
                     1 => Modal::info("old target".into()),
                     2 => Modal::help(app.visual.active()),
@@ -12505,6 +13172,7 @@ fn dialog_close_controls_follow_cancel_fifo_and_shutdown_semantics() {
             confirm_requested: false,
             confirmed: None,
             capture: None,
+            guard_until: None,
         },
         Modal::Batch {
             target: "selected".to_owned(),
@@ -12735,6 +13403,7 @@ fn dialog_options_reuse_pending_confirmation_and_cancellation() {
         confirm_requested: false,
         confirmed: None,
         capture: None,
+        guard_until: None,
     });
     terminal
         .draw(|frame| app.draw(frame, false, false))
@@ -13171,6 +13840,7 @@ fn quit_prompt_suspends_auto_confirmation_but_keeps_validation_results() {
         confirm_requested: true,
         confirmed: None,
         capture: Some(receiver),
+        guard_until: None,
     });
     app.request_quit_confirmation();
     sender.send(Ok(test_confirmed_target())).unwrap();

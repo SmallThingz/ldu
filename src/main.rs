@@ -1,8 +1,10 @@
 use clap::Parser;
 use ldu::{
     backend::Backend,
+    config::{self, Config, MAX_DEBOUNCE_MS, Settings},
     model::Model,
     scan::{self, ScanOptions},
+    theme::ThemeColor,
     types::{ROOT, SizeMode},
 };
 use std::{
@@ -20,16 +22,32 @@ use std::{
 struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
-    #[arg(short = 't', short_alias = 'j', long, default_value_t = default_threads(), value_parser = clap::value_parser!(usize))]
-    threads: usize,
-    #[arg(long, value_enum, default_value_t = Backend::Auto)]
-    backend: Backend,
-    #[arg(long, default_value_t = 262144)]
-    buffer_size: usize,
-    #[arg(long, default_value_t = 128)]
-    batch_size: usize,
+    #[arg(short = 't', short_alias = 'j', long)]
+    threads: Option<usize>,
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
     #[arg(long)]
-    apparent_size: bool,
+    buffer_size: Option<usize>,
+    #[arg(long)]
+    batch_size: Option<usize>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    apparent_size: Option<bool>,
+    #[arg(
+        long,
+        value_name = "COLOR",
+        help = "Accent: ANSI name, 0–255, or #RRGGBB"
+    )]
+    color: Option<ThemeColor>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", help = "Enable mouse input (or --mouse=false)")]
+    mouse: Option<bool>,
+    #[arg(long, conflicts_with = "mouse", help = "Disable mouse input")]
+    no_mouse: bool,
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(0..=MAX_DEBOUNCE_MS), help = "Recent mouse selection window; 0 disables the guard (default: 250)")]
+    mouse_debounce_ms: Option<u64>,
+    #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u64).range(0..=MAX_DEBOUNCE_MS), help = "Confirmation delay after recent mouse selection (default: 1250)")]
+    mouse_debounce_delay_ms: Option<u64>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", help = "Show the mouse-selection warning (default: true)")]
+    mouse_debounce_warning: Option<bool>,
     #[arg(
         short = 'o',
         long,
@@ -51,34 +69,58 @@ fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get().min(32))
 }
 
-fn run(args: Args) -> io::Result<bool> {
-    if !(1..=128).contains(&args.threads)
-        || !(1..=4096).contains(&args.batch_size)
-        || !(4096..=4194304).contains(&args.buffer_size)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "threads must be 1–128, batch-size 1–4096, and buffer-size 4096–4194304",
-        ));
+impl Args {
+    fn resolve(&self, config: Config) -> io::Result<(ScanOptions, SizeMode, Settings)> {
+        let options = ScanOptions {
+            threads: self
+                .threads
+                .or(config.threads)
+                .unwrap_or_else(default_threads),
+            batch_size: self.batch_size.or(config.batch_size).unwrap_or(128),
+            buffer_size: self.buffer_size.or(config.buffer_size).unwrap_or(262_144),
+            backend: self.backend.or(config.backend).unwrap_or(Backend::Auto),
+        };
+        if !(1..=128).contains(&options.threads)
+            || !(1..=4096).contains(&options.batch_size)
+            || !(4096..=4_194_304).contains(&options.buffer_size)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "threads must be 1–128, batch-size 1–4096, and buffer-size 4096–4194304",
+            ));
+        }
+        let settings = Settings {
+            color: self.color.unwrap_or(config.ui.color),
+            mouse: !self.no_mouse && self.mouse.unwrap_or(config.ui.mouse),
+            mouse_debounce_ms: self
+                .mouse_debounce_ms
+                .unwrap_or(config.ui.mouse_debounce_ms),
+            mouse_debounce_delay_ms: self
+                .mouse_debounce_delay_ms
+                .unwrap_or(config.ui.mouse_debounce_delay_ms),
+            mouse_debounce_warning: self
+                .mouse_debounce_warning
+                .unwrap_or(config.ui.mouse_debounce_warning),
+        };
+        let mode = if self.apparent_size.or(config.apparent_size).unwrap_or(false) {
+            SizeMode::Apparent
+        } else {
+            SizeMode::Allocated
+        };
+        Ok((options, mode, settings))
     }
-    let options = ScanOptions {
-        threads: args.threads,
-        batch_size: args.batch_size,
-        buffer_size: args.buffer_size,
-        backend: args.backend,
-    };
-    let mode = if args.apparent_size {
-        SizeMode::Apparent
-    } else {
-        SizeMode::Allocated
-    };
+}
+
+fn run(args: Args) -> io::Result<bool> {
+    // clap handles help/version before configuration is opened.
+    let (options, mode, settings) = args.resolve(config::load()?)?;
     let root = if args.path.is_absolute() {
         args.path
     } else {
         std::env::current_dir()?.join(args.path)
     };
     let Some(output) = args.output else {
-        ldu::tui::run(root, options, mode)?;
+        ldu::tui::run(root, options, mode, settings)?;
         return Ok(false);
     };
     // Only file output needs this identity snapshot. The file is opened after
@@ -198,9 +240,9 @@ mod tests {
             ])
             .unwrap();
             assert_eq!(args.output.as_deref(), Some(Path::new("-")));
-            assert_eq!(args.threads, 3);
+            assert_eq!(args.threads, Some(3));
             assert_eq!(args.path, Path::new("/fixture"));
-            assert!(args.apparent_size);
+            assert_eq!(args.apparent_size, Some(true));
             assert!(args._quiet);
         }
         let args = Args::try_parse_from(["ldu", "--output", "tree.json"]).unwrap();
@@ -226,4 +268,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_overrides_config_including_explicit_false_values() {
+        let config = || Config {
+            ui: Settings {
+                color: "red".parse().unwrap(),
+                mouse: false,
+                mouse_debounce_ms: 123,
+                mouse_debounce_delay_ms: 456,
+                mouse_debounce_warning: false,
+            },
+            threads: Some(7),
+            backend: Some(Backend::Native),
+            buffer_size: Some(8192),
+            batch_size: Some(64),
+            apparent_size: Some(true),
+        };
+        let (scan, mode, ui) = Args::try_parse_from(["ldu"])
+            .unwrap()
+            .resolve(config())
+            .unwrap();
+        assert_eq!(scan.threads, 7);
+        assert!(matches!(scan.backend, Backend::Native));
+        assert_eq!(scan.buffer_size, 8192);
+        assert_eq!(scan.batch_size, 64);
+        assert!(matches!(mode, SizeMode::Apparent));
+        assert_eq!(ui, config().ui);
+
+        let args = Args::try_parse_from([
+            "ldu",
+            "--color",
+            "#abc123",
+            "--mouse",
+            "--mouse-debounce-ms",
+            "0",
+            "--mouse-debounce-delay-ms",
+            "60000",
+            "--mouse-debounce-warning",
+            "--threads",
+            "3",
+            "--backend",
+            "std",
+            "--buffer-size",
+            "4096",
+            "--batch-size",
+            "2",
+            "--apparent-size=false",
+        ])
+        .unwrap();
+        let (scan, mode, ui) = args.resolve(config()).unwrap();
+        assert_eq!(scan.threads, 3);
+        assert!(matches!(scan.backend, Backend::Std));
+        assert_eq!(scan.buffer_size, 4096);
+        assert_eq!(scan.batch_size, 2);
+        assert!(matches!(mode, SizeMode::Allocated));
+        assert_eq!(ui.color, "#abc123".parse().unwrap());
+        assert!(ui.mouse && ui.mouse_debounce_warning);
+        assert_eq!(ui.mouse_debounce_ms, 0);
+        assert_eq!(ui.mouse_debounce_delay_ms, 60000);
+
+        for flag in ["--no-mouse", "--mouse=false"] {
+            let (_, _, ui) = Args::try_parse_from(["ldu", flag, "--mouse-debounce-warning=false"])
+                .unwrap()
+                .resolve(Config::default())
+                .unwrap();
+            assert!(!ui.mouse && !ui.mouse_debounce_warning);
+        }
+    }
+
+    #[test]
+    fn cli_settings_reject_invalid_values_and_mouse_conflicts() {
+        for args in [
+            vec!["ldu", "--mouse", "--no-mouse"],
+            vec!["ldu", "--mouse=maybe"],
+            vec!["ldu", "--mouse-debounce-ms", "60001"],
+            vec!["ldu", "--mouse-debounce-delay-ms", "18446744073709551615"],
+            vec!["ldu", "--mouse-debounce-warning=no"],
+            vec!["ldu", "--color", "#12345"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        for (flag, value) in [
+            ("--threads", "0"),
+            ("--batch-size", "4097"),
+            ("--buffer-size", "4095"),
+        ] {
+            let args = Args::try_parse_from(["ldu", flag, value]).unwrap();
+            assert!(args.resolve(Config::default()).is_err());
+        }
+        for args in [["ldu", "--help"], ["ldu", "--version"]] {
+            let error = Args::try_parse_from(args).err().unwrap();
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ));
+        }
+    }
 }

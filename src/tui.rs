@@ -1,5 +1,6 @@
 use crate::backend::RootAnchor;
 use crate::batch::{BatchCapture, BatchEvent};
+use crate::config::Settings;
 use crate::delete::{self, ConfirmedTarget, DeleteError};
 use crate::model::Model;
 use crate::order::{CachedOrderWorker, CachedRow, CachedSnapshot, OrderConfig};
@@ -8,6 +9,7 @@ use crate::queue::{DeleteQueue, DeleteState, QueueId, QueueMarks};
 use crate::retire::Retirer;
 use crate::scan::{self, ScanHandle, ScanOptions};
 use crate::selection::{RangeMode, VisualSelection};
+use crate::theme::Theme;
 use crate::types::{Entry, NodeId, NodeKind, ROOT, ScanEvent, SizeMode, SortMode};
 use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use crossterm::cursor::{Hide, Show};
@@ -47,44 +49,51 @@ const VISUAL_INTENT_LIMIT: usize = 128;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
 
-struct TerminalGuard(Option<Arc<PanicHook>>);
+struct TerminalGuard {
+    previous_hook: Option<Arc<PanicHook>>,
+    mouse: bool,
+}
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    fn enter(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut guard = Self(None);
+        let mut guard = Self {
+            previous_hook: None,
+            mouse,
+        };
         crate::terminal_input::configure_read()?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide, EnableMouseCapture)?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        if mouse {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
         let previous = Arc::new(panic::take_hook());
         let hook = Arc::clone(&previous);
         panic::set_hook(Box::new(move |info| {
-            restore_terminal();
+            restore_terminal(mouse);
             hook(info);
         }));
-        guard.0 = Some(previous);
+        guard.previous_hook = Some(previous);
         Ok(guard)
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal();
-        if !std::thread::panicking() {
-            if let Some(previous) = self.0.take() {
-                drop(panic::take_hook());
-                if let Ok(previous) = Arc::try_unwrap(previous) {
-                    panic::set_hook(previous);
-                }
+        restore_terminal(self.mouse);
+        if !std::thread::panicking()
+            && let Some(previous) = self.previous_hook.take()
+        {
+            drop(panic::take_hook());
+            if let Ok(previous) = Arc::try_unwrap(previous) {
+                panic::set_hook(previous);
             }
         }
     }
 }
-fn restore_terminal() {
+fn restore_terminal(mouse: bool) {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        Show
-    );
+    if mouse {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -176,6 +185,7 @@ enum Modal {
         confirm_requested: bool,
         confirmed: Option<ConfirmedTarget>,
         capture: Option<Receiver<io::Result<ConfirmedTarget>>>,
+        guard_until: Option<Instant>,
     },
 }
 impl Modal {
@@ -262,6 +272,7 @@ struct DialogOptionPress {
 #[derive(Default)]
 struct DialogMouse {
     accent: Color,
+    guard_warning: bool,
     options: [Option<DialogOption>; 4],
     press: Option<DialogOptionPress>,
     hovered: Option<KeyEvent>,
@@ -748,6 +759,9 @@ fn breadcrumb_tail(text: &str, width: usize) -> String {
 }
 
 struct App {
+    settings: Settings,
+    theme: Theme,
+    recent_mouse_entry: Option<(NodeId, Instant)>,
     model: Model,
     root: PathBuf,
     report_root: PathBuf,
@@ -836,7 +850,13 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(root: PathBuf, size_mode: SizeMode) -> io::Result<Self> {
+        Self::with_settings(root, size_mode, Settings::default())
+    }
+
+    fn with_settings(root: PathBuf, size_mode: SizeMode, settings: Settings) -> io::Result<Self> {
+        let theme = Theme::detect(settings.color);
         let mut order = CachedOrderWorker::new()?;
         let config = OrderConfig {
             size_mode,
@@ -852,6 +872,9 @@ impl App {
         let preview = Preview::new(Arc::clone(&empty));
         let file_preview = FilePreview::new()?;
         Ok(Self {
+            settings,
+            theme,
+            recent_mouse_entry: None,
             model: Model::new(root.clone()),
             report_root: std::path::absolute(&root)?,
             root,
@@ -942,6 +965,7 @@ impl App {
 
     fn reset_order(&mut self, keep_previous: bool) {
         if !keep_previous {
+            self.recent_mouse_entry = None;
             self.parent_selected = false;
             self.parent_navigation = false;
             self.parent_press = None;
@@ -2177,7 +2201,77 @@ impl App {
         }
     }
 
+    fn record_mouse_entry_change(&mut self, previous: Option<NodeId>, id: NodeId, now: Instant) {
+        if self.settings.mouse && !self.visual.active() && previous != Some(id) {
+            self.recent_mouse_entry = Some((id, now));
+        }
+    }
+
+    fn mouse_delete_guard(&self, id: NodeId, now: Instant) -> Option<Instant> {
+        let (hovered, changed_at) = self.recent_mouse_entry?;
+        (self.settings.mouse
+            && self.settings.mouse_debounce_ms != 0
+            && self.settings.mouse_debounce_delay_ms != 0
+            && hovered == id
+            && now.saturating_duration_since(changed_at)
+                < Duration::from_millis(self.settings.mouse_debounce_ms))
+        .then(|| now.checked_add(Duration::from_millis(self.settings.mouse_debounce_delay_ms)))
+        .flatten()
+    }
+
+    fn delete_guard_deadline(&self) -> Option<Instant> {
+        [&self.modal, &self.previous_modal]
+            .into_iter()
+            .filter_map(|modal| match modal.as_ref()?.underlying() {
+                Modal::Delete { guard_until, .. } => *guard_until,
+                _ => None,
+            })
+            .min()
+    }
+
+    fn expire_delete_guard(&mut self, now: Instant) -> bool {
+        if let Some(request) = self.deferred_delete.as_mut()
+            && request.guard_until.is_some_and(|deadline| now >= deadline)
+        {
+            request.guard_until = None;
+        }
+        let mut repaint = false;
+        for (visible, slot) in [(true, &mut self.modal), (false, &mut self.previous_modal)] {
+            let direct = visible && matches!(slot, Some(Modal::Delete { .. }));
+            if let Some(Modal::Delete { guard_until, .. }) = underlying_modal_slot(slot)
+                && guard_until.is_some_and(|deadline| now >= deadline)
+            {
+                *guard_until = None;
+                repaint |= direct;
+            }
+        }
+        repaint
+    }
+
     fn key(&mut self, key: KeyEvent, anchor: Option<Arc<RootAnchor>>, deleting: bool) -> Action {
+        if self.modal.is_none()
+            && (self.filter_editing
+                || matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Char(
+                            'j' | 'k' | 'h' | 'l' | '<' | 'v' | 'V' | '/' | 'e' | 'r' | 'R'
+                        )
+                )
+                || (key.code == KeyCode::Esc && (self.visual.active() || !self.filter.is_empty())))
+        {
+            // Navigation owns the target; display toggles and help do not.
+            self.recent_mouse_entry = None;
+        }
         self.breadcrumbs.pressed = None;
         self.header_right_press = None;
         self.cancel_right_press();
@@ -2435,8 +2529,14 @@ impl App {
                     mut confirm_requested,
                     confirmed,
                     capture,
+                    guard_until,
                 } => {
+                    let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
                     match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter if guarded => {
+                            // Drop early input. Async identity completion must never replay it.
+                            confirm_requested = false;
+                        }
                         KeyCode::Char('y') | KeyCode::Enter
                             if reviewable && confirmed.is_some() =>
                         {
@@ -2461,6 +2561,7 @@ impl App {
                         confirm_requested,
                         confirmed,
                         capture,
+                        guard_until,
                     });
                 }
                 Modal::Text {
@@ -2755,6 +2856,7 @@ impl App {
                                 anchor,
                                 relative: relative.to_owned(),
                                 target: printable(path.as_os_str()),
+                                guard_until: self.mouse_delete_guard(id, Instant::now()),
                             };
                             if self
                                 .capture_inflight
@@ -2771,6 +2873,7 @@ impl App {
                                     confirm_requested: false,
                                     confirmed: None,
                                     capture: None,
+                                    guard_until: request.guard_until,
                                 });
                                 self.deferred_delete = Some(request);
                             } else {
@@ -3181,6 +3284,9 @@ impl App {
             confirm_requested,
             confirmed: None,
             capture: Some(capture),
+            guard_until: request
+                .guard_until
+                .filter(|deadline| Instant::now() < *deadline),
         });
     }
 
@@ -3206,6 +3312,10 @@ impl App {
     }
 
     fn confirmation_ready(&self) -> bool {
+        if matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
+        {
+            return false;
+        }
         matches!(
             self.modal,
             Some(
@@ -4054,6 +4164,12 @@ impl App {
         }
         if let Some(option) = hit {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if matches!(option.key.code, KeyCode::Enter | KeyCode::Char('y'))
+                    && matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
+                {
+                    // Never carry a press begun during the hold across its deadline.
+                    return Some(Action::Continue);
+                }
                 self.finish_mouse_for_input();
                 self.parent_press = None;
                 self.control_press = None;
@@ -4387,6 +4503,12 @@ impl App {
     }
 
     fn mouse(&mut self, mouse: MouseEvent) {
+        if !self.settings.mouse {
+            return;
+        }
+        if mouse.kind != MouseEventKind::Moved {
+            self.recent_mouse_entry = None;
+        }
         // The pressed parent row owns motion and release even over a
         // different header target. Leaving and returning cannot become a click.
         if self.parent_press.is_some() && self.parent_mouse(mouse) {
@@ -4694,6 +4816,10 @@ impl App {
                 self.set_drag_edge(edge, id);
             }
             MouseEventKind::Moved if !captured => {
+                let previous = (!self.parent_selected).then_some(self.selected).flatten();
+                if !self.visual.active() && previous != Some(id) {
+                    self.record_mouse_entry_change(previous, id, Instant::now());
+                }
                 self.cursor_mode = CursorMode::Tracked;
                 if self.visual.active() && self.visual_busy() {
                     if self.try_enqueue_visual(VisualIntent::Hover(PendingHover {
@@ -4860,7 +4986,7 @@ impl App {
             match self.graph {
                 Graph::Bar => spans.push(Span::styled(
                     format!("{} ", fractional_bar(size, total, graph_width)),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(self.theme.accent),
                 )),
                 Graph::Percent => spans.push(Span::raw(format!(
                     "{:5.1}% ",
@@ -4888,7 +5014,7 @@ impl App {
         } else if node.error_count > 0 {
             Color::Yellow
         } else if node.kind == NodeKind::Directory {
-            Color::Cyan
+            self.theme.accent
         } else {
             Color::White
         };
@@ -5024,7 +5150,7 @@ impl App {
             path_budget,
             columns[1],
             self.modal.is_some(),
-            Color::Cyan,
+            self.theme.accent,
         );
         if label.width() > 0 && !phase.is_empty() {
             label.spans.push(Span::raw("  "));
@@ -5117,7 +5243,7 @@ impl App {
                 Paragraph::new(label).style(mouse_control_style(
                     header_style,
                     self.modal.is_none() && self.control_hovered == Some(control),
-                    Color::Cyan,
+                    self.theme.accent,
                 )),
                 hitbox,
             );
@@ -5127,7 +5253,7 @@ impl App {
                 Paragraph::new("X selected").style(mouse_control_style(
                     header_style,
                     true,
-                    Color::Cyan,
+                    self.theme.accent,
                 )),
                 self.selection_clear_area,
             );
@@ -5183,7 +5309,7 @@ impl App {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(self.theme.accent)
         };
         frame.render_widget(
             Paragraph::new(if self.parent_selected {
@@ -5334,7 +5460,7 @@ impl App {
                 })
                 .style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(self.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -5431,7 +5557,8 @@ impl App {
         }
         let old_close_area = self.dialog_close_area;
         self.dialog_close_area = Rect::default();
-        self.dialog_mouse.accent = Color::Cyan;
+        self.dialog_mouse.accent = self.theme.accent;
+        self.dialog_mouse.guard_warning = self.settings.mouse_debounce_warning;
         if let Some(modal) = self.modal.as_mut() {
             draw_modal(
                 frame,
@@ -5454,10 +5581,26 @@ impl App {
                 Paragraph::new(marker).style(mouse_control_style(
                     Style::default().bg(Color::Black).fg(Color::Yellow),
                     self.control_hovered == Some(MouseControl::Close),
-                    Color::Cyan,
+                    self.theme.accent,
                 )),
                 self.dialog_close_area,
             );
+        }
+        if self.settings.mouse_debounce_warning
+            && matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
+        {
+            // Tint after all widgets so cleared dialogs and blank cells are covered.
+            // Ordinary frames avoid this pass entirely; the timer redraws only once.
+            let style = Style::default()
+                .bg(self.theme.warning_background)
+                .fg(self.theme.warning_foreground);
+            frame.buffer_mut().set_style(area, style);
+            let popup = self.dialog_mouse.scroll_area;
+            if !popup.is_empty() {
+                frame
+                    .buffer_mut()
+                    .set_style(popup, style.bg(self.theme.warning_dialog_background));
+            }
         }
         self.painted_control_dialog = self.control_dialog();
     }
@@ -6022,11 +6165,18 @@ fn draw_modal(
             scroll,
             reviewable,
             confirm_requested,
+            guard_until,
             ..
         } => {
+            let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
             let target_paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
             let target_lines = target_paragraph.line_count(inner_width);
-            let prompt = Paragraph::new("Permanently remove:").wrap(Wrap { trim: false });
+            let prompt = Paragraph::new(if guarded && mouse.guard_warning {
+                "Mouse changed selection. Check the target.\nPermanently remove:"
+            } else {
+                "Permanently remove:"
+            })
+            .wrap(Wrap { trim: false });
             let prompt_height = u16::try_from(prompt.line_count(inner_width)).unwrap_or(u16::MAX);
             let height = area.height.min(14).min(
                 u16::try_from(target_lines)
@@ -6083,14 +6233,18 @@ fn draw_modal(
                 Paragraph::new(vec![
                     Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
                         .style(Style::default().fg(Color::DarkGray)),
-                    dialog_option(
-                        mouse,
-                        regions[2],
-                        1,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                        "y / Enter",
-                        ": delete",
-                    ),
+                    if guarded {
+                        Line::from("Please wait…")
+                    } else {
+                        dialog_option(
+                            mouse,
+                            regions[2],
+                            1,
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            "y / Enter",
+                            ": delete",
+                        )
+                    },
                     dialog_option(
                         mouse,
                         regions[2],
@@ -6232,6 +6386,7 @@ struct DeleteRequest {
     anchor: Arc<RootAnchor>,
     relative: PathBuf,
     target: String,
+    guard_until: Option<Instant>,
 }
 
 struct WaitingBatch {
@@ -7065,7 +7220,12 @@ fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: 
 }
 
 /// The first frame precedes all scanner filesystem work.
-pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Result<()> {
+pub fn run(
+    root: PathBuf,
+    options: ScanOptions,
+    size_mode: SizeMode,
+    settings: Settings,
+) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(
             "interactive browsing requires a terminal; use -o FILE to export, or -o - for stdout",
@@ -7077,8 +7237,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         signal_interrupts.fetch_add(1, Ordering::Release);
     })
     .map_err(io::Error::other)?;
-    let mut app = App::new(root.clone(), size_mode)?;
-    let _guard = TerminalGuard::enter()?;
+    let mouse = settings.mouse;
+    let mut app = App::with_settings(root.clone(), size_mode, settings)?;
+    let _guard = TerminalGuard::enter(mouse)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.draw(|frame| app.draw(frame, false, false))?;
     if take_interrupt(&interrupts) {
@@ -7110,6 +7271,10 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
     let mut order_backlog = true;
     let mut input_timeout = Duration::from_millis(1);
     'events: loop {
+        if app.expire_delete_guard(Instant::now()) {
+            frame_gate.dirty = true;
+            next_frame = Instant::now();
+        }
         frame_gate.observe_refreshing(!scopes.is_empty() || !refresh_requests.is_empty());
         frame_gate.observe_activity(
             app.frame_work()
@@ -7233,7 +7398,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         let anchor = scanner.anchor.get().cloned();
                         Some(app.key(key, anchor, deletion_busy(&queue, batch.as_ref())))
                     }
-                    Event::Mouse(mouse) => {
+                    Event::Mouse(mouse) if app.settings.mouse => {
                         if matches!(
                             mouse.kind,
                             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
@@ -7617,6 +7782,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         } else {
             timeout.max(Duration::from_millis(1))
         };
+        if let Some(deadline) = app.delete_guard_deadline() {
+            input_timeout = input_timeout.min(deadline.saturating_duration_since(Instant::now()));
+        }
     }
     // External helpers must stop before App is retired off-thread. Signalling
     // owned groups does not join potentially blocked filesystem workers.

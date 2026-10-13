@@ -850,3 +850,72 @@ fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias()
         .unwrap();
     assert!(model.is_live(branch) && model.node(branch).complete);
 }
+
+#[test]
+fn config_errors_preserve_exports_and_do_not_block_help_or_version() {
+    let work = fixture();
+    let root = work.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("leaf"), b"fixture").unwrap();
+    let xdg = work.path().join("settings");
+    fs::create_dir_all(xdg.join("ldu")).unwrap();
+    let xdg = xdg.canonicalize().unwrap();
+    let config = xdg.join("ldu/config");
+    fs::write(&config, "mouse_debounce_ms = invalid\n").unwrap();
+    let export = work.path().join("existing.ncdu");
+    fs::write(&export, b"preserve existing export").unwrap();
+    let failed = ldu_command()
+        .env("XDG_CONFIG_HOME", &xdg)
+        .arg("-o")
+        .arg(&export)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        error.contains(&format!("{}:1:", config.display())),
+        "{error}"
+    );
+    assert!(error.contains("mouse_debounce_ms"), "{error}");
+    assert_eq!(fs::read(&export).unwrap(), b"preserve existing export");
+    for flag in ["--help", "--version"] {
+        let result = ldu_command()
+            .env("XDG_CONFIG_HOME", &xdg)
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!result.stdout.is_empty());
+    }
+    let home = work.path().join("home");
+    fs::create_dir_all(home.join(".config/ldu")).unwrap();
+    let home = home.canonicalize().unwrap();
+    fs::write(
+        home.join(".config/ldu/config"),
+        "backend=std\nthreads=1\nmouse=false\n",
+    )
+    .unwrap();
+    let result = ldu_command()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", "relative-is-ignored")
+        .args(["--backend", "native", "-o", "-"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let document = ncdu_document(&result);
+    assert!(
+        ncdu_records(&document[3])
+            .iter()
+            .any(|record| record["name"] == "leaf")
+    );
+}
