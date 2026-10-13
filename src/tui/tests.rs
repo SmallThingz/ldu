@@ -1010,7 +1010,7 @@ fn configured_accent_reaches_directory_graphs_breadcrumbs_and_dialog_choices() {
     for option in app.dialog_mouse.options.iter().flatten() {
         assert_eq!(
             terminal.backend().buffer()[(option.area.x + 2, option.area.y)].fg,
-            Color::Magenta
+            app.theme.dialog_accent
         );
     }
     assert_eq!(app.dialog_mouse.options.iter().flatten().count(), 2);
@@ -11445,7 +11445,13 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     let app = browser_fixture_at(PathBuf::from("/outside/fixture"));
     let mut crumbs = Breadcrumbs::default();
     crumbs.sync(&app.root, &app.model, 5);
-    let line = crumbs.line(25, Rect::new(0, 0, 25, 1), false, Color::Cyan, Color::White);
+    let line = crumbs.line(
+        25,
+        Rect::new(0, 0, 25, 1),
+        false,
+        Style::default().bg(Color::Cyan).fg(Color::Black),
+        Color::White,
+    );
     assert_eq!(line.to_string(), "…/folder/child-folder");
     assert_eq!(
         crumbs.hits.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
@@ -11454,7 +11460,13 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     assert!(crumbs.hits.iter().all(|(area, _)| area.x >= 2));
     assert_eq!(
         crumbs
-            .line(8, Rect::new(0, 0, 8, 1), false, Color::Cyan, Color::White)
+            .line(
+                8,
+                Rect::new(0, 0, 8, 1),
+                false,
+                Style::default().bg(Color::Cyan).fg(Color::Black),
+                Color::White
+            )
             .to_string(),
         "…-folder"
     );
@@ -11466,8 +11478,14 @@ fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
     let mut root = Breadcrumbs::default();
     root.sync(&app.root, &app.model, ROOT);
     assert_eq!(
-        root.line(10, Rect::new(0, 0, 10, 1), false, Color::Cyan, Color::White)
-            .to_string(),
+        root.line(
+            10,
+            Rect::new(0, 0, 10, 1),
+            false,
+            Style::default().bg(Color::Cyan).fg(Color::Black),
+            Color::White
+        )
+        .to_string(),
         "…/fixture"
     );
     assert!(root.hits.iter().all(|(_, id)| *id == ROOT));
@@ -11481,7 +11499,13 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
     let area = Rect::new(4, 2, 80, 1);
     assert_eq!(
         crumbs
-            .line(80, area, false, Color::Cyan, Color::White)
+            .line(
+                80,
+                area,
+                false,
+                Style::default().bg(Color::Cyan).fg(Color::Black),
+                Color::White
+            )
             .to_string(),
         "/outside/界\\nroot/folder"
     );
@@ -11494,7 +11518,13 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
             .any(|(hit, _)| hit.contains(ratatui::layout::Position::new(root.right(), area.y)))
     );
     for width in 0..80 {
-        let line = crumbs.line(width, area, false, Color::Cyan, Color::White);
+        let line = crumbs.line(
+            width,
+            area,
+            false,
+            Style::default().bg(Color::Cyan).fg(Color::Black),
+            Color::White,
+        );
         assert!(line.width() <= width);
         assert!(
             crumbs.hits.iter().all(
@@ -11506,7 +11536,13 @@ fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
     crumbs.sync(&app.root, &app.model, ROOT);
     assert_eq!(
         crumbs
-            .line(1, Rect::new(0, 0, 1, 1), false, Color::Cyan, Color::White)
+            .line(
+                1,
+                Rect::new(0, 0, 1, 1),
+                false,
+                Style::default().bg(Color::Cyan).fg(Color::Black),
+                Color::White
+            )
             .to_string(),
         "/"
     );
@@ -14877,5 +14913,191 @@ fn terminal_cleanup_preserves_write_failures_without_retrying_a_closed_writer() 
             calls_before_cleanup.get(),
             "Ratatui cleanup must not retry the closed writer or trigger its stderr diagnostic"
         );
+    }
+}
+
+#[test]
+fn rendered_dark_accent_controls_keep_text_visible_on_their_actual_backgrounds() {
+    for color in [
+        "black", "blue", "magenta", "0", "16", "17", "#010203", "#eeeeee", "white",
+    ] {
+        let mut app = browser_fixture();
+        app.settings.color = color.parse().unwrap();
+        app.theme = Theme::detect(app.settings.color);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let help = app.help_area;
+        app.control_mouse(control_event(MouseEventKind::Moved, help), false);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let assert_hover =
+            |terminal: &Terminal<ratatui::backend::TestBackend>, area: Rect, theme: Theme| {
+                for x in area.x..area.right() {
+                    let cell = &terminal.backend().buffer()[(x, area.y)];
+                    assert_eq!(Some(cell.bg), theme.hover.bg, "{color}");
+                    assert_eq!(Some(cell.fg), theme.hover.fg, "{color}");
+                    assert_ne!(cell.fg, cell.bg, "{color}");
+                }
+            };
+        assert_hover(&terminal, help, app.theme);
+        let root = app
+            .breadcrumbs
+            .hits
+            .iter()
+            .find(|(_, id)| *id == ROOT)
+            .unwrap()
+            .0;
+        app.control_mouse(control_event(MouseEventKind::Moved, root), false);
+        app.mouse(control_event(MouseEventKind::Moved, root));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_hover(&terminal, root, app.theme);
+        app.request_quit_confirmation();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let yes = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == KeyCode::Enter)
+            .copied()
+            .unwrap();
+        let label = &terminal.backend().buffer()[(yes.area.x + 2, yes.area.y)];
+        assert_eq!(label.bg, Color::Black);
+        assert_eq!(label.fg, app.theme.dialog_accent);
+        assert_ne!(label.fg, label.bg, "{color}");
+        app.modal_option_mouse(control_event(MouseEventKind::Moved, yes.area), false);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_hover(&terminal, yes.area, app.theme);
+        app.modal = Some(Modal::help(false));
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let down = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == KeyCode::Down)
+            .copied()
+            .unwrap();
+        app.modal_option_mouse(control_event(MouseEventKind::Moved, down.area), false);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_hover(&terminal, down.area, app.theme);
+    }
+}
+
+#[test]
+fn selected_queue_status_stays_readable_for_pending_and_active_rows() {
+    let mut app = browser_fixture();
+    app.settings.color = "darkgray".parse().unwrap();
+    app.theme = Theme::detect(app.settings.color);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    for active in [false, true] {
+        app.modal = Some(Modal::Queue {
+            selected: Some(1),
+            offset: Some(1),
+        });
+        app.queue_view.selected = Some(1);
+        app.queue_view.rows = vec![(1, active, "example".to_owned())];
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        let row = queue_layout(Rect::new(0, 0, 80, 12)).2[1];
+        let cell = &terminal.backend().buffer()[(row.x, row.y)];
+        assert_eq!(cell.symbol(), if active { "a" } else { "q" });
+        assert_eq!(cell.fg, Color::White);
+        assert_eq!(cell.bg, Color::DarkGray);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_red_overlay_remains_readable_over_cached_dark_hover_colors() {
+    for color in ["black", "blue", "16", "#010203", "white"] {
+        let mut app = browser_fixture();
+        app.settings.color = color.parse().unwrap();
+        app.theme = Theme::detect(app.settings.color);
+        let until = Instant::now() + Duration::from_secs(60);
+        let _sender = guarded_delete_capture(&mut app, until);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let cancel = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == KeyCode::Esc)
+            .copied()
+            .unwrap();
+        app.modal_option_mouse(control_event(MouseEventKind::Moved, cancel.area), false);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        for x in cancel.area.x..cancel.area.right() {
+            let cell = &terminal.backend().buffer()[(x, cancel.area.y)];
+            assert_eq!(cell.fg, app.theme.warning_foreground);
+            assert_eq!(cell.bg, app.theme.warning_dialog_background);
+        }
+    }
+}
+
+#[test]
+fn selected_browser_rows_keep_names_graphs_counts_and_status_glyphs_readable() {
+    for color in ["blue", "darkgray", "#000080", "#808080"] {
+        let mut app = browser_fixture();
+        app.settings.color = color.parse().unwrap();
+        app.theme = Theme::detect(app.settings.color);
+        app.counts = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        for (selected, marked) in [(true, false), (false, true), (true, true)] {
+            for deleting in [false, true] {
+                app.visual.exit();
+                if marked {
+                    app.visual.enter(ROOT, Some(1));
+                }
+                app.queue_view.marks.active = deleting.then_some(1);
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(app.row(
+                                1,
+                                24,
+                                80,
+                                selected,
+                                spinner_frame(0),
+                                DeleteState::default(),
+                            )),
+                            Rect::new(0, 0, 80, 1),
+                        );
+                    })
+                    .unwrap();
+                let text = rendered(&terminal);
+                assert!(text.contains("folder/") && text.contains('█'));
+                assert_eq!(text.contains('×'), deleting);
+                for cell in &terminal.backend().buffer().content {
+                    if cell.symbol().trim().is_empty() {
+                        continue;
+                    }
+                    let foreground = if !deleting && cell.symbol() == spinner_frame(0) {
+                        Color::Gray
+                    } else {
+                        Color::White
+                    };
+                    assert_eq!(cell.fg, foreground, "{color}: {}", cell.symbol());
+                    assert_eq!(cell.bg, if marked { Color::Blue } else { Color::DarkGray });
+                }
+            }
+        }
     }
 }

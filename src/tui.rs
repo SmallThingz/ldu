@@ -306,6 +306,7 @@ struct DialogOptionPress {
 #[derive(Default)]
 struct DialogMouse {
     accent: Color,
+    hover: Style,
     guard_warning: bool,
     options: [Option<DialogOption>; 6],
     press: Option<DialogOptionPress>,
@@ -703,7 +704,7 @@ impl Breadcrumbs {
         width: usize,
         area: Rect,
         modal: bool,
-        accent: Color,
+        hover: Style,
         foreground: Color,
     ) -> Line<'static> {
         self.hits.clear();
@@ -724,7 +725,7 @@ impl Breadcrumbs {
                 self.add_hit(area, 1, shown - 1, target);
                 line.spans.push(Span::styled(
                     text['…'.len_utf8()..].to_owned(),
-                    self.style(target, modal, accent, foreground),
+                    self.style(target, modal, hover, foreground),
                 ));
             }
             return line;
@@ -753,7 +754,7 @@ impl Breadcrumbs {
             let part_width = part.width;
             line.spans.push(Span::styled(
                 part.text.clone(),
-                self.style(target, modal, accent, foreground),
+                self.style(target, modal, hover, foreground),
             ));
             self.add_hit(area, offset, part_width, target);
             offset += part_width;
@@ -761,22 +762,13 @@ impl Breadcrumbs {
         line
     }
 
-    fn style(
-        &self,
-        target: Option<NodeId>,
-        modal: bool,
-        accent: Color,
-        foreground: Color,
-    ) -> Style {
+    fn style(&self, target: Option<NodeId>, modal: bool, hover: Style, foreground: Color) -> Style {
         if target.is_none() {
             Style::default()
                 .fg(Color::Gray)
                 .remove_modifier(Modifier::DIM)
         } else if !modal && self.hovered == target {
-            Style::default()
-                .bg(accent)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
+            hover
         } else {
             Style::default()
                 .fg(foreground)
@@ -5144,6 +5136,7 @@ impl App {
             )
         };
         let visually_selected = self.visual.contains(id);
+        let highlighted = selected || visually_selected;
         let marker = if selected {
             "›"
         } else if visually_selected {
@@ -5165,7 +5158,11 @@ impl App {
             match self.graph {
                 Graph::Bar => spans.push(Span::styled(
                     format!("{} ", fractional_bar(size, total, graph_width)),
-                    Style::default().fg(self.theme.accent),
+                    Style::default().fg(if highlighted {
+                        Color::White
+                    } else {
+                        self.theme.accent
+                    }),
                 )),
                 Graph::Percent => spans.push(Span::raw(format!(
                     "{:5.1}% ",
@@ -5188,7 +5185,7 @@ impl App {
         if node.error_count > 0 {
             name.push_str(" !");
         }
-        let color = if selected {
+        let color = if highlighted {
             Color::White
         } else if node.error_count > 0 {
             Color::Yellow
@@ -5208,7 +5205,15 @@ impl App {
                     spinner
                 }
             ),
-            Style::default().fg(if deleting { Color::Red } else { Color::Gray }),
+            Style::default().fg(if deleting {
+                if highlighted {
+                    Color::White
+                } else {
+                    Color::Red
+                }
+            } else {
+                Color::Gray
+            }),
         ));
         spans.push(Span::styled(name, Style::default().fg(color)));
         let line = Line::from(spans);
@@ -5227,6 +5232,7 @@ impl App {
             line.style(
                 Style::default()
                     .bg(Color::DarkGray)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -5341,7 +5347,7 @@ impl App {
             path_budget,
             columns[1],
             self.modal.is_some(),
-            self.theme.accent,
+            self.theme.hover,
             self.theme.header_foreground,
         );
         if label.width() > 0 && !phase.is_empty() {
@@ -5443,7 +5449,7 @@ impl App {
                 Paragraph::new(label).style(mouse_control_style(
                     header_style,
                     self.modal.is_none() && self.control_hovered == Some(control),
-                    self.theme.accent,
+                    self.theme.hover,
                 )),
                 hitbox,
             );
@@ -5453,7 +5459,7 @@ impl App {
                 Paragraph::new("X selected").style(mouse_control_style(
                     header_style,
                     true,
-                    self.theme.accent,
+                    self.theme.hover,
                 )),
                 self.selection_clear_area,
             );
@@ -5757,7 +5763,8 @@ impl App {
         }
         let old_close_area = self.dialog_close_area;
         self.dialog_close_area = Rect::default();
-        self.dialog_mouse.accent = self.theme.accent;
+        self.dialog_mouse.accent = self.theme.dialog_accent;
+        self.dialog_mouse.hover = self.theme.hover;
         self.dialog_mouse.guard_warning = self.settings.mouse_debounce_warning;
         if let Some(modal) = self.modal.as_mut() {
             draw_modal(
@@ -5781,7 +5788,7 @@ impl App {
                 Paragraph::new(marker).style(mouse_control_style(
                     Style::default().bg(Color::Black).fg(Color::Yellow),
                     self.control_hovered == Some(MouseControl::Close),
-                    self.theme.accent,
+                    self.theme.hover,
                 )),
                 self.dialog_close_area,
             );
@@ -5859,14 +5866,8 @@ fn queue_layout(area: Rect) -> (Rect, Rect, [Rect; 3]) {
     (popup, inner, regions)
 }
 
-fn mouse_control_style(base: Style, hovered: bool, accent: Color) -> Style {
-    if hovered {
-        base.bg(accent)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        base
-    }
+fn mouse_control_style(base: Style, hovered: bool, hover: Style) -> Style {
+    if hovered { base.patch(hover) } else { base }
 }
 
 fn dialog_close_area(popup: Rect) -> Rect {
@@ -5951,7 +5952,7 @@ fn draw_dialog_buttons(
         if let Some(key) = button.key {
             mouse.option(rect, 0, key, &line);
             if mouse.hovered == Some(key) {
-                line = line.style(mouse_control_style(style, true, mouse.accent));
+                line = line.style(mouse_control_style(style, true, mouse.hover));
                 for span in &mut line.spans {
                     span.style = Style::default();
                 }
@@ -5994,7 +5995,7 @@ fn draw_dialog_scroll_controls(
             Paragraph::new(line).style(mouse_control_style(
                 style,
                 mouse.hovered == Some(key),
-                mouse.accent,
+                mouse.hover,
             )),
             rect,
         );
@@ -6295,7 +6296,13 @@ fn draw_modal(
                             } else {
                                 "queued  "
                             },
-                            Style::default().fg(if *active { accent } else { Color::DarkGray }),
+                            Style::default().fg(if queue.selected == Some(*id) {
+                                Color::White
+                            } else if *active {
+                                accent
+                            } else {
+                                Color::DarkGray
+                            }),
                         ),
                         Span::raw(clipped(target, usize::from(inner.width).saturating_sub(8))),
                     ]);

@@ -1,6 +1,6 @@
 //! Terminal colors resolved once, without changing the user's terminal palette.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use std::fmt;
 use std::str::FromStr;
 
@@ -103,6 +103,8 @@ fn hex_digit(byte: u8) -> Result<u8, ParseColorError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
     pub accent: Color,
+    pub dialog_accent: Color,
+    pub hover: Style,
     pub header_foreground: Color,
     pub warning_background: Color,
     pub warning_dialog_background: Color,
@@ -127,8 +129,21 @@ impl Theme {
             ColorSupport::Indexed => (Color::Indexed(52), Color::Indexed(88)),
             ColorSupport::Ansi => (Color::Red, Color::Red),
         };
+        let accent = support.resolve(accent.0);
+        // The browser uses the terminal's background, so keep its configured
+        // accent. Popups have a fixed black background and need readable text.
+        let hover_foreground = if brightness(color_rgb(accent)) >= 65_025 * 1_800 {
+            Color::Black
+        } else {
+            Color::White
+        };
         Self {
-            accent: support.resolve(accent.0),
+            accent,
+            dialog_accent: readable_on_black(accent),
+            hover: Style::default()
+                .bg(accent)
+                .fg(hover_foreground)
+                .add_modifier(Modifier::BOLD),
             header_foreground: match support {
                 ColorSupport::TrueColor => Color::Rgb(255, 255, 255),
                 _ => Color::White,
@@ -259,11 +274,74 @@ fn palette_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
+// Approximate linear luminance with squared channels, avoiding floating-point
+// conversion in rendering. ANSI colors use the existing reference palette;
+// customized terminal palettes cannot be measured without querying the terminal.
+fn brightness((red, green, blue): (u8, u8, u8)) -> u32 {
+    u32::from(red).pow(2) * 2_126 + u32::from(green).pow(2) * 7_152 + u32::from(blue).pow(2) * 722
+}
+
+fn color_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(red, green, blue) => (red, green, blue),
+        Color::Indexed(index) => palette_rgb(index),
+        _ => ANSI_COLORS
+            .iter()
+            .position(|candidate| *candidate == color)
+            .map_or((255, 255, 255), |index| ANSI_RGB[index]),
+    }
+}
+
+const MIN_TEXT_BRIGHTNESS: u32 = 65_025 * 1_750;
+
+fn readable_on_black(color: Color) -> Color {
+    let rgb = color_rgb(color);
+    if brightness(rgb) >= MIN_TEXT_BRIGHTNESS {
+        return color;
+    }
+    // Lift the requested color toward white before palette matching, rather
+    // than turning a requested black/gray accent into an unrelated bright hue.
+    let lighten = |amount: u8| {
+        (
+            rgb.0.saturating_add(amount),
+            rgb.1.saturating_add(amount),
+            rgb.2.saturating_add(amount),
+        )
+    };
+    let (mut low, mut high) = (0u16, 255u16);
+    while low < high {
+        let middle = (low + high) / 2;
+        if brightness(lighten(middle as u8)) >= MIN_TEXT_BRIGHTNESS {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    let rgb = lighten(low as u8);
+    match color {
+        Color::Rgb(..) => Color::Rgb(rgb.0, rgb.1, rgb.2),
+        Color::Indexed(index) => Color::Indexed(nearest_with_minimum(
+            rgb,
+            if index < 16 { 0 } else { 16 },
+            if index < 16 { 15 } else { 255 },
+            MIN_TEXT_BRIGHTNESS,
+        )),
+        _ => ANSI_COLORS[usize::from(nearest_with_minimum(rgb, 0, 15, MIN_TEXT_BRIGHTNESS))],
+    }
+}
+
 fn nearest(rgb: (u8, u8, u8), start: u8, end: u8) -> u8 {
+    nearest_with_minimum(rgb, start, end, 0)
+}
+
+fn nearest_with_minimum(rgb: (u8, u8, u8), start: u8, end: u8, minimum: u32) -> u8 {
     let mut result = start;
     let mut best = u32::MAX;
     for index in start..=end {
         let candidate = palette_rgb(index);
+        if minimum > 0 && brightness(candidate) < minimum {
+            continue;
+        }
         let distance = u32::from(rgb.0.abs_diff(candidate.0)).pow(2)
             + u32::from(rgb.1.abs_diff(candidate.1)).pow(2)
             + u32::from(rgb.2.abs_diff(candidate.2)).pow(2);
@@ -452,5 +530,50 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn cached_control_colors_follow_supported_depth_without_replacing_browser_accent() {
+        for support in [
+            ColorSupport::Ansi,
+            ColorSupport::Indexed,
+            ColorSupport::TrueColor,
+        ] {
+            for (color, hover_foreground) in [
+                (Color::Black, Color::White),
+                (Color::Blue, Color::White),
+                (Color::Magenta, Color::White),
+                (Color::Cyan, Color::Black),
+                (Color::White, Color::Black),
+                (Color::Indexed(0), Color::White),
+                (Color::Indexed(16), Color::White),
+                (Color::Indexed(17), Color::White),
+                (Color::Indexed(255), Color::Black),
+                (Color::Rgb(0, 0, 0), Color::White),
+                (Color::Rgb(3, 9, 20), Color::White),
+                (Color::Rgb(240, 240, 240), Color::Black),
+            ] {
+                let resolved = support.resolve(color);
+                let theme = Theme::with_support(ThemeColor(color), support);
+                assert_eq!(theme.accent, resolved);
+                assert_eq!(theme.hover.bg, Some(resolved));
+                assert_eq!(theme.hover.fg, Some(hover_foreground));
+                assert!(brightness(color_rgb(theme.dialog_accent)) >= MIN_TEXT_BRIGHTNESS);
+                if brightness(color_rgb(resolved)) >= MIN_TEXT_BRIGHTNESS {
+                    assert_eq!(theme.dialog_accent, resolved);
+                }
+                match (support, theme.dialog_accent) {
+                    (ColorSupport::Ansi, Color::Rgb(..) | Color::Indexed(_))
+                    | (ColorSupport::Indexed, Color::Rgb(..)) => panic!("unsupported color depth"),
+                    _ => {}
+                }
+            }
+        }
+        let black = Theme::with_support(ThemeColor(Color::Black), ColorSupport::Ansi);
+        assert_eq!(black.hover.fg, Some(Color::White));
+        assert_ne!(black.dialog_accent, Color::Black);
+        let white = Theme::with_support(ThemeColor(Color::White), ColorSupport::Ansi);
+        assert_eq!(white.hover.fg, Some(Color::Black));
+        assert_eq!(white.dialog_accent, Color::White);
     }
 }
