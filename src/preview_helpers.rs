@@ -90,7 +90,6 @@ enum Tool {
     ZipInfo,
     Unzip,
     SevenZip,
-    PdfText,
 }
 
 pub(super) struct Catalog {
@@ -108,14 +107,13 @@ impl Catalog {
                     .collect()
             })
             .unwrap_or_default();
-        let mut tools = Vec::with_capacity(7);
+        let mut tools = Vec::with_capacity(5);
         for (tool, names) in [
             (Tool::BsdTar, &["bsdtar"][..]),
             (Tool::Tar, &["tar"][..]),
             (Tool::ZipInfo, &["zipinfo"][..]),
             (Tool::Unzip, &["unzip"][..]),
             (Tool::SevenZip, &["7zz", "7z"][..]),
-            (Tool::PdfText, &["pdftotext"][..]),
         ] {
             let found = names.iter().find_map(|name| {
                 paths.iter().find_map(|directory| {
@@ -146,7 +144,6 @@ impl Catalog {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
-    Pdf,
     Zip,
     Tar,
     Gzip,
@@ -158,7 +155,8 @@ enum Format {
 
 fn format(bytes: &[u8], path: &Path) -> Option<Format> {
     if bytes.starts_with(b"%PDF-") {
-        return Some(Format::Pdf);
+        // Recognized documents remain file details, even with an archive extension.
+        return None;
     }
     if bytes.starts_with(b"PK\x03\x04")
         || bytes.starts_with(b"PK\x05\x06")
@@ -207,17 +205,6 @@ fn format(bytes: &[u8], path: &Path) -> Option<Format> {
 
 fn arguments(tool: Tool, format: Format) -> Option<&'static [&'static str]> {
     match (tool, format) {
-        (Tool::PdfText, Format::Pdf) => Some(&[
-            "-f",
-            "1",
-            "-l",
-            "8",
-            "-layout",
-            "-nopgbrk",
-            "/dev/fd/0",
-            "-",
-        ]),
-        (_, Format::Pdf) | (Tool::PdfText, _) => None,
         (Tool::BsdTar, _) => Some(&[
             "--passphrase",
             "ldu-preview-no-password",
@@ -285,20 +272,9 @@ pub(super) fn preview(
         ) {
             Ok(Some((bytes, truncated))) => {
                 let mut contents = output_text(&bytes, truncated);
-                contents.kind = if format == Format::Pdf {
-                    "PDF"
-                } else {
-                    "Archive"
-                };
+                contents.kind = "Archive";
                 if contents.text.as_deref() == Some("") {
-                    contents.text = Some(
-                        if format == Format::Pdf {
-                            "No extractable text."
-                        } else {
-                            "Empty archive."
-                        }
-                        .into(),
-                    );
+                    contents.text = Some("Empty archive.".into());
                 }
                 return Ok(Some(contents));
             }
@@ -530,7 +506,6 @@ mod tests {
     fn fixed_helper_plans_and_output_do_not_depend_on_file_magic_or_names() {
         for (magic, expected) in [
             (b"PK\x03\x04".as_slice(), Format::Zip),
-            (b"%PDF-1.7", Format::Pdf),
             (b"\x1f\x8b", Format::Gzip),
             (b"BZh9", Format::Bzip),
             (b"\xfd7zXZ\0", Format::Xz),
@@ -546,8 +521,6 @@ mod tests {
         assert_eq!(format(b"text", Path::new("notes.txt")), None);
         let args = arguments(Tool::Tar, Format::Zip).unwrap();
         assert!(args.contains(&"--passphrase") && args.contains(&"/dev/fd/0"));
-        assert!(arguments(Tool::PdfText, Format::Zip).is_none());
-        assert!(arguments(Tool::BsdTar, Format::Pdf).is_none());
         let output = output_text(b"%PDF-member\nGIF89a\nraw\xff\n\x1b[31m\0", false);
         assert_eq!(
             output.text.as_deref(),
@@ -556,6 +529,31 @@ mod tests {
         let output = output_text(&b"x\n".repeat(READ_LIMIT), false);
         assert!(output.truncated);
         assert!(output.text.unwrap().lines().count() <= super::super::LINE_LIMIT);
+    }
+
+    #[test]
+    fn pdf_files_skip_helper_discovery_and_archive_extension_fallbacks() {
+        std::fs::create_dir_all(".tmp").unwrap();
+        let mut input = tempfile::tempfile_in(".tmp").unwrap();
+        let bytes = b"%PDF-1.7\nPDF contents must not be shown\n";
+        input.write_all(bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut catalog = None;
+        for name in ["document.pdf", "renamed.zip", "renamed.tar", "renamed.7z"] {
+            assert!(
+                preview(
+                    &mut input,
+                    bytes,
+                    Path::new(name),
+                    &cancel,
+                    &mut catalog,
+                    &Control::default(),
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(catalog.is_none());
+        }
     }
 
     #[test]
