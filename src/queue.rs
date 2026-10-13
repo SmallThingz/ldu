@@ -54,7 +54,7 @@ pub struct QueueEntry {
     pub id: QueueId,
     pub node: NodeId,
     pub anchor: Arc<RootAnchor>,
-    pub relative: PathBuf,
+    pub relative: Arc<Path>,
     target: Option<ConfirmedTarget>,
 }
 
@@ -297,22 +297,20 @@ struct Prune {
 }
 
 enum Retired {
-    Marks {
-        _marks: QueueMarks,
-    },
-    Entry {
-        _entry: QueueEntry,
-    },
-    Prune {
-        _prune: Prune,
-    },
-    Pending {
-        _pending: PendingQueue,
-        _paths: Paths,
-        _superseded: Paths,
-        _superseded_nodes: HashMap<NodeId, QueueId>,
-        _pruning: Vector<Prune>,
-    },
+    Marks { _marks: QueueMarks },
+    Entry { _entry: QueueEntry },
+    Prune { _prune: Prune },
+    Pending { _pending: Box<RetiredPending> },
+}
+
+// Cancel-all is rare; keep its combined payload out of every per-entry
+// retirement slot without allocating for ordinary entries, marks or prunes.
+struct RetiredPending {
+    _pending: PendingQueue,
+    _paths: Paths,
+    _superseded: Paths,
+    _superseded_nodes: HashMap<NodeId, QueueId>,
+    _pruning: Vector<Prune>,
 }
 
 /// The caller excludes new targets, pumps bounded ancestor supersession, and
@@ -407,7 +405,7 @@ impl DeleteQueue {
         let superseded = self
             .has_at_or_below(root, &relative)
             .then(|| self.paths[&root].clone());
-        let path = Arc::<Path>::from(relative.as_path());
+        let path = Arc::<Path>::from(relative);
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -417,13 +415,6 @@ impl DeleteQueue {
             .entry(root)
             .or_default()
             .insert(Arc::clone(&path), id);
-        self.pending.push_back(QueueEntry {
-            id,
-            node,
-            anchor,
-            relative,
-            target,
-        });
         if let Some(paths) = superseded {
             self.superseded_nodes.insert(node, id);
             self.superseded
@@ -434,10 +425,17 @@ impl DeleteQueue {
                 anchor: root,
                 node,
                 ancestor: id,
-                prefix: path,
+                prefix: Arc::clone(&path),
                 paths,
             });
         }
+        self.pending.push_back(QueueEntry {
+            id,
+            node,
+            anchor,
+            relative: path,
+            target,
+        });
         EnqueueOutcome { id, inserted: true }
     }
 
@@ -552,7 +550,7 @@ impl DeleteQueue {
     fn remove_pending_inner(&mut self, id: QueueId) -> Option<QueueEntry> {
         let entry = self.pending.remove(id)?;
         let root = anchor_id(&entry.anchor);
-        let path = entry.relative.as_path();
+        let path = entry.relative.as_ref();
         if let Some(paths) = self.paths.get_mut(&root) {
             // An older superseded job may have been explicitly reconfirmed at
             // the same path with a fresh ID before its old prune completed.
@@ -577,11 +575,13 @@ impl DeleteQueue {
         self.cancel_active();
         let removed = self.pending.len();
         self.retired.push(Retired::Pending {
-            _pending: std::mem::take(&mut self.pending),
-            _paths: std::mem::take(&mut self.paths),
-            _superseded: std::mem::take(&mut self.superseded),
-            _superseded_nodes: std::mem::take(&mut self.superseded_nodes),
-            _pruning: std::mem::take(&mut self.pruning),
+            _pending: Box::new(RetiredPending {
+                _pending: std::mem::take(&mut self.pending),
+                _paths: std::mem::take(&mut self.paths),
+                _superseded: std::mem::take(&mut self.superseded),
+                _superseded_nodes: std::mem::take(&mut self.superseded_nodes),
+                _pruning: std::mem::take(&mut self.pruning),
+            }),
         });
         self.flush_retired();
         removed
@@ -709,7 +709,7 @@ impl DeleteQueue {
             #[cfg(unix)]
             let handle = delete::spawn_with_completion(
                 Arc::clone(&entry.anchor),
-                entry.relative.clone(),
+                entry.relative.to_path_buf(),
                 entry.target,
                 completion,
             );
@@ -717,10 +717,10 @@ impl DeleteQueue {
             let handle = match entry.target {
                 Some(target) => delete::spawn_confirmed(
                     Arc::clone(&entry.anchor),
-                    entry.relative.clone(),
+                    entry.relative.to_path_buf(),
                     target,
                 ),
-                None => delete::spawn(Arc::clone(&entry.anchor), entry.relative.clone()),
+                None => delete::spawn(Arc::clone(&entry.anchor), entry.relative.to_path_buf()),
             };
             Worker::Running(handle)
         })
@@ -752,7 +752,7 @@ impl DeleteQueue {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => DeleteResult {
-                relative: active.entry.relative.clone(),
+                relative: active.entry.relative.to_path_buf(),
                 target_removed: false,
                 outcome: Err(io::Error::other("deletion worker stopped without a result")),
                 parent_metadata: None,
@@ -856,7 +856,7 @@ mod tests {
                 sender,
                 finished: Arc::clone(&finished),
                 cancelled: Arc::clone(&cancelled),
-                relative: entry.relative.clone(),
+                relative: entry.relative.to_path_buf(),
             });
             Worker::Fake(FakeWorker {
                 receiver,
@@ -865,6 +865,68 @@ mod tests {
             })
         });
         control
+    }
+
+    #[test]
+    fn queued_paths_share_storage_through_reordering_pruning_and_completion() {
+        fn shared_path(queue: &DeleteQueue, id: QueueId) -> Arc<Path> {
+            let entry = queue.entry(id).unwrap();
+            let (indexed, indexed_id) = queue.paths[&anchor_id(&entry.anchor)]
+                .get_key_value(entry.relative.as_ref())
+                .unwrap();
+            assert_eq!(*indexed_id, id);
+            assert!(Arc::ptr_eq(indexed, &entry.relative));
+            Arc::clone(indexed)
+        }
+
+        let anchor = anchor();
+        let mut queue = DeleteQueue::new().unwrap();
+        let first = queue
+            .enqueue(1, Arc::clone(&anchor), "parent/first".into())
+            .id;
+        let second = queue
+            .enqueue(2, Arc::clone(&anchor), "parent/second".into())
+            .id;
+        let sibling = queue.enqueue(3, Arc::clone(&anchor), "sibling".into()).id;
+        let first_path = shared_path(&queue, first);
+        let second_path = shared_path(&queue, second);
+        let sibling_path = shared_path(&queue, sibling);
+
+        assert!(queue.move_pending(sibling, -1));
+        assert!(Arc::ptr_eq(&shared_path(&queue, sibling), &sibling_path));
+        let removed = queue.remove_pending(sibling).unwrap();
+        assert!(Arc::ptr_eq(&removed.relative, &sibling_path));
+        assert!(!queue.paths[&anchor_id(&anchor)].contains_key(sibling_path.as_ref()));
+
+        let parent = queue.enqueue(4, Arc::clone(&anchor), "parent".into()).id;
+        let parent_path = shared_path(&queue, parent);
+        let (marker, _) = queue.superseded[&anchor_id(&anchor)]
+            .get_key_value(parent_path.as_ref())
+            .unwrap();
+        assert!(Arc::ptr_eq(marker, &parent_path));
+        let prune = queue.pruning.front().unwrap();
+        assert!(Arc::ptr_eq(&prune.prefix, &parent_path));
+        for path in [&first_path, &second_path] {
+            let (indexed, _) = prune.paths.get_key_value(path.as_ref()).unwrap();
+            assert!(Arc::ptr_eq(indexed, path));
+        }
+        while queue.is_updating() {
+            queue.pump(1);
+            std::thread::yield_now();
+        }
+        assert!(queue.entry(first).is_none() && queue.entry(second).is_none());
+        assert_eq!(queue.pending().len(), 1);
+        assert!(Arc::ptr_eq(&shared_path(&queue, parent), &parent_path));
+
+        let worker = start(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&queue.active().unwrap().relative, &parent_path));
+        assert!(!queue.paths.contains_key(&anchor_id(&anchor)));
+        worker.send_result(Ok(()));
+        worker.finish();
+        let completion = queue.poll().unwrap();
+        assert!(Arc::ptr_eq(&completion.entry.relative, &parent_path));
+        assert_eq!(completion.result.relative, parent_path.as_ref());
+        assert!(!queue.is_busy());
     }
 
     #[test]
@@ -1190,7 +1252,7 @@ mod tests {
         assert_eq!(queue.pending().len(), 1);
         assert_eq!(queue.pending().front().unwrap().id, later);
         assert_eq!(
-            queue.entry(later).unwrap().relative,
+            queue.entry(later).unwrap().relative.as_ref(),
             Path::new("parent/new")
         );
 
@@ -1262,7 +1324,7 @@ mod tests {
             assert_eq!(queue.poll().unwrap().entry.id, old);
             let next_worker = start(&mut queue).unwrap();
             assert_eq!(queue.active().unwrap().id, fresh.id);
-            assert_eq!(queue.active().unwrap().relative, Path::new(target));
+            assert_eq!(queue.active().unwrap().relative.as_ref(), Path::new(target));
             next_worker.send_result(Ok(()));
             next_worker.finish();
             assert!(queue.poll().unwrap().result.outcome.is_ok());
