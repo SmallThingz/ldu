@@ -4970,7 +4970,7 @@ fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: 
 pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(
-            "interactive browsing requires a terminal; use --json for non-interactive output",
+            "interactive browsing requires a terminal; use -o FILE for non-interactive output",
         ));
     }
     let interrupts = Arc::new(AtomicUsize::new(0));

@@ -76,7 +76,16 @@ def reference_total(root, apparent):
         command.append("--apparent-size")
     command += ["--", str(root)]
     result = subprocess.run(command, text=True, capture_output=True, check=True)
-    return int(result.stdout.split()[0])
+    total = int(result.stdout.split()[0])
+    if apparent:
+        # GNU du omits directory metadata lengths in apparent-size mode.
+        # LDU's export includes each entry's own length, including directories.
+        def failed(error):
+            raise error
+
+        total += sum(Path(folder).lstat().st_size for folder, _, _ in
+                     os.walk(root, onerror=failed, followlinks=False))
+    return total
 
 
 def binary_identity(label, binary):
@@ -99,12 +108,36 @@ def reference_entries(root):
 
 
 def validate_output(output, expected, entries):
-    assert output["errors"] == 0 and not output["cancelled"], output
-    assert all(output[key] == expected[key] for key in expected), (expected, output)
-    assert output["entries"] == entries, (entries, output)
-    assert all(row["complete"] and row["errors"] == 0 for row in output["directories"]), output
-    assert sorted(row["name"] for row in output["directories"]) == ["deep", "flat", "wide"], output
-    assert math.isfinite(output["seconds"]) and output["seconds"] > 0, output
+    assert isinstance(output, list) and len(output) == 4 and output[:2] == [1, 2], (
+        "Expected ncdu-compatible -o output; both benchmark binaries must support this format")
+    assert output[2]["progname"] == "ldu", output[2]
+    root = output[3]
+    assert isinstance(root, list) and root and isinstance(root[0], dict), "Missing export root"
+    totals = {"apparent": 0, "allocated": 0}
+    count = 0
+    pending = [iter([root])]
+    while pending:
+        item = next(pending[-1], None)
+        if item is None:
+            pending.pop()
+            continue
+        if isinstance(item, list):
+            assert item and isinstance(item[0], dict), "Invalid exported directory"
+            record = item[0]
+            pending.append(iter(item[1:]))
+        else:
+            record = item
+        assert isinstance(record, dict) and isinstance(record.get("name"), str), record
+        assert not record.get("read_error") and not record.get("excluded"), record
+        for field, total in [("asize", "apparent"), ("dsize", "allocated")]:
+            value = record.get(field, 0)
+            assert type(value) is int and value >= 0, record
+            totals[total] += value
+        count += 1
+    assert totals == expected, (expected, totals)
+    assert count - 1 == entries, (entries, count - 1)
+    assert sorted(item[0]["name"] for item in root[1:] if isinstance(item, list)) == [
+        "deep", "flat", "wide"]
 
 
 def measure(args):
@@ -125,12 +158,11 @@ def measure(args):
             buffers = args.buffers if backend != "std" else [262144]
             for buffer_size in buffers:
                 commands = {
-                    label: [local_executable(binary), "--json", "--backend", backend,
+                    label: [local_executable(binary), "-o", "-", "--backend", backend,
                             "--threads", str(threads), "--buffer-size", str(buffer_size), str(root)]
                     for label, binary in variants
                 }
                 samples = {label: [] for label, _ in variants}
-                scan_samples = {label: [] for label, _ in variants}
                 # Warm each executable on the same corpus before collecting this case.
                 for command in commands.values():
                     _, initial = run_json(command)
@@ -142,15 +174,12 @@ def measure(args):
                         elapsed, output = run_json(commands[label])
                         validate_output(output, expected, entries)
                         samples[label].append(elapsed)
-                        scan_samples[label].append(output["seconds"])
                 for label, _ in variants:
                     reports.append({
                         "variant": label,
                         "backend": backend, "threads": threads, "buffer_bytes": buffer_size,
                         "wall_median_seconds": statistics.median(samples[label]),
-                        "scan_median_seconds": statistics.median(scan_samples[label]),
                         "wall_samples_seconds": samples[label],
-                        "scan_samples_seconds": scan_samples[label],
                     })
     references = []
     for name, command in (
@@ -180,6 +209,7 @@ def measure(args):
         "qualification": "Synthetic corpus; warm metadata cache; samples accepted only when guarded-run exits zero.",
         "platform": platform.platform(), "logical_cpus": os.cpu_count(),
         "source_head": source_head(), "binaries": binaries,
+        "timing": "Process wall time, including ncdu-compatible JSON export",
         "sample_order": "baseline/current then current/baseline on alternating repetitions"
                         if args.baseline_binary is not None else "current only",
         "primary_files": args.files, "flat_rows": args.files // 2 + 1, "entries": entries,

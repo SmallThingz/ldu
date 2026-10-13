@@ -303,6 +303,18 @@ impl Model {
         &self.nodes[id as usize]
     }
 
+    /// Counted bytes belonging to this entry, excluding directory descendants.
+    pub fn own_sizes(&self, id: NodeId) -> Sizes {
+        let node = self.node(id);
+        if node.kind == NodeKind::Directory {
+            self.directories
+                .get(&id)
+                .map_or(node.sizes, |directory| directory.sizes)
+        } else {
+            node.sizes
+        }
+    }
+
     /// Removed descendants remain addressable, but do not participate in totals or views.
     pub fn is_removed(&self, id: NodeId) -> bool {
         if id as usize >= self.nodes.len() {

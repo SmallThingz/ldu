@@ -292,6 +292,17 @@ fn unreadable_directory_finishes_with_observable_error_and_partial_total() {
         2,
         "the unreadable directory remains visible"
     );
+    let output = export_scan(root);
+    assert_eq!(output.status.code(), Some(2));
+    let document = ncdu_document(&output);
+    let records = ncdu_records(&document[3]);
+    assert_eq!(ncdu_totals(&records), model.node(ROOT).sizes);
+    assert!(
+        records
+            .iter()
+            .any(|record| record["name"] == "blocked" && record["read_error"] == true)
+    );
+    assert!(!records.iter().any(|record| record["name"] == "secret"));
     let blocked_id = model
         .children(ROOT)
         .find(|&id| model.node(id).name.as_ref() == "blocked")
@@ -311,41 +322,350 @@ fn unreadable_directory_finishes_with_observable_error_and_partial_total() {
     );
 }
 
-fn json_scan(path: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ldu"))
-        .args(["--json", "--threads", "2"])
+fn ldu_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ldu"));
+    command.env_remove("XDG_CONFIG_HOME").env_remove("HOME");
+    command
+}
+
+fn export_scan(path: &Path) -> std::process::Output {
+    ldu_command()
+        .args(["-o", "-", "--threads", "2"])
         .arg(path)
         .output()
         .unwrap()
 }
 
+fn ncdu_document(output: &std::process::Output) -> serde_json::Value {
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let fields = document.as_array().expect("ncdu export must be an array");
+    assert_eq!(fields.len(), 4);
+    assert_eq!(fields[0], 1);
+    assert_eq!(fields[1], 2);
+    assert_eq!(fields[2]["progname"], "ldu");
+    assert_eq!(fields[2]["progver"], env!("CARGO_PKG_VERSION"));
+    assert!(fields[2]["timestamp"].as_u64().is_some());
+    assert!(
+        fields[3].is_array(),
+        "ncdu imports require a directory root"
+    );
+    document
+}
+
+fn ncdu_records(tree: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut pending = vec![tree];
+    let mut records = Vec::new();
+    while let Some(entry) = pending.pop() {
+        if let Some(directory) = entry.as_array() {
+            let (record, children) = directory.split_first().expect("directory needs metadata");
+            assert!(record.is_object());
+            records.push(record);
+            pending.extend(children);
+        } else {
+            assert!(entry.is_object());
+            records.push(entry);
+        }
+    }
+    records
+}
+
+fn ncdu_totals(records: &[&serde_json::Value]) -> Sizes {
+    records.iter().fold(Sizes::default(), |mut total, record| {
+        total.apparent += record["asize"].as_u64().unwrap_or(0);
+        total.allocated += record["dsize"].as_u64().unwrap_or(0);
+        total
+    })
+}
+
 #[test]
-fn headless_json_handles_non_utf8_root_and_directory_paths_and_reports_missing_root() {
+fn headless_export_exports_the_full_ncdu_tree_with_counted_own_sizes() {
     let work = fixture();
-    let raw_root = work.path().join(OsString::from_vec(b"root-\xfe".to_vec()));
-    fs::create_dir(&raw_root).unwrap();
-    let raw_dir = raw_root.join(OsString::from_vec(b"directory-\xff".to_vec()));
-    fs::create_dir(&raw_dir).unwrap();
-    fs::write(raw_dir.join("leaf"), b"content").unwrap();
-    let output = json_scan(&raw_root);
+    let root = work.path();
+    fs::create_dir_all(root.join("branch/nested")).unwrap();
+    fs::create_dir(root.join("empty")).unwrap();
+    fs::write(root.join("branch/nested/leaf"), b"nested payload").unwrap();
+    let unusual = "quoted-\"-backslash-\\-newline-\n-snowman-☃";
+    fs::write(root.join(unusual), b"escaped name").unwrap();
+    let sparse = root.join("sparse");
+    File::create(&sparse).unwrap().set_len(1 << 20).unwrap();
+    fs::hard_link(&sparse, root.join("branch/alias")).unwrap();
+    symlink("branch", root.join("directory-link")).unwrap();
+    symlink("branch/nested/leaf", root.join("file-link")).unwrap();
+    let expected = reference(root, &mut HashSet::new());
+    let output = export_scan(root);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["errors"], 0);
-    assert_eq!(json["entries"], 2);
-    assert_eq!(json["directories"][0]["complete"], true);
-    let expected = reference(&raw_root, &mut HashSet::new()).0;
-    assert_eq!(json["apparent"], expected.apparent);
-    assert_eq!(json["allocated"], expected.allocated);
+    let document = ncdu_document(&output);
+    let tree = &document[3];
+    let records = ncdu_records(tree);
+    assert_eq!(records.len() as u64, expected.1 + 1);
+    assert_eq!(ncdu_totals(&records), expected.0);
+    assert!(records.iter().all(|record| record["read_error"] != true));
+    let root_metadata = fs::symlink_metadata(root).unwrap();
+    assert_eq!(tree[0]["asize"], root_metadata.len());
+    assert_eq!(tree[0]["dsize"], root_metadata.blocks() * 512);
+    let branch = tree
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .find(|entry| entry.is_array() && entry[0]["name"] == "branch")
+        .unwrap();
+    let nested = branch
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .find(|entry| entry.is_array() && entry[0]["name"] == "nested")
+        .unwrap();
+    assert!(
+        nested
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .any(|entry| entry["name"] == "leaf" && entry["asize"] == 14)
+    );
+    assert!(
+        tree.as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .any(|entry| entry.is_array()
+                && entry[0]["name"] == "empty"
+                && entry.as_array().unwrap().len() == 1)
+    );
+    assert!(records.iter().any(|record| record["name"] == unusual));
+    for name in ["directory-link", "file-link"] {
+        let link = tree
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .find(|entry| entry.is_object() && entry["name"] == name)
+            .unwrap();
+        assert_eq!(link["notreg"], true);
+        assert_eq!(
+            link["asize"],
+            fs::symlink_metadata(root.join(name)).unwrap().len()
+        );
+    }
+    let aliases: Vec<_> = records
+        .iter()
+        .filter(|record| record["name"] == "sparse" || record["name"] == "alias")
+        .collect();
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(
+        aliases.iter().filter(|record| record["asize"] == 0).count(),
+        1
+    );
+    for record in records {
+        assert!(record.get("ino").is_none());
+        assert!(record.get("dev").is_none());
+        assert!(record.get("nlink").is_none());
+    }
+}
 
-    let output = json_scan(&work.path().join("does-not-exist"));
+#[test]
+fn headless_export_handles_non_utf8_paths_and_reports_missing_root() {
+    let work = fixture();
+    let raw_root = work.path().join(OsString::from_vec(b"root-\xfe".to_vec()));
+    fs::create_dir(&raw_root).unwrap();
+    let raw_dir = raw_root.join(OsString::from_vec(b"directory-\xff".to_vec()));
+    fs::create_dir(&raw_dir).unwrap();
+    let raw_file = raw_dir.join(OsString::from_vec(b"file-\xfd".to_vec()));
+    fs::write(&raw_file, b"content").unwrap();
+    let output = export_scan(&raw_root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = ncdu_document(&output);
+    let records = ncdu_records(&document[3]);
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        ncdu_totals(&records),
+        reference(&raw_root, &mut HashSet::new()).0
+    );
+    assert_eq!(
+        document[3][0]["name"],
+        std::path::absolute(&raw_root)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(records.iter().any(|record| record["name"] == "directory-�"));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["name"] == "file-�" && record["asize"] == 7)
+    );
+    assert!(records.iter().all(|record| record["read_error"] != true));
+
+    let output = export_scan(&work.path().join("does-not-exist"));
     assert_eq!(output.status.code(), Some(2));
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(json["errors"].as_u64().unwrap() > 0);
-    assert_eq!(json["cancelled"], false);
+    let document = ncdu_document(&output);
+    let records = ncdu_records(&document[3]);
+    assert!(records.iter().any(|record| record["read_error"] == true));
+    assert_eq!(ncdu_totals(&records), Sizes::default());
+}
+
+#[test]
+fn export_file_matches_stdout_and_does_not_write_json_to_stdout() {
+    let work = fixture();
+    let root = work.path().join("tree");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("nested/leaf"), b"exported payload").unwrap();
+    let stdout = export_scan(&root);
+    assert!(
+        stdout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stdout.stderr)
+    );
+    let mut expected = ncdu_document(&stdout);
+    let path = work.path().join("scan.ncdu");
+    let file = ldu_command()
+        .args(["-0", "-o"])
+        .arg(&path)
+        .args(["--threads", "2"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    assert!(file.stdout.is_empty());
+    let mut actual: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(actual[2]["timestamp"].as_u64().is_some());
+    actual[2].as_object_mut().unwrap().remove("timestamp");
+    expected[2].as_object_mut().unwrap().remove("timestamp");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn export_output_cannot_truncate_the_input_file_or_its_aliases() {
+    let work = fixture();
+    let input = work.path().join("input");
+    let contents = b"original input must survive export rejection";
+    fs::write(&input, contents).unwrap();
+    let hardlink = work.path().join("hardlink");
+    let symlink_path = work.path().join("symlink");
+    fs::hard_link(&input, &hardlink).unwrap();
+    symlink("input", &symlink_path).unwrap();
+    for output in [&input, &hardlink, &symlink_path] {
+        let result = ldu_command()
+            .arg("-o")
+            .arg(output)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "accepted input alias as output: {}",
+            output.display()
+        );
+        assert_eq!(fs::read(&input).unwrap(), contents);
+        assert_eq!(fs::read(&hardlink).unwrap(), contents);
+        assert_eq!(fs::read(&symlink_path).unwrap(), contents);
+        assert!(
+            fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[test]
+fn headless_export_wraps_a_file_root_without_charging_the_unscanned_parent() {
+    let work = fixture();
+    let root = work.path().join("only-file");
+    fs::write(&root, b"standalone").unwrap();
+    let output = export_scan(&root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = ncdu_document(&output);
+    let records = ncdu_records(&document[3]);
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        ncdu_totals(&records),
+        reference(&root, &mut HashSet::new()).0
+    );
+    assert_eq!(document[3][1]["name"], "only-file");
+    assert_eq!(document[3][1]["asize"], 10);
+    assert_eq!(document[3][0]["asize"].as_u64().unwrap_or(0), 0);
+    assert_eq!(document[3][0]["dsize"].as_u64().unwrap_or(0), 0);
+}
+
+fn json_prefix(input: &[u8]) -> (serde_json::Value, &[u8]) {
+    let mut stream = serde_json::Deserializer::from_slice(input).into_iter();
+    let value = stream.next().unwrap().unwrap();
+    (value, &input[stream.byte_offset()..])
+}
+
+fn json_delimiter(input: &[u8], delimiter: u8) -> &[u8] {
+    let input = input.trim_ascii_start();
+    assert_eq!(input.first().copied(), Some(delimiter));
+    &input[1..]
+}
+
+#[test]
+fn headless_export_exports_deep_trees_without_recursive_serialization() {
+    let work = fixture();
+    let mut leaf = work.path().to_owned();
+    for level in 0..192 {
+        leaf.push(format!("d-{level:03}"));
+        fs::create_dir(&leaf).unwrap();
+    }
+    fs::write(leaf.join("leaf"), b"deep").unwrap();
+    let expected = reference(work.path(), &mut HashSet::new());
+    let output = export_scan(work.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Parse one flat record at a time, independently of serde_json's nesting limit.
+    let (major, input) = json_prefix(json_delimiter(&output.stdout, b'['));
+    assert_eq!(major, 1);
+    let (minor, input) = json_prefix(json_delimiter(input, b','));
+    assert_eq!(minor, 2);
+    let (metadata, input) = json_prefix(json_delimiter(input, b','));
+    assert_eq!(metadata["progname"], "ldu");
+    let mut input = json_delimiter(input, b',');
+    let mut total = Sizes::default();
+    for level in 0..=192 {
+        let (record, remaining) = json_prefix(json_delimiter(input, b'['));
+        assert!(record.is_object());
+        if level != 0 {
+            assert_eq!(record["name"], format!("d-{:03}", level - 1));
+        }
+        total.apparent += record["asize"].as_u64().unwrap_or(0);
+        total.allocated += record["dsize"].as_u64().unwrap_or(0);
+        input = json_delimiter(remaining, b',');
+    }
+    let (record, remaining) = json_prefix(input);
+    assert_eq!(record["name"], "leaf");
+    assert_eq!(record["asize"], 4);
+    total.apparent += record["asize"].as_u64().unwrap_or(0);
+    total.allocated += record["dsize"].as_u64().unwrap_or(0);
+    input = remaining;
+    // Every directory array plus the outer format array must close exactly once.
+    for _ in 0..194 {
+        input = json_delimiter(input, b']');
+    }
+    assert!(input.trim_ascii().is_empty());
+    assert_eq!(total, expected.0);
+    assert_eq!(expected.1, 193);
 }
 
 #[cfg(target_os = "linux")]
