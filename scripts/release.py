@@ -98,6 +98,16 @@ def inspect_elf(data, target):
             f"Wrong ELF OS ABI for {target}")
     require(struct.unpack_from("<H", data, 16)[0] in (2, 3), "ELF is not executable")
     bounded(data, 0, 52 if is_32 else 64)
+    require(struct.unpack_from("<I", data, 20)[0] == 1
+            and struct.unpack_from("<H", data, 40 if is_32 else 52)[0] == (52 if is_32 else 64),
+            "Invalid ELF header version or size")
+    if is_32:
+        flags = struct.unpack_from("<I", data, 36)[0]
+        require(flags & 0xff000000 == 0x05000000 and flags & 0x600 == 0x400,
+                "ARM releases require EABI version 5 and the hard-float ABI")
+    elif target.startswith("riscv64gc-"):
+        flags = struct.unpack_from("<I", data, 48)[0]
+        require(flags & 0x6 == 0x4, "RISC-V releases require the double-float ABI")
     if is_32:
         phoff = struct.unpack_from("<I", data, 28)[0]
         phsize, phnum = struct.unpack_from("<HH", data, 42)

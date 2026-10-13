@@ -41,11 +41,15 @@ def elf(target="x86_64-unknown-linux-musl", libraries=(), interpreter=None, rpat
             struct.pack_into("<QQ", data, 500 + index * 16, *entry)
         headers.append((2, 500, len(dynamic) * 16))
     phoff, phsize = (52, 32) if is_32 else (64, 56)
+    struct.pack_into("<H", data, 40 if is_32 else 52, phoff)
     if is_32:
         struct.pack_into("<I", data, 28, phoff)
+        struct.pack_into("<I", data, 36, 0x05000400)
         struct.pack_into("<HH", data, 42, phsize, len(headers))
     else:
         struct.pack_into("<Q", data, 32, phoff)
+        if target.startswith("riscv64gc-"):
+            struct.pack_into("<I", data, 48, 0x5)
         struct.pack_into("<HH", data, 54, phsize, len(headers))
     for index, (kind, start, size) in enumerate(headers):
         if is_32:
@@ -98,6 +102,31 @@ class FormatTests(unittest.TestCase):
             release.check_architecture(elf(libraries=["libc.so.6"],
                                            interpreter="/lib64/ld-linux-x86-64.so.2"),
                                        "x86_64-unknown-linux-musl")
+
+    def test_arm_and_riscv_calling_abis_must_match_the_release_target(self):
+        cases = [
+            ("armv7-unknown-linux-musleabihf", 36,
+             [0, 0x04000400, 0x05000000, 0x05000200, 0x05000600]),
+            ("riscv64gc-unknown-linux-musl", 48, [0, 1, 2, 3, 6, 7]),
+        ]
+        for target, offset, invalid_flags in cases:
+            for flags in invalid_flags:
+                with self.subTest(target=target, flags=hex(flags)):
+                    data = bytearray(elf(target))
+                    struct.pack_into("<I", data, offset, flags)
+                    with self.assertRaisesRegex(RuntimeError, "ABI"):
+                        release.check_architecture(bytes(data), target)
+
+    def test_invalid_elf_fixed_header_version_and_size_are_rejected(self):
+        for target in ["x86_64-unknown-linux-musl", "armv7-unknown-linux-musleabihf"]:
+            offset = 40 if target.startswith("armv7-") else 52
+            for position, code, value in [(20, "I", 0), (20, "I", 2),
+                                           (offset, "H", 0), (offset, "H", 51)]:
+                with self.subTest(target=target, position=position, value=value):
+                    data = bytearray(elf(target))
+                    struct.pack_into("<" + code, data, position, value)
+                    with self.assertRaisesRegex(RuntimeError, "ELF header"):
+                        release.check_architecture(bytes(data), target)
 
     def test_freebsd_requires_its_abi_loader_and_only_base_libraries(self):
         for target in ["x86_64-unknown-freebsd", "aarch64-unknown-freebsd"]:
