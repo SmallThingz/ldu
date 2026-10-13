@@ -536,8 +536,11 @@ def settled_home(session, predicate, description, multiple=True):
     # A retained row may precede a pending configuration; observe cursor changes.
     if multiple:
         session.key(b"\x1b[F")
-        session.wait(lambda: session.screen.selected_row() not in (None, session.screen.first_entry_row()),
-                     "End did not acknowledge configured order")
+        # Home paints the pinned parent before its following j reaches the
+        # first entry. That intermediate row must not acknowledge our End.
+        session.wait(lambda: (row := session.screen.selected_row()) is not None
+                     and row > session.screen.first_entry_row(),
+                     "End did not acknowledge configured order with a later entry")
     home_entry(session)
     session.wait(lambda: session.screen.selected_row() == session.screen.first_entry_row() and predicate(),
                  "Home did not return to the configured first row")
@@ -861,7 +864,7 @@ def check_owned_immediate_confirmation(binary, work, threads):
             fixture_selection(session, "alpha")
             expected = names[:1] if mode == "single" else names[:2]
             if mode == "batch":
-                session.key(b"v")
+                enter_visual_mark(session)
                 wait_visual(session, names, names[:1], cursor="alpha")
                 session.key(b"\x1b[1;2B")
                 wait_visual(session, names, expected, cursor="beta")
@@ -1479,12 +1482,12 @@ def check_owned_mouse_navigation(binary, work, threads):
         row = session.screen.selected_row()
         click = f"\x1b[<0;35;{row + 1}M\x1b[<0;35;{row + 1}m".encode()
         session.key(b"v")
-        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
-        session.key(click)
         wait_visual(session, ["branch/"], [], cursor="branch/")
+        session.key(click)
+        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
         assert fixture_directory(session, root), "visual click entered a directory"
         session.key(click)
-        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
+        wait_visual(session, ["branch/"], [], cursor="branch/")
         assert fixture_directory(session, root), "visual click entered a directory"
         session.key(b"v")
         session.wait(lambda: path_in_header(session.screen, root),
@@ -1642,6 +1645,8 @@ def check_owned_parent_row(binary, work, threads):
         fixture_selection(session, "alpha")
         row = session.screen.selected_row()
         mouse_click(session, 35, row, button=2)
+        wait_visual(session, names, [], cursor="alpha")
+        mouse_click(session, 35, row)
         wait_visual(session, names, ["alpha"], cursor="alpha")
         mouse_click(session, 35, row, button=2)
         column = session.screen.text(header=True).rfind("1 selected")
@@ -1669,11 +1674,29 @@ def check_owned_parent_row(binary, work, threads):
         # Selecting ../ means all current-folder entries, including both the
         # hidden dotfile and entries excluded by the just-applied filter.
         session.key(b"\x1b[Hv")
+        session.wait(lambda: visual_count(session) == 0
+                     and visible_paths(session, names) == ["alpha"],
+                     "entering visual mode on ../ unexpectedly selected or revealed entries")
+        session.key(b"\r")
         session.wait(lambda: visual_count(session) == len(names)
                      and set(visible_paths(session, names)) == set(names)
                      and set(visual_paths(session, names)) == set(names)
                      and "/alpha" not in session.screen.text(header=True),
                      "visual ../ omitted hidden or filter-excluded entries")
+        session.key(b"\r")
+        wait_visual(session, names, [])
+        assert set(visible_paths(session, names)) == set(names), "parent toggle hid selected-folder entries"
+        parent_column = session.screen.main_line(1).index("../")
+        mouse_click(session, parent_column, 1)
+        session.wait(lambda: visual_count(session) == len(names)
+                     and set(visual_paths(session, names)) == set(names),
+                     "clicking ../ did not select every current-folder entry")
+        mouse_click(session, parent_column, 1)
+        wait_visual(session, names, [])
+        mouse_click(session, parent_column, 1)
+        session.wait(lambda: visual_count(session) == len(names)
+                     and set(visual_paths(session, names)) == set(names),
+                     "second parent toggle did not restore all entries")
         click_header_label(session, "[D] delete")
         wait_batch_confirmation(session, count=len(names))
         close_modal_mouse(session)
@@ -1813,7 +1836,7 @@ def check_owned_mouse_quit(binary, work, threads):
                     session.key(b"n")
                     settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                                  "mouse quit FIFO name order did not settle")
-                    session.key(b"v\x1b[1;2F")
+                    session.key(b"v\r\x1b[1;2F")
                     session.wait(lambda: visual_count(session) == len(names)
                                  and cursor_path(session, names) == names[-1],
                                  "mouse quit FIFO did not select all entries")
@@ -1998,7 +2021,7 @@ def check_owned_quit_completion(binary, work, threads, replacement_error=False):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                      "finishing-quit name ordering did not settle")
-        session.key(b"v\x1b[1;2F")
+        session.key(b"v\r\x1b[1;2F")
         session.wait(lambda: visual_count(session) == len(names)
                      and cursor_path(session, names) == names[-1],
                      "finishing-quit did not select all owned targets")
@@ -2561,12 +2584,22 @@ def wait_visual(session, names, expected, cursor=None):
                  f"visual selection did not contain {expected} with cursor {cursor}")
 
 
+def enter_visual_mark(session, key=b"v"):
+    """Enter empty visual mode, then explicitly mark the focused entry."""
+    session.key(key)
+    session.wait(lambda: visual_count(session) == 0 and session.screen.normal_view(),
+                 "entering visual mode unexpectedly marked the focused entry")
+    session.key(b"\r")
+    session.wait(lambda: visual_count(session) == 1,
+                 "Enter did not mark the focused entry in visual mode")
+
+
 def reset_fixture_visual(session, names):
     session.key(b"v")
     session.wait(lambda: not visual_active(session)
                  and not visual_paths(session, names), "v did not clear visual selection")
     fixture_selection(session, "alpha")
-    session.key(b"V")
+    enter_visual_mark(session, key=b"V")
     wait_visual(session, names, ["alpha"])
 
 
@@ -2612,9 +2645,6 @@ def check_owned_drag_modes(binary, work, threads, include_control=True):
         session.key(b"n")
         settled_home(session, lambda: visible_paths(session, names) == names,
                      "drag fixture name order did not settle")
-        session.key(b"v")
-        wait_visual(session, names, names[:1], cursor=names[0])
-
         def event(code, index, released, selected, label):
             # Convert the real-entry index to its painted terminal row.
             suffix = "m" if released else "M"
@@ -2626,6 +2656,37 @@ def check_owned_drag_modes(binary, work, threads, include_control=True):
                 and visual_count(session) == len(expected)
                 and visual_paths(session, names) == expected
                 and cursor_path(session, names) == names[index], label))
+
+        # A normal press alone remains a click candidate. Motion starts a
+        # visual range at that pressed row, without opening its entry.
+        row = session.screen.first_entry_row() + 1
+        session.key(f"\x1b[<0;35;{row + 1}M".encode())
+        session.wait(lambda: visual_count(session) is None
+                     and cursor_path(session, names) == names[1],
+                     "normal left press entered selection before dragging")
+        event(32, 4, False, [1, 2, 3, 4], "normal left drag enters visual mode")
+        event(0, 4, True, [1, 2, 3, 4], "normal left drag releases without navigating")
+        assert fixture_directory(session, root), "normal left drag navigated into its origin"
+        session.key(b"\x1b")
+        session.wait(lambda: visual_count(session) is None, "normal left drag selection did not clear")
+
+        # Right press changes mode/focus only. Its first motion applies the
+        # inclusive range, and reversing it restores the original baseline.
+        session.key(f"\x1b[<2;35;{row + 1}M".encode())
+        wait_visual(session, names, [], cursor=names[1])
+        event(34, 4, False, [1, 2, 3, 4], "right drag adds its range")
+        event(34, 2, False, [1, 2], "right drag reverses to its anchored range")
+        event(2, 2, True, [1, 2], "right drag releases")
+        session.key(f"\x1b[<2;35;{row + 1}M".encode())
+        wait_visual(session, names, names[1:3], cursor=names[1])
+        event(34, 2, False, [], "right drag from marked origin removes its range")
+        event(2, 2, True, [], "right subtracting drag releases")
+        session.key(b"\x1b")
+        session.wait(lambda: visual_count(session) is None, "right drag selection did not clear")
+        home_entry(session)
+        session.wait(lambda: cursor_path(session, names) == names[0], "drag fixture did not restore origin")
+        enter_visual_mark(session)
+        wait_visual(session, names, names[:1], cursor=names[0])
 
         # A frame and quiet interval separate every report. In particular, a
         # held plain press must retain its baseline after its toggle is drawn.
@@ -2677,7 +2738,7 @@ def check_owned_visual(binary, work, threads):
         session.wait(lambda: visible_paths(session, names) == names,
                      "visual name ordering did not settle")
         fixture_selection(session, "alpha")
-        session.key(b"v")
+        enter_visual_mark(session)
         wait_visual(session, names, ["alpha"], cursor="alpha")
         session.key(b"\x1b[1;2B")
         wait_visual(session, names, ["alpha", "beta"], cursor="beta")
@@ -2776,7 +2837,7 @@ def check_owned_input_modes(binary, work, threads):
         moved(b"\x1b[1;2B", 1 + page)
         moved(b"\x1b[1;2A", 1)
         moved(first_entry_key(session), 0)
-        session.key(b"v")
+        enter_visual_mark(session)
         wait_visual(session, names, names[:1], cursor=names[0])
         # Every plain movement retains the original mark, including movements
         # that take it outside the viewport. Home exposes it again for inspection.
@@ -2934,7 +2995,7 @@ def check_owned_batch_queue(binary, work, threads):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" item-00"),
                      "batch FIFO name ordering did not settle")
-        session.key(b"v" + b"\x1b[1;2B" * 31)
+        session.key(b"v\r" + b"\x1b[1;2B" * 31)
         session.wait(lambda: visual_count(session) == 32
                      and cursor_path(session, ["item-31"]) == "item-31",
                      "batch FIFO did not select exactly its 32 confirmed targets")
@@ -2953,10 +3014,10 @@ def check_owned_batch_queue(binary, work, threads):
                      "batch FIFO did not retain all 32 paused jobs")
         assert all(victim.is_file() for victim in victims), "paused FIFO changed a confirmed target"
         # Each event-loop iteration handles one key and can start at most two
-        # jobs. Queue all four keys before resuming our child, so older confirmed
+        # jobs. Queue all five keys before resuming our child, so older confirmed
         # work must remain when d opens review, regardless of deletion speed.
         with stopped_child(session):
-            keys = b" Dvd"
+            keys = b" Dv\rd"
             session.key(keys)
             session.wait(lambda: queued_input_bytes(session) == len(keys),
                          "batch FIFO keys did not enter the stopped child's PTY")
@@ -3007,7 +3068,7 @@ def check_owned_completion_input(binary, work, threads):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                      "completion/input name ordering did not settle")
-        session.key(b"v\x1b[1;2F")
+        session.key(b"v\r\x1b[1;2F")
         session.wait(lambda: visual_count(session) == len(names) + 1
                      and cursor_path(session, [survivor.name]) == survivor.name,
                      "completion/input did not select the full fixture")
@@ -3070,42 +3131,26 @@ def check_owned_visual_ranges(binary, work, threads):
                      "large visual fixture scan did not complete", timeout=30)
         session.key(b"n")
         # Scan completion precedes the ordering worker's final publication.
-        # A fresh complete selection proves the whole cache is ready; retries
-        # belong only to setup, never to the deferred-delete regression below.
-        deadline = time.monotonic() + 30
-        def ready(predicate, description):
-            remaining = deadline - time.monotonic()
-            assert remaining > 0, "large visual fixture cache never became complete"
-            session.wait(predicate, description, timeout=remaining)
-        while True:
-            home_entry(session)
-            ready(lambda: cursor_path(session, names[:1]) == names[0],
-                  "large visual fixture Home did not reach the first sorted row")
-            session.key(b"v")
-            ready(lambda: visual_count(session) == 1,
-                  "large visual fixture did not start a fresh selection")
-            # Help acknowledges Shift-End even for a one-row partial
-            # cache. Closing it preserves selection and allows pumping to finish.
-            session.key(b"\x1b[1;2F?")
-            ready(lambda: session.screen.has_modal_title("Help"),
-                  "large visual fixture did not acknowledge setup End")
-            session.key(b"\x1b")
-            ready(lambda: session.screen.normal_view()
-                  and visual_count(session) is not None
-                  and "Selecting" not in session.screen.text(header=True),
-                  "large visual fixture setup selection did not settle")
-            complete = visual_count(session) == len(names)
-            session.key(b"v")
-            ready(lambda: session.screen.normal_view() and visual_count(session) is None,
-                  "large visual fixture did not clear its setup selection")
-            if complete:
-                break
-        home_entry(session)
-        ready(lambda: cursor_path(session, names[:1]) == names[0],
-              "large visual fixture Home did not return to the first sorted row")
+        # Parent selection enumerates every child and validates the complete
+        # sorted view before applying queued navigation. Its count plus End's
+        # final cursor provide a semantic barrier without transient status text.
+        session.key(b"\x1b[Hv")
+        session.wait(lambda: visual_count(session) == 0
+                     and session.screen.selected_row() == 1,
+                     "large visual fixture did not enter empty visual mode on its parent row")
+        session.key(b"\r\x1b[F")
+        session.wait(lambda: visual_count(session) == len(names)
+                     and cursor_path(session, names[-1:]) == names[-1],
+                     "large visual fixture did not validate its complete sorted selection", timeout=30)
         session.key(b"v")
-        ready(lambda: visual_count(session) == 1,
-              "large visual fixture did not enter visual mode")
+        session.wait(lambda: session.screen.normal_view() and visual_count(session) is None,
+                     "large visual fixture did not clear its setup selection")
+        home_entry(session)
+        session.wait(lambda: cursor_path(session, names[:1]) == names[0],
+                     "large visual fixture Home did not return to the first sorted row")
+        enter_visual_mark(session)
+        session.wait(lambda: visual_count(session) == 1,
+                     "large visual fixture did not enter visual mode")
         # Cancel deletion before the 8192-row selection range can finish.
         # Cancellation must preserve the range already requested by input.
         with stopped_child(session):
@@ -3127,7 +3172,7 @@ def check_owned_visual_ranges(binary, work, threads):
         session.wait(lambda: first_row(session).rstrip().endswith(" " + names[0])
                      and session.screen.selected_row() == session.screen.first_entry_row(),
                      "edge drag did not start at the first row")
-        session.key(b"v")
+        enter_visual_mark(session)
         session.wait(lambda: visual_count(session) == 1,
                      "edge drag did not enter visual mode")
         # Start on the second, unmarked entry so this plain drag adds. Hold
@@ -3155,7 +3200,7 @@ def check_owned_visual_ranges(binary, work, threads):
         home_entry(session)
         session.wait(lambda: cursor_path(session, names[:1]) == names[0],
                      "pending confirmation fixture did not return to its first row")
-        session.key(b"v")
+        enter_visual_mark(session)
         wait_visual(session, names[:1], names[:1], cursor=names[0])
         # Enter belongs to this request even while Shift-End is settling and
         # identity checks are pending. No later input may be needed to confirm.
@@ -3226,7 +3271,7 @@ def check_owned_resize_confirmation(binary, work, threads, cases=("single", "bat
                              and "y / Enter: delete" in session.screen.words(),
                              "single resize confirmation did not become reviewable")
             elif case == "batch":
-                session.key(b"v")
+                enter_visual_mark(session)
                 wait_visual(session, names, ["alpha"], cursor="alpha")
                 open_batch_confirmation(session, count=1, key=b"d")
             elif case == "quit":
@@ -3330,7 +3375,7 @@ def check_owned_held_resize(binary, work, threads, cases=("normal", "visual")):
                         and visible_paths(session, names) == names[:count])
 
             if mode == "visual":
-                session.key(b"v")
+                enter_visual_mark(session)
                 wait_visual(session, names, names[:1], cursor=names[0])
             samples.append(stationary_sample(
                 session, lambda: rows_ready(10) and cursor_path(session, names) == names[0],
@@ -3677,14 +3722,14 @@ def main():
         if args.root is None:
             checks.append("buffered d/Enter in normal, visual and pending-range deletion with tiny-dialog guards")
             checks.append("clickable header help/queue/delete, selection clear, modal options/scrollbar, queue hover/right-click/click/drag")
-            checks.append("pinned ../ navigation and visual selection of hidden/filter-excluded entries")
+            checks.append("pinned ../ navigation and reversible select-all including hidden/filter-excluded entries")
             checks.append("header right-click quit Yes/No with idle, paused and finishing deletions")
             checks.append("target-replacement error after terminal restoration")
             checks.append("stationary paused queue growth and shrink without input")
             checks.append("held normal and visual mouse rows across shrink and growth without input")
             checks.append("normal mouse click opens directories, visual click selects, scanned breadcrumbs navigate")
             checks.append("XDG/CLI colors, RGB fallback, disabled mouse, hover guard drops early Enter and expires without input")
-            checks.append("spaced plain drag selection/deselection by origin, Ctrl-drag, reversal and press modifiers")
+            checks.append("empty v/V/right-click entry, normal-left/right drag ranges, selected-origin removal, Ctrl-drag, reversal and press modifiers")
             checks.append("symlink destinations without following targets, installed archive helpers, PDF and unsupported file details")
             if sys.platform.startswith("linux"):
                 checks.append("owned preview helpers and descendants stop on q, Ctrl-C and SIGTERM")

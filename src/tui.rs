@@ -373,6 +373,7 @@ struct ParentSelection {
     order_revision: u64,
     order_cursor: usize,
     order_rejected: bool,
+    all_selected: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -406,6 +407,8 @@ struct RightPress {
     view: Arc<CachedSnapshot>,
     offset: usize,
     valid: bool,
+    modifiers: KeyModifiers,
+    origin_selected: bool,
 }
 
 struct PendingScroll {
@@ -420,7 +423,7 @@ enum VisualIntent {
     Navigate(Navigation, bool),
     ToggleCurrent,
     ToggleStable(NodeId),
-    SelectStable(NodeId),
+    FocusStable(NodeId),
     ToggleParent,
     Parent(Option<bool>),
     Hover(PendingHover),
@@ -811,6 +814,7 @@ struct App {
     parent_area: Rect,
     parent_press: Option<ParentPress>,
     right_press: Option<RightPress>,
+    right_dragging: bool,
     view: Arc<CachedSnapshot>,
     empty: Arc<CachedSnapshot>,
     view_directory: NodeId,
@@ -924,6 +928,7 @@ impl App {
             parent_area: Rect::default(),
             parent_press: None,
             right_press: None,
+            right_dragging: false,
             view: Arc::clone(&empty),
             empty: Arc::clone(&empty),
             view_directory: ROOT,
@@ -1044,6 +1049,7 @@ impl App {
                 } else if id as usize >= selection.initial_end && !self.visual.contains(id) {
                     // Entry admission is already bounded. Select only new direct
                     // children here; size updates never restart the initial walk.
+                    selection.all_selected = false;
                     self.visual.select(id);
                     selection.membership_revision = selection.membership_revision.wrapping_add(1);
                     #[cfg(test)]
@@ -1565,7 +1571,15 @@ impl App {
             self.config.show_hidden = true;
             self.reset_order(true);
         }
-        self.visual.enter(self.directory, None);
+        let all_selected = self.visual.active() && !self.visual.is_empty();
+        if remove || !self.visual.active() {
+            self.visual.enter(self.directory, None);
+        } else if let Some(id) = self
+            .selected
+            .or_else(|| self.model.first_child(self.directory))
+        {
+            self.visual.reanchor(id);
+        }
         self.parent_select_pending = !remove;
         self.parent_selection = (!remove).then(|| ParentSelection {
             epoch: self.model.node(self.directory).child_epoch,
@@ -1575,6 +1589,7 @@ impl App {
             order_revision: 0,
             order_cursor: 0,
             order_rejected: false,
+            all_selected,
         });
         // An empty, finished listing completes in the input turn without
         // scheduling selection work. Growing folders still wait for admission.
@@ -1593,6 +1608,13 @@ impl App {
     }
 
     fn finish_parent_selection(&mut self, incomplete: bool) {
+        if !incomplete
+            && self
+                .parent_selection
+                .is_some_and(|selection| selection.all_selected)
+        {
+            self.visual.enter(self.directory, None);
+        }
         // Select-all is a completed action. Commit its materialized marks before
         // another Shift gesture can reuse and shrink the original empty baseline.
         if let Some(anchor) = self
@@ -1659,6 +1681,7 @@ impl App {
             progressed = true;
             selection.cursor = self.model.next_sibling(id);
             if self.model.is_live(id) && self.model.node(id).parent == Some(self.directory) {
+                selection.all_selected &= self.visual.contains(id);
                 self.visual.select(id);
             }
             #[cfg(test)]
@@ -1749,13 +1772,16 @@ impl App {
     }
 
     fn cancel_right_press(&mut self) {
+        if std::mem::take(&mut self.right_dragging) {
+            self.finish_mouse_capture(false);
+        }
         if let Some(press) = self.right_press.take() {
             self.visual
                 .retire_snapshot_and_order(im::HashSet::new(), press.view);
         }
     }
 
-    fn select_clicked_entry(&mut self, id: NodeId) {
+    fn focus_clicked_entry(&mut self, id: NodeId) {
         if !self.eligible(id) || self.model.node(id).parent != Some(self.directory) {
             self.bind_visual_cursor(None);
             return;
@@ -1768,11 +1794,7 @@ impl App {
         self.cursor_mode = CursorMode::Tracked;
         self.pending_navigation = None;
         self.range_requested = false;
-        if !self.visual.contains(id) {
-            self.visual.toggle(id);
-        } else {
-            self.visual.reanchor(id);
-        }
+        self.visual.reanchor(id);
         self.bind_visual_cursor(Some(id));
         self.prioritize_requested = true;
     }
@@ -1788,70 +1810,104 @@ impl App {
             self.cancel_right_press();
             return right_event;
         }
-        if let Some(press) = self.right_press.as_mut() {
-            match mouse.kind {
-                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Right) => {
-                    if mouse.kind != MouseEventKind::Moved
-                        || press.position != (mouse.column, mouse.row)
-                    {
-                        press.valid = false;
-                    }
-                    return true;
+        if self.right_dragging {
+            let kind = match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Right) => {
+                    Some(MouseEventKind::Drag(MouseButton::Left))
                 }
                 MouseEventKind::Up(MouseButton::Right) => {
-                    let press = self.right_press.take().expect("right press exists");
-                    let area = match press.target {
-                        BrowserTarget::Entry(_) => self.list_area,
-                        BrowserTarget::Parent => self.parent_area,
-                    };
+                    self.right_dragging = false;
+                    Some(MouseEventKind::Up(MouseButton::Left))
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.cancel_right_press();
+                    None
+                }
+                MouseEventKind::Up(MouseButton::Left) => return true,
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.mouse(MouseEvent { kind, ..mouse });
+                return true;
+            }
+        }
+        if let Some(mut press) = self.right_press.take() {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Right) => {
                     let valid = press.valid
                         && press.directory == self.directory
                         && press.epoch == self.model.node(self.directory).child_epoch
-                        && press.position == (mouse.column, mouse.row)
-                        && press.area == area
-                        && area.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                        && match press.target {
-                            BrowserTarget::Entry(id) => {
-                                self.eligible(id)
-                                    && self.model.node(id).parent == Some(self.directory)
-                                    && self
-                                        .painted_rows
-                                        .get(usize::from(mouse.row.saturating_sub(area.y)))
-                                        == Some(&id)
-                            }
-                            BrowserTarget::Parent => true,
-                        };
-                    self.visual
-                        .retire_snapshot_and_order(im::HashSet::new(), press.view);
+                        && press.area
+                            == match press.target {
+                                BrowserTarget::Entry(_) => self.list_area,
+                                BrowserTarget::Parent => self.parent_area,
+                            };
                     if valid {
-                        self.finish_mouse_for_input();
-                        if !self.visual.active() {
-                            self.visual.enter(self.directory, None);
-                        }
                         match press.target {
                             BrowserTarget::Entry(id) => {
-                                if self.visual_busy() {
-                                    self.try_enqueue_visual(VisualIntent::SelectStable(id));
+                                let mode = if press.modifiers.contains(KeyModifiers::CONTROL) {
+                                    RangeMode::Remove
+                                } else if press.modifiers.contains(KeyModifiers::SHIFT) {
+                                    RangeMode::Invert
                                 } else {
-                                    self.select_clicked_entry(id);
+                                    RangeMode::Add
+                                };
+                                // Reuse the bounded range queue without a synthetic
+                                // click. It resolves membership after earlier input
+                                // and retains the origin if that row disappears.
+                                self.right_dragging =
+                                    self.try_enqueue_visual(VisualIntent::Mouse(PendingMouse {
+                                        anchor: id,
+                                        lead: id,
+                                        dragged: true,
+                                        released: false,
+                                        origin_selected: press.origin_selected,
+                                        mode,
+                                        edge: 0,
+                                        view: Arc::clone(&press.view),
+                                        offset: press.offset,
+                                    }));
+                                if self.right_dragging {
+                                    self.mouse_position = Some(press.position);
+                                    self.mouse(MouseEvent {
+                                        kind: MouseEventKind::Drag(MouseButton::Left),
+                                        ..mouse
+                                    });
                                 }
                             }
                             BrowserTarget::Parent => {
+                                let remove = press.modifiers.contains(KeyModifiers::CONTROL);
                                 if self.visual_busy() {
-                                    self.try_enqueue_visual(VisualIntent::Parent(Some(false)));
+                                    self.try_enqueue_visual(VisualIntent::Parent(Some(remove)));
                                 } else {
-                                    self.focus_parent(false);
-                                    self.select_parent_contents(false);
+                                    self.select_parent_contents(remove);
                                 }
                             }
                         }
                     }
+                    self.visual
+                        .retire_snapshot_and_order(im::HashSet::new(), press.view);
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Right) => {
+                    // Right-click only enters/focuses visual mode. Membership
+                    // changes require a drag or an explicit selection action.
+                    self.visual
+                        .retire_snapshot_and_order(im::HashSet::new(), press.view);
+                    return true;
+                }
+                MouseEventKind::Moved => {
+                    press.valid &= press.position == (mouse.column, mouse.row);
+                    self.right_press = Some(press);
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
                 | MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown => self.cancel_right_press(),
-                _ => {}
+                | MouseEventKind::ScrollDown => {
+                    self.visual
+                        .retire_snapshot_and_order(im::HashSet::new(), press.view);
+                }
+                _ => self.right_press = Some(press),
             }
         }
         if mouse.kind != MouseEventKind::Down(MouseButton::Right) {
@@ -1882,6 +1938,28 @@ impl App {
         } else {
             return true;
         };
+        if !self.visual.active() {
+            self.visual.enter(self.directory, None);
+        }
+        let accepted = match target {
+            BrowserTarget::Entry(id) if self.visual_busy() => {
+                self.try_enqueue_visual(VisualIntent::FocusStable(id))
+            }
+            BrowserTarget::Entry(id) => {
+                self.focus_clicked_entry(id);
+                true
+            }
+            BrowserTarget::Parent if self.visual_busy() => {
+                self.try_enqueue_visual(VisualIntent::Parent(None))
+            }
+            BrowserTarget::Parent => {
+                self.focus_parent(false);
+                true
+            }
+        };
+        if !accepted {
+            return true;
+        }
         self.hover_position = None;
         self.normal_click = None;
         self.cursor_mode = CursorMode::Tracked;
@@ -1894,6 +1972,11 @@ impl App {
             view: Arc::clone(&self.painted_view),
             offset: self.painted_offset,
             valid: true,
+            modifiers: mouse.modifiers,
+            origin_selected: match target {
+                BrowserTarget::Entry(id) => self.visual.contains(id),
+                BrowserTarget::Parent => false,
+            },
         });
         true
     }
@@ -2788,13 +2871,11 @@ impl App {
                 if self.visual.active() {
                     self.visual.exit();
                 } else {
-                    let pending = self.pending_navigation.is_some();
-                    self.visual
-                        .enter(self.directory, self.selected.filter(|_| !pending));
-                    self.range_requested = pending;
-                    if self.parent_selected {
-                        self.select_parent_contents(false);
+                    self.visual.enter(self.directory, None);
+                    if let Some(id) = self.selected {
+                        self.visual.reanchor(id);
                     }
+                    self.range_requested = false;
                 }
             }
             KeyCode::Esc if self.visual.active() => {
@@ -3467,7 +3548,7 @@ impl App {
                         | VisualIntent::Hover(_)
                         | VisualIntent::Mouse(_)
                         | VisualIntent::Parent(_)
-                        | VisualIntent::SelectStable(_)
+                        | VisualIntent::FocusStable(_)
                 )
             })
     }
@@ -3676,9 +3757,12 @@ impl App {
         self.control_press = None;
         self.control_hovered = None;
         self.queue_drag = None;
+        let right_capture = self.right_dragging;
         self.cancel_right_press();
         self.cancel_breadcrumb_press();
-        if kind == MouseEventKind::Up(MouseButton::Left) {
+        if kind == MouseEventKind::Up(MouseButton::Left)
+            || (right_capture && kind == MouseEventKind::Up(MouseButton::Right))
+        {
             // A physical release still ends capture when its old hitboxes are
             // unusable. Keep accepted presses/ranges, without inventing a final
             // drag endpoint, opening a directory, or completing a Shift click.
@@ -3839,7 +3923,7 @@ impl App {
                         self.visual.toggle(id);
                     }
                 }
-                VisualIntent::SelectStable(id) => self.select_clicked_entry(id),
+                VisualIntent::FocusStable(id) => self.focus_clicked_entry(id),
                 VisualIntent::ToggleParent => self.select_parent_contents(false),
                 VisualIntent::Parent(select) => {
                     self.focus_parent(false);
@@ -4345,7 +4429,7 @@ impl App {
             // gesture without passing its endpoint into another control.
             return Some(Action::Continue);
         }
-        if !inside {
+        if !inside || self.right_press.is_some() || self.right_dragging {
             return None;
         }
         match mouse.kind {
@@ -4583,7 +4667,7 @@ impl App {
                 self.mouse_position = None;
             } else {
                 // A normal click resumes hover only at its original live row.
-                // Normal drags keep their pressed ID and never become ranges.
+                // Release-only motion still becomes a range from the pressed ID.
                 let restore_hover = !self.visual.active()
                     && self.mouse_position == Some((mouse.column, mouse.row))
                     && self.mouse_press_view.as_ref().is_some_and(|view| {
@@ -4787,6 +4871,11 @@ impl App {
                     self.view = Arc::clone(&self.painted_view);
                     self.offset = self.painted_offset;
                     self.drag_anchor = Some(id);
+                    self.drag_mode = if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                        RangeMode::Remove
+                    } else {
+                        RangeMode::Add
+                    };
                 }
                 self.cursor_mode = CursorMode::Tracked;
                 self.parent_selected = false;
@@ -4795,7 +4884,11 @@ impl App {
                 self.range_requested = false;
                 self.prioritize_requested = true;
             }
-            MouseEventKind::Drag(MouseButton::Left) if dragging && self.visual.active() => {
+            MouseEventKind::Drag(MouseButton::Left) if dragging => {
+                if !self.visual.active() {
+                    self.visual.enter(self.directory, None);
+                    self.mouse_baseline = Some(self.visual.snapshot());
+                }
                 self.mouse_position = Some((mouse.column, mouse.row));
                 let painted = Arc::clone(&self.painted_view);
                 let painted_offset = self.painted_offset;

@@ -1148,7 +1148,7 @@ fn right_event(kind: MouseEventKind, row: u16) -> MouseEvent {
 }
 
 #[test]
-fn right_click_enters_visual_and_adds_the_clicked_entry_without_navigating() {
+fn right_click_enters_visual_and_focuses_without_marking_or_navigating() {
     let mut app = browser_fixture();
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
     terminal
@@ -1162,16 +1162,16 @@ fn right_click_enters_visual_and_adds_the_clicked_entry_without_navigating() {
         assert_eq!(app.visual.len(), before, "press alone must not select");
         app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
         finish_visual(&mut app);
-        assert!(app.visual.active() && app.visual.contains(id));
+        assert!(app.visual.active() && app.visual.is_empty());
         assert_eq!(app.selected, Some(id));
         assert_eq!(app.directory, ROOT);
     }
-    assert_eq!(app.visual.len(), 2);
+    assert_eq!(app.visual.len(), 0);
     assert!(app.right_press.is_none());
 }
 
 #[test]
-fn right_click_parent_enters_visual_and_selects_all_without_navigating() {
+fn right_click_parent_enters_visual_without_selecting_or_navigating() {
     for directory in [ROOT, 1] {
         let mut app = browser_fixture();
         if directory != ROOT {
@@ -1190,19 +1190,19 @@ fn right_click_parent_enters_visual_and_selects_all_without_navigating() {
         );
         let row = app.parent_area.y;
         app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
-        assert!(!app.visual.active());
+        assert!(app.visual.active() && app.visual.is_empty());
         app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
         finish_visual(&mut app);
         assert_eq!(app.directory, directory);
         assert!(app.parent_selected && app.visual.active());
-        assert_eq!(app.visual.len(), app.model.child_count(directory));
+        assert!(app.visual.is_empty());
         assert!(!app.visual.contains(directory));
     }
 }
 
 #[test]
-fn right_click_rejects_drag_stale_rows_keys_resize_and_modal_interruption() {
-    for interruption in 0..7 {
+fn right_click_never_marks_after_stale_rows_keys_resize_and_modal_interruption() {
+    for interruption in 0..6 {
         let mut app = browser_fixture();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
         terminal
@@ -1213,23 +1213,22 @@ fn right_click_rejects_drag_stale_rows_keys_resize_and_modal_interruption() {
         assert!(app.right_press.is_some());
         let mut release_row = row;
         match interruption {
-            0 => app.mouse(right_event(MouseEventKind::Drag(MouseButton::Right), 0)),
-            1 => release_row = row + 1,
-            2 => {
+            0 => release_row = row + 1,
+            1 => {
                 app.key(
                     KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
                     None,
                     false,
                 );
             }
-            3 => {
+            2 => {
                 terminal.backend_mut().resize(60, 8);
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
             }
-            4 => app.removed(1),
-            5 => app.begin_model_refresh(ROOT, 1),
+            3 => app.removed(1),
+            4 => app.begin_model_refresh(ROOT, 1),
             _ => {
                 app.modal = Some(Modal::help(false));
                 terminal
@@ -1242,10 +1241,7 @@ fn right_click_rejects_drag_stale_rows_keys_resize_and_modal_interruption() {
             MouseEventKind::Up(MouseButton::Right),
             release_row,
         ));
-        assert!(
-            !app.visual.active() && app.visual.is_empty(),
-            "interruption={interruption}"
-        );
+        assert!(app.visual.is_empty(), "interruption={interruption}");
         assert!(app.right_press.is_none());
         assert_eq!(app.directory, ROOT);
     }
@@ -1292,9 +1288,9 @@ fn right_click_retains_its_painted_order_and_queues_before_dependent_enter() {
         }
         finish_visual(&mut app);
         assert_eq!(app.selected, Some(2));
-        assert_eq!(app.visual.contains(2), !pending);
+        assert!(!app.visual.contains(2));
         assert_eq!(app.visual.contains(1), pending);
-        assert_eq!(app.visual.len(), 1);
+        assert_eq!(app.visual.len(), usize::from(pending));
     }
 }
 
@@ -1904,7 +1900,12 @@ fn parent_select_all_reveals_filter_and_hidden_entries_with_bounded_work() {
         None,
         false,
     );
-    assert!(app.parent_selected);
+    assert!(app.parent_selected && app.visual.is_empty());
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
     assert!(app.config.show_hidden && app.filter.is_empty());
     assert!(app.visual_busy());
     assert!(app.visual.len() <= 1);
@@ -1915,6 +1916,83 @@ fn parent_select_all_reveals_filter_and_hidden_entries_with_bounded_work() {
     assert!((1..=4096).all(|id| app.visual.contains(id)));
     assert!(!app.visual.contains(ROOT));
     assert_eq!(app.view.ids.len(), 4096);
+}
+
+#[test]
+fn parent_toggle_clears_complete_selection_and_adds_missing_hidden_entries() {
+    let mut app = navigation_fixture(1024, 769..=1024);
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.config.show_hidden = false;
+    app.reset_order(true);
+    app.filter = "item-00001".to_owned();
+    app.update_filter();
+    app.visual.enter(ROOT, None);
+    for id in 1..=768 {
+        app.visual.select(id);
+    }
+    app.focus_parent(false);
+    app.select_parent_contents(false);
+    assert_eq!(app.visual.len(), 768, "input must not walk the directory");
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 1024);
+    assert!(app.config.show_hidden && app.filter.is_empty());
+    let checks = app.parent_select_checks;
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(app.parent_select_pending && app.visual.len() == 1024);
+    app.pump_visual();
+    assert!(app.parent_select_checks - checks <= 256);
+    finish_visual(&mut app);
+    assert!(app.visual.active() && app.visual.is_empty());
+    assert!(!app.parent_select_pending);
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 1024);
+}
+
+#[test]
+fn parent_toggle_waits_for_listing_and_keeps_newly_discovered_entries() {
+    let mut app = navigation_fixture(2, 3..=3);
+    app.visual.enter(ROOT, None);
+    app.visual.select(1);
+    app.visual.select(2);
+    app.select_parent_contents(false);
+    app.pump_visual();
+    assert!(app.parent_select_pending && app.visual.len() == 2);
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(3, "late", NodeKind::File, 100)],
+        },
+    );
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    wait_cache(&mut app, ROOT, &[3, 1, 2]);
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 3);
+    assert!((1..=3).all(|id| app.visual.contains(id)));
+    app.select_parent_contents(false);
+    finish_visual(&mut app);
+    assert!(app.visual.is_empty());
 }
 
 #[test]
@@ -1973,9 +2051,11 @@ fn queued_parent_navigation_and_enter_keep_their_input_order() {
     finish_visual(&mut app);
     assert_eq!(app.selected, Some(1));
     assert!(!app.parent_selected);
-    assert_eq!(app.visual.len(), 1023);
-    assert!(!app.visual.contains(1));
-    assert!((2..=1024).all(|id| app.visual.contains(id)));
+    // Parent activation clears the completed all-entry range; the later
+    // Enter applies to the first entry after navigation, selecting it alone.
+    assert_eq!(app.visual.len(), 1);
+    assert!(app.visual.contains(1));
+    assert!((2..=1024).all(|id| !app.visual.contains(id)));
 }
 
 #[test]
@@ -4379,7 +4459,7 @@ fn visual_shift_arrows_extend_and_enter_toggles_before_batch_confirmation() {
         None,
         false,
     );
-    assert!(app.visual.contains(1));
+    assert!(app.visual.active() && app.visual.is_empty());
     app.key(
         KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
         None,
@@ -4417,7 +4497,7 @@ fn visual_shift_arrows_extend_and_enter_toggles_before_batch_confirmation() {
 }
 
 #[test]
-fn visual_aliases_mark_and_batch_without_affecting_normal_queue_keys() {
+fn visual_aliases_enter_empty_and_batch_without_affecting_normal_queue_keys() {
     for enter in ['v', 'V'] {
         for delete in [KeyCode::Char('d'), KeyCode::Char('D'), KeyCode::Delete] {
             let mut app = browser_fixture();
@@ -4427,7 +4507,13 @@ fn visual_aliases_mark_and_batch_without_affecting_normal_queue_keys() {
                 None,
                 false,
             );
-            assert!(app.visual.active() && app.visual.contains(1));
+            assert!(app.visual.active() && app.visual.is_empty());
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false,
+            );
+            assert!(app.visual.contains(1));
             assert!(matches!(
                 app.key(KeyEvent::new(delete, KeyModifiers::NONE), None, false),
                 Action::BatchPrepare
@@ -4693,7 +4779,12 @@ fn newly_discovered_rows_preserve_an_explicit_keyboard_deselection() {
     wait_cache(&mut app, ROOT, &[1, 2]);
     app.sync_order(true);
     assert_eq!(app.selected, Some(1));
-    for code in [KeyCode::Char('v'), KeyCode::Enter, KeyCode::Down] {
+    for code in [
+        KeyCode::Char('v'),
+        KeyCode::Enter,
+        KeyCode::Enter,
+        KeyCode::Down,
+    ] {
         let modifiers = if code == KeyCode::Down {
             KeyModifiers::SHIFT
         } else {
@@ -7498,7 +7589,15 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
         ));
         assert_eq!(app.directory, ROOT, "interruption={interruption}");
         assert!(app.mouse_press_view.is_none() && app.normal_click.is_none());
-        assert!(!app.visual.active() && app.visual.is_empty());
+        if interruption <= 5 || interruption == 15 {
+            finish_visual(&mut app);
+            assert!(
+                app.visual.active() && !app.visual.is_empty(),
+                "interruption={interruption}"
+            );
+        } else {
+            assert!(!app.visual.active() && app.visual.is_empty());
+        }
     }
 }
 
@@ -7654,67 +7753,137 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
 }
 
 #[test]
-fn normal_captured_motion_and_release_never_create_visual_gestures() {
-    for directory in [ROOT, 1] {
-        for (column, row) in [(35, 2), (1, 0), (90, 2), (35, 20), (35, 1)] {
-            let mut app = browser_fixture();
-            app.directory = directory;
-            app.reset_order(false);
-            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
-            terminal
-                .draw(|frame| app.draw(frame, false, false))
-                .unwrap();
-            let rows = app.painted_rows.clone();
-            let mouse = |kind, column, row, modifiers| MouseEvent {
-                kind,
-                column,
-                row,
-                modifiers,
-            };
-            app.mouse_entry(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                35,
-                1,
+fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
+    for button in [MouseButton::Left, MouseButton::Right] {
+        for existing in [false, true] {
+            for modifiers in [
                 KeyModifiers::NONE,
-            ));
-            for kind in ignored_mouse_kinds() {
-                app.mouse_entry(mouse(kind, column, row, KeyModifiers::SHIFT));
+                KeyModifiers::CONTROL,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ] {
+                if !existing && modifiers.contains(KeyModifiers::SHIFT) {
+                    continue; // Normal Shift gestures retain their separate range-anchor behavior.
+                }
+                let mut app = navigation_fixture(12, 13..=13);
+                app.selected = Some(3);
+                if existing {
+                    app.visual.enter(ROOT, None);
+                    for id in (3..=7).chain([11]) {
+                        app.visual.select(id);
+                    }
+                }
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                let row = |id| {
+                    app.list_area.y
+                        + app
+                            .painted_rows
+                            .iter()
+                            .position(|&value| value == id)
+                            .unwrap() as u16
+                };
+                let (start, end) = (row(3), row(7));
+                let mouse = |kind, row, modifiers| MouseEvent {
+                    kind,
+                    column: 35,
+                    row,
+                    modifiers,
+                };
+                let baseline = app.visual.snapshot();
+                app.mouse(mouse(MouseEventKind::Down(button), start, modifiers));
+                if button == MouseButton::Right {
+                    assert!(app.visual.active());
+                    assert_eq!(
+                        app.visual.snapshot(),
+                        baseline,
+                        "right press changed membership"
+                    );
+                }
+                app.mouse(mouse(MouseEventKind::Drag(button), end, KeyModifiers::ALT));
+                app.mouse(mouse(MouseEventKind::Up(button), end, KeyModifiers::NONE));
+                finish_visual(&mut app);
+                assert!(app.visual.active());
+                for id in 1..=12 {
+                    let expected = if existing {
+                        id == 11
+                    } else {
+                        !modifiers.contains(KeyModifiers::CONTROL) && (3..=7).contains(&id)
+                    };
+                    assert_eq!(
+                        app.visual.contains(id),
+                        expected,
+                        "{button:?} existing={existing} {modifiers:?} id={id}"
+                    );
+                }
+                assert_eq!(app.selected, Some(7));
+                assert_eq!(app.directory, ROOT);
+                assert!(app.mouse_press_view.is_none() && !app.has_held_mouse());
+                assert!(!app.right_dragging && app.right_press.is_none());
+                assert!(!app.mouse_dragging && app.drag_scroll.is_none());
             }
-            app.mouse_entry(mouse(
-                MouseEventKind::Drag(MouseButton::Left),
-                column,
-                row,
-                KeyModifiers::SHIFT,
-            ));
-            assert!(app.breadcrumbs.hovered.is_none());
-            app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
-            assert!(!app.pump_mouse_scroll(Instant::now() + Duration::from_secs(1)));
-            terminal
-                .draw(|frame| app.draw(frame, false, false))
-                .unwrap();
-            assert_eq!(app.painted_rows, rows);
-            assert_eq!(app.selected, rows.first().copied());
-            assert_eq!(app.directory, directory);
-            assert!(!app.visual.active() && app.visual.is_empty());
-            app.mouse_entry(mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                column,
-                row,
-                KeyModifiers::SHIFT,
-            ));
-            assert_eq!(app.selected, rows.first().copied());
-            assert_eq!(app.directory, directory);
-            assert_eq!(
-                app.entry_hover_position(),
-                ((column, row) == (35, 1)).then_some((35, 1))
-            );
-            assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
-            assert!(app.mouse_baseline.is_none() && app.drag_anchor.is_none());
-            assert!(!app.mouse_dragging && !app.drag_started && app.drag_scroll.is_none());
-            assert!(!app.visual.active() && app.visual.is_empty());
-            app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
-            assert_eq!(app.selected, rows.get(1).copied());
         }
+    }
+}
+
+#[test]
+fn right_drag_retains_removed_origin_direction_and_frozen_rows() {
+    let mut app = navigation_fixture(12, 13..=13);
+    app.visual.enter(ROOT, None);
+    for id in (3..=7).chain([11]) {
+        app.visual.select(id);
+    }
+    app.selected = Some(3);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let start = app.list_area.y + app.painted_rows.iter().position(|&id| id == 3).unwrap() as u16;
+    let end = app.list_area.y + app.painted_rows.iter().position(|&id| id == 7).unwrap() as u16;
+    app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), start));
+    assert_eq!(app.visual.len(), 6);
+    app.removed(3);
+    app.mouse(right_event(MouseEventKind::Drag(MouseButton::Right), end));
+    app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), end));
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 1);
+    assert!(app.visual.contains(11));
+    assert_eq!(app.selected, Some(7));
+    assert!(!app.right_dragging && app.right_press.is_none());
+}
+
+#[test]
+fn parent_right_drag_toggles_every_child_but_plain_click_preserves_marks() {
+    let mut app = browser_fixture();
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let row = app.parent_area.y;
+    for selected in [true, false] {
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        app.mouse(right_event(
+            MouseEventKind::Drag(MouseButton::Right),
+            row + 1,
+        ));
+        app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row + 1));
+        finish_visual(&mut app);
+        assert_eq!(app.visual.len(), if selected { 2 } else { 0 });
+        assert!(!app.visual.contains(ROOT));
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
+        assert_eq!(app.visual.len(), if selected { 2 } else { 0 });
+        assert_eq!(app.directory, ROOT);
     }
 }
 
@@ -8489,7 +8658,7 @@ fn visual_entry_and_normal_shift_page_keep_distinct_pending_navigation() {
         app.advance_navigation();
         finish_visual(&mut app);
         assert_eq!(app.visual.active(), !shifted);
-        assert_eq!(app.visual.contains(5), !shifted);
+        assert!(app.visual.is_empty());
         assert!(!app.visual.contains(3) && !app.visual.contains(4));
         assert_eq!(app.selected, (!shifted).then_some(5));
         assert_eq!(app.parent_selected, shifted);
@@ -9873,7 +10042,7 @@ fn ignored_delete_preserves_startup_top_follow_and_visual_delete_still_batches()
             None,
             false,
         );
-        assert!(app.visual.active() && app.visual.contains(1));
+        assert!(app.visual.active() && app.visual.is_empty());
         assert!(matches!(
             app.key(
                 KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
@@ -11795,6 +11964,27 @@ fn stale_geometry_release_stops_visual_capture_without_synthesizing_shift_click(
             }
         }
     }
+}
+
+#[test]
+fn stale_geometry_right_release_ends_its_own_range_capture() {
+    let mut app = navigation_fixture(40, 41..=41);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.mouse_entry(right_event(MouseEventKind::Down(MouseButton::Right), 3));
+    app.mouse_entry(right_event(MouseEventKind::Drag(MouseButton::Right), 10));
+    app.pump_visual();
+    assert!(app.right_dragging && app.mouse_press_view.is_some());
+    assert!(app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Right), (79, 12)));
+    assert!(!app.right_dragging && app.right_press.is_none());
+    assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+    assert!(!app.mouse_dragging && app.drag_scroll.is_none());
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 8);
+    assert!((3..=10).all(|id| app.visual.contains(id)));
+    assert!(!app.pump_mouse_scroll(Instant::now() + Duration::from_secs(1)));
 }
 
 #[test]
