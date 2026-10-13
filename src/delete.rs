@@ -628,6 +628,10 @@ impl DirectoryHandle {
 }
 
 #[cfg(unix)]
+#[allow(clippy::box_collection)]
+type RetrySkips = Option<Box<std::collections::HashSet<std::ffi::OsString>>>;
+
+#[cfg(unix)]
 struct DirectoryFrame {
     handle: DirectoryHandle,
     #[cfg(any(test, not(target_os = "linux")))]
@@ -641,8 +645,7 @@ struct DirectoryFrame {
     read_error: Option<io::Error>,
     errors_at_entry: usize,
     // Keep successful traversal frames compact; allocate the set only after failure.
-    #[allow(clippy::box_collection)]
-    retry_skip: Option<Box<std::collections::HashSet<std::ffi::OsString>>>,
+    retry_skip: RetrySkips,
 }
 
 #[cfg(unix)]
@@ -1272,6 +1275,13 @@ fn remove_from_parent(
         state.check_cancel()?;
         if let Some(next) = stack.last_mut().unwrap().pending.pop() {
             let frame = stack.last().unwrap();
+            if frame
+                .retry_skip
+                .as_ref()
+                .is_some_and(|skipped| skipped.contains(next.name.as_os_str()))
+            {
+                continue;
+            }
             path.push(&next.name);
             match open_checked_directory(
                 frame.handle.fd()?,
@@ -1284,6 +1294,10 @@ fn remove_from_parent(
                 Ok(Some(mut child)) => {
                     if let Err(error) = enter_directory(&mut ancestors, child.captured) {
                         record_error(errors, path.as_path(), error)?;
+                        remember_failed_child(
+                            &mut stack.last_mut().unwrap().retry_skip,
+                            path.file_name().unwrap(),
+                        );
                     } else {
                         child.errors_at_entry = errors.len();
                         stack.push(child);
@@ -1291,7 +1305,13 @@ fn remove_from_parent(
                     }
                 }
                 Ok(None) => {}
-                Err(error) => record_error(errors, path.as_path(), error)?,
+                Err(error) => {
+                    record_error(errors, path.as_path(), error)?;
+                    remember_failed_child(
+                        &mut stack.last_mut().unwrap().retry_skip,
+                        path.file_name().unwrap(),
+                    );
+                }
             }
             path.pop();
             continue;
@@ -1394,8 +1414,7 @@ fn remove_from_parent(
                 && finished.read_error.is_none()
                 && error.raw_os_error() == Some(rustix::io::Errno::NOTEMPTY.raw_os_error())
             {
-                match prepare_directory_retry(&mut finished, containing_parent, state, path, errors)
-                {
+                match prepare_directory_retry(&mut finished, containing_parent, state) {
                     Ok(true) => {
                         ancestors.insert((finished.captured.device, finished.captured.inode));
                         stack.push(finished);
@@ -1428,7 +1447,13 @@ fn remove_from_parent(
                 record_error(errors, path.as_path(), error)?;
             }
         }
-        if !stack.is_empty() {
+        if let Some(frame) = stack.last_mut() {
+            // Retained children have exhausted their own retry budget. Their
+            // diagnostics stay in the report, but only this direct name is
+            // needed if an ancestor's nonempty retry enumerates them again.
+            if !directory_removed {
+                remember_failed_child(&mut frame.retry_skip, &finished.name);
+            }
             path.pop();
         }
     }
@@ -1442,8 +1467,6 @@ fn prepare_directory_retry(
     frame: &mut DirectoryFrame,
     parent: BorrowedFd<'_>,
     state: &WorkerState,
-    path: &Path,
-    errors: &[DeleteError],
 ) -> io::Result<bool> {
     if !checked_current(parent, &frame.name, frame.captured, state)? {
         return Ok(false);
@@ -1460,31 +1483,19 @@ fn prepare_directory_retry(
         #[cfg(any(test, not(target_os = "linux")))]
         DirectoryHandle::Buffered(entries) => entries.rewind(),
     }
-    collect_retry_skips(frame, state, path, errors)?;
     frame.retried_removal = true;
     frame.exhausted = false;
     Ok(true)
 }
 
+/// Remember failures where they occur instead of rescanning every descendant
+/// diagnostic at each ancestor. Successful traversal keeps this set absent.
 #[cfg(unix)]
-fn collect_retry_skips(
-    frame: &mut DirectoryFrame,
-    state: &WorkerState,
-    path: &Path,
-    errors: &[DeleteError],
-) -> io::Result<()> {
-    let mut skipped = std::collections::HashSet::new();
-    for error in &errors[frame.errors_at_entry..] {
-        state.check_cancel()?;
-        if let Ok(relative) = error.path.strip_prefix(path)
-            && let Some(Component::Normal(name)) = relative.components().next()
-            && !skipped.contains(name)
-        {
-            skipped.insert(name.to_owned());
-        }
+fn remember_failed_child(skips: &mut RetrySkips, name: &std::ffi::OsStr) {
+    let skipped = skips.get_or_insert_with(Box::default);
+    if !skipped.contains(name) {
+        skipped.insert(name.to_owned());
     }
-    frame.retry_skip = (!skipped.is_empty()).then(|| Box::new(skipped));
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1552,6 +1563,7 @@ fn apply_leaf_completions(
     state: &WorkerState,
     path: &Path,
     errors: &mut Vec<DeleteError>,
+    skipped: &mut RetrySkips,
     outcome: crate::uring::BatchOutcome<()>,
 ) -> io::Result<()> {
     use crate::uring::{BatchOutcome, EntryOutcome};
@@ -1608,6 +1620,7 @@ fn apply_leaf_completions(
                     None => "deletion completion could not be confirmed".to_owned(),
                 };
                 record_error(errors, path.join(name), io::Error::other(message))?;
+                remember_failed_child(skipped, name);
                 continue;
             }
         };
@@ -1617,6 +1630,7 @@ fn apply_leaf_completions(
             )
         {
             record_error(errors, path.join(name), error)?;
+            remember_failed_child(skipped, name);
         }
     }
     Ok(())
@@ -1629,6 +1643,7 @@ fn flush_leaf_unlinks(
     state: &WorkerState,
     path: &Path,
     errors: &mut Vec<DeleteError>,
+    skipped: &mut RetrySkips,
 ) -> io::Result<()> {
     if leaves.entries.is_empty() {
         return Ok(());
@@ -1643,7 +1658,15 @@ fn flush_leaf_unlinks(
     if !matches!(&outcome, crate::uring::BatchOutcome::Complete(_)) {
         leaves.enabled = false;
     }
-    let result = apply_leaf_completions(parent.as_fd(), leaves, state, path, errors, outcome);
+    let result = apply_leaf_completions(
+        parent.as_fd(),
+        leaves,
+        state,
+        path,
+        errors,
+        skipped,
+        outcome,
+    );
     leaves.clear();
     result
 }
@@ -1682,18 +1705,39 @@ fn read_directory_batch(
             loop {
                 state.check_cancel()?;
                 let Some(entry) = entries.next() else {
-                    flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                    flush_leaf_unlinks(
+                        directory,
+                        leaves,
+                        state,
+                        path,
+                        errors,
+                        &mut frame.retry_skip,
+                    )?;
                     return Ok(true);
                 };
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(Errno::INTR) => continue,
                     Err(Errno::INVAL) if capacity < 1024 * 1024 => {
-                        flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                        flush_leaf_unlinks(
+                            directory,
+                            leaves,
+                            state,
+                            path,
+                            errors,
+                            &mut frame.retry_skip,
+                        )?;
                         break;
                     }
                     Err(error) => {
-                        flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                        flush_leaf_unlinks(
+                            directory,
+                            leaves,
+                            state,
+                            path,
+                            errors,
+                            &mut frame.retry_skip,
+                        )?;
                         return Err(error.into());
                     }
                 };
@@ -1706,7 +1750,14 @@ fn read_directory_batch(
                         .is_some_and(|skipped| skipped.contains(name))
                     {
                         if entries.is_buffer_empty() {
-                            flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                            flush_leaf_unlinks(
+                                directory,
+                                leaves,
+                                state,
+                                path,
+                                errors,
+                                &mut frame.retry_skip,
+                            )?;
                             return Ok(false);
                         }
                         continue;
@@ -1717,12 +1768,26 @@ fn read_directory_batch(
                     if leaves.enabled && !is_directory && kind != FileType::Unknown {
                         leaves.push(name, entry.ino());
                         if leaves.entries.len() == LEAF_UNLINK_WINDOW {
-                            flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                            flush_leaf_unlinks(
+                                directory,
+                                leaves,
+                                state,
+                                path,
+                                errors,
+                                &mut frame.retry_skip,
+                            )?;
                         }
                     } else if !is_directory {
                         // Unknown d_type classification and its permission repair
                         // remain serial, after previously admitted leaf work.
-                        flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                        flush_leaf_unlinks(
+                            directory,
+                            leaves,
+                            state,
+                            path,
+                            errors,
+                            &mut frame.retry_skip,
+                        )?;
                         if let Err(error) = unlink_entry(fd, entry.file_name(), false, state) {
                             let mut captured = None;
                             if kind == FileType::Unknown
@@ -1752,6 +1817,7 @@ fn read_directory_batch(
                                     }
                                     Err(error) => {
                                         record_error(errors, path.join(name), error)?;
+                                        remember_failed_child(&mut frame.retry_skip, name);
                                         continue;
                                     }
                                 }
@@ -1770,6 +1836,7 @@ fn read_directory_batch(
                                 )
                             {
                                 record_error(errors, path.join(name), error)?;
+                                remember_failed_child(&mut frame.retry_skip, name);
                             }
                         }
                     }
@@ -1781,7 +1848,14 @@ fn read_directory_batch(
                     }
                 }
                 if entries.is_buffer_empty() {
-                    flush_leaf_unlinks(directory, leaves, state, path, errors)?;
+                    flush_leaf_unlinks(
+                        directory,
+                        leaves,
+                        state,
+                        path,
+                        errors,
+                        &mut frame.retry_skip,
+                    )?;
                     return Ok(false);
                 }
             }
@@ -1808,11 +1882,7 @@ fn read_portable_directory_batch(
     use std::os::unix::ffi::OsStrExt;
 
     debug_assert!(frame.pending.is_empty());
-    if frame.reopen_stream {
-        // Pending directories from the failed read have now finished. Never
-        // give exhausted entries new unlink attempts after reopening.
-        collect_retry_skips(frame, state, path, errors)?;
-    }
+    // Failed direct names already survive pending-child processing and reopen.
     frame.handle.prepare_buffered(state, frame.reopen_stream)?;
     frame.reopen_stream = false;
     #[cfg(test)]
@@ -1873,6 +1943,7 @@ fn read_portable_directory_batch(
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => {
                         record_error(errors, path.join(name), error)?;
+                        remember_failed_child(&mut frame.retry_skip, name);
                         continue;
                     }
                 }
@@ -1891,6 +1962,7 @@ fn read_portable_directory_batch(
                 )
             {
                 record_error(errors, path.join(name), error)?;
+                remember_failed_child(&mut frame.retry_skip, name);
             }
         }
         if is_directory {
@@ -2154,9 +2226,9 @@ mod tests {
         let error = enter_directory(&mut ancestors, frame.captured).unwrap_err();
         let mut errors = Vec::new();
         record_error(&mut errors, target.join("cycle"), error).unwrap();
-        assert!(
-            prepare_directory_retry(&mut frame, parent.as_fd(), &state, &target, &errors).unwrap()
-        );
+        // Simulate the direct-child failure bookkeeping as well as its report.
+        remember_failed_child(&mut frame.retry_skip, std::ffi::OsStr::new("cycle"));
+        assert!(prepare_directory_retry(&mut frame, parent.as_fd(), &state).unwrap());
         while !read_portable_directory_batch(&mut frame, &state, &target, &mut errors).unwrap() {}
         assert!(
             frame.pending.is_empty(),
@@ -2685,6 +2757,161 @@ mod tests {
         assert!(!work.path().join("target/removable").exists());
         assert_eq!(state.snapshot().removed_entries, 513);
         assert!(work.path().join("target/nested/deeper").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_wide_failures_preserve_attempt_limits_and_remove_every_healthy_sibling() {
+        const DEPTH: usize = 24;
+        const FAILURES: usize = 384;
+        for state in [WorkerState::default(), portable_state()] {
+            let work = fixture();
+            let target = work.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            let mut ancestors = vec![target.clone()];
+            for level in 0..DEPTH {
+                let directory = ancestors.last().unwrap().join(format!("level-{level:02}"));
+                std::fs::create_dir(&directory).unwrap();
+                ancestors.push(directory);
+            }
+            let mut healthy = Vec::new();
+            for (level, directory) in ancestors.iter().enumerate() {
+                let file = directory.join(format!("healthy-file-{level:02}"));
+                std::fs::write(&file, b"remove").unwrap();
+                healthy.push(file);
+                let sibling = directory.join(format!("healthy-dir-{level:02}"));
+                std::fs::create_dir(&sibling).unwrap();
+                std::fs::write(sibling.join("payload"), b"remove").unwrap();
+                healthy.push(sibling);
+            }
+            let deepest = ancestors.last().unwrap();
+            let mut expected_paths = std::collections::HashSet::new();
+            for index in 0..FAILURES {
+                let name = std::ffi::OsString::from(format!("failure-{index:03}"));
+                let path = deepest.join(&name);
+                std::fs::write(&path, b"keep").unwrap();
+                state.failed_names.lock().unwrap().insert(name);
+                expected_paths.insert(std::path::absolute(path).unwrap());
+            }
+            let attempts = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let observed = Arc::clone(&attempts);
+            *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, directory| {
+                *observed
+                    .lock()
+                    .unwrap()
+                    .entry((name.to_owned(), directory))
+                    .or_insert(0_usize) += 1;
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(removal.outcome.is_err() && !removal.target_removed);
+            assert_eq!(removal.errors.len(), FAILURES);
+            let attempts = attempts.lock().unwrap();
+            for error in &removal.errors {
+                assert!(error.path.is_absolute());
+                assert!(
+                    expected_paths.remove(&error.path),
+                    "duplicate or unexpected error: {error:?}"
+                );
+                assert!(error.message.contains("injected removal failure"));
+                assert_eq!(
+                    attempts.get(&(error.path.file_name().unwrap().to_owned(), false)),
+                    Some(&2),
+                    "ancestor retries repeated an exhausted leaf"
+                );
+                assert_eq!(std::fs::read(&error.path).unwrap(), b"keep");
+            }
+            assert!(expected_paths.is_empty());
+            for directory in &ancestors {
+                assert!(directory.is_dir());
+                assert_eq!(
+                    attempts.get(&(directory.file_name().unwrap().to_owned(), true)),
+                    Some(&2),
+                    "each retained ancestor gets just one rescan"
+                );
+            }
+            for path in healthy {
+                assert!(!path.exists(), "healthy sibling was left behind: {path:?}");
+            }
+            assert_eq!(state.snapshot().removed_entries, ((DEPTH + 1) * 3) as u64);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_errors_do_not_skip_a_replacement_child_during_parent_retry() {
+        const RESOLVED_FAILURES: usize = 32;
+        for keep_failed_sibling in [false, true] {
+            for state in [WorkerState::default(), portable_state()] {
+                let work = fixture();
+                let target = work.path().join("target");
+                let recovered = target.join("recovered");
+                std::fs::create_dir_all(&recovered).unwrap();
+                let mut vanished = Vec::new();
+                for index in 0..RESOLVED_FAILURES {
+                    let name = std::ffi::OsString::from(format!("vanished-{index:02}"));
+                    let path = recovered.join(&name);
+                    std::fs::write(&path, b"removed externally").unwrap();
+                    state.failed_names.lock().unwrap().insert(name);
+                    vanished.push(path);
+                }
+                if keep_failed_sibling {
+                    std::fs::write(target.join("retained"), b"keep").unwrap();
+                    state.failed_names.lock().unwrap().insert("retained".into());
+                }
+                let directory_attempts = Arc::new(std::sync::Mutex::new((0_usize, 0_usize)));
+                let observed = Arc::clone(&directory_attempts);
+                let replacement = recovered.clone();
+                *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, directory| {
+                    if !directory {
+                        return Ok(());
+                    }
+                    let mut attempts = observed.lock().unwrap();
+                    if name == "recovered" {
+                        attempts.0 += 1;
+                        if attempts.0 == 1 {
+                            for path in &vanished {
+                                std::fs::remove_file(path)?;
+                            }
+                        }
+                    } else if name == "target" {
+                        attempts.1 += 1;
+                        if attempts.1 == 1 {
+                            // The first incarnation is gone and its errors were
+                            // truncated. This new child must remain eligible.
+                            std::fs::create_dir(&replacement)?;
+                            std::fs::write(replacement.join("new-payload"), b"remove")?;
+                        }
+                    }
+                    Ok(())
+                }));
+                let anchor = RootAnchor::open(work.path()).unwrap();
+                let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+                assert_eq!(*directory_attempts.lock().unwrap(), (2, 2));
+                assert!(
+                    !recovered.exists(),
+                    "a resolved child poisoned the parent's retry skip set"
+                );
+                assert_eq!(removal.target_removed, !keep_failed_sibling);
+                assert_eq!(removal.outcome.is_err(), keep_failed_sibling);
+                assert_eq!(removal.errors.len(), usize::from(keep_failed_sibling));
+                if keep_failed_sibling {
+                    assert_eq!(
+                        removal.errors[0].path,
+                        std::path::absolute(target.join("retained")).unwrap()
+                    );
+                    assert!(
+                        removal.errors[0]
+                            .message
+                            .contains("injected removal failure")
+                    );
+                    assert_eq!(std::fs::read(target.join("retained")).unwrap(), b"keep");
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -3311,12 +3538,14 @@ mod tests {
         let leaves = synthetic_leaves(&["removed-first", "removed-second", "waiting"], &state);
         state.cancel.store(true, Ordering::Relaxed);
         let mut errors = Vec::new();
+        let mut skipped = None;
         let result = apply_leaf_completions(
             fd.as_fd(),
             &leaves,
             &state,
             work.path(),
             &mut errors,
+            &mut skipped,
             BatchOutcome::Complete(vec![
                 EntryOutcome::Completed(Ok(())),
                 EntryOutcome::Completed(Ok(())),
@@ -3327,6 +3556,7 @@ mod tests {
         assert_eq!(state.snapshot().removed_entries, 2);
         assert!(work.path().join("waiting").exists());
         assert!(errors.is_empty());
+        assert!(skipped.is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -3346,12 +3576,14 @@ mod tests {
         let state = WorkerState::default();
         let leaves = synthetic_leaves(&["absent", "interrupted", "sibling"], &state);
         let mut errors = Vec::new();
+        let mut skipped = None;
         apply_leaf_completions(
             fd.as_fd(),
             &leaves,
             &state,
             work.path(),
             &mut errors,
+            &mut skipped,
             BatchOutcome::Complete(vec![
                 EntryOutcome::Completed(Err(rustix::io::Errno::NOENT.into())),
                 EntryOutcome::Completed(Err(rustix::io::Errno::INTR.into())),
@@ -3362,6 +3594,7 @@ mod tests {
         assert_eq!(state.snapshot().removed_entries, 2);
         assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
         assert!(errors.is_empty());
+        assert!(skipped.is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -3390,12 +3623,14 @@ mod tests {
         }));
         let leaves = synthetic_leaves(&["denied", "sibling"], &state);
         let mut errors = Vec::new();
+        let mut skipped = None;
         apply_leaf_completions(
             fd.as_fd(),
             &leaves,
             &state,
             work.path(),
             &mut errors,
+            &mut skipped,
             BatchOutcome::Complete(vec![
                 EntryOutcome::Completed(Err(rustix::io::Errno::ACCESS.into())),
                 EntryOutcome::NotSubmitted,
@@ -3408,6 +3643,9 @@ mod tests {
         assert!(!work.path().join("sibling").exists());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, work.path().join("denied"));
+        let skipped = skipped.unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped.contains(std::ffi::OsStr::new("denied")));
     }
 
     #[cfg(target_os = "linux")]
@@ -3445,6 +3683,7 @@ mod tests {
             &state,
             &target,
             &mut errors,
+            &mut frame.retry_skip,
             BatchOutcome::Failed {
                 entries: vec![
                     EntryOutcome::Unknown,
@@ -3460,9 +3699,7 @@ mod tests {
         assert!(!target.join("sibling").exists());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, target.join("uncertain"));
-        assert!(
-            prepare_directory_retry(&mut frame, parent.as_fd(), &state, &target, &errors).unwrap()
-        );
+        assert!(prepare_directory_retry(&mut frame, parent.as_fd(), &state).unwrap());
         let skipped = frame.retry_skip.as_ref().unwrap();
         assert!(skipped.contains(std::ffi::OsStr::new("uncertain")));
         assert!(!skipped.contains(std::ffi::OsStr::new("absent")));
