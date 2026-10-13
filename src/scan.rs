@@ -2,7 +2,8 @@ use crate::backend::{self, Backend, EntryMetadata, RootAnchor};
 use crate::types::{Entry, NodeId, NodeKind, ScanEvent, Sizes};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::Entry as MapEntry};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -630,17 +631,19 @@ impl HardlinkRegistry {
 
 impl HardlinkState {
     fn group(&mut self, identity: (u64, u64)) -> io::Result<(NodeId, bool)> {
-        if let Some(&group) = self.groups.get(&identity) {
-            return Ok((group, true));
+        match self.groups.entry(identity) {
+            MapEntry::Occupied(entry) => Ok((*entry.get(), true)),
+            MapEntry::Vacant(entry) => {
+                let group = self.next_group;
+                self.next_group = group.checked_add(1).ok_or_else(|| {
+                    io::Error::other("too many hardlink groups for the scan's identifiers")
+                })?;
+                // Record single-link files too. A later refresh may discover a new
+                // alias of an unchanged file outside the refreshed branch.
+                entry.insert(group);
+                Ok((group, false))
+            }
         }
-        let group = self.next_group;
-        self.next_group = group.checked_add(1).ok_or_else(|| {
-            io::Error::other("too many hardlink groups for the scan's identifiers")
-        })?;
-        // Record single-link files too. A later refresh may discover a new alias
-        // of an unchanged file outside the refreshed branch.
-        self.groups.insert(identity, group);
-        Ok((group, false))
     }
 }
 
@@ -673,7 +676,7 @@ impl Emitter {
     fn entries(
         &mut self,
         task: &DirectoryTask,
-        discovered: Vec<(std::ffi::OsString, io::Result<EntryMetadata>)>,
+        discovered: Vec<(Arc<OsStr>, io::Result<EntryMetadata>)>,
         cancel: &AtomicBool,
         control: &ScanControl,
     ) -> io::Result<Vec<DirectoryTask>> {
@@ -722,7 +725,7 @@ impl Emitter {
             if kind == NodeKind::Directory {
                 directories.push(DirectoryTask {
                     id,
-                    path: task.path.join(&name),
+                    path: task.path.join(name.as_ref()),
                 });
             }
             entries.push(Entry {
@@ -1765,10 +1768,10 @@ mod tests {
                 &task,
                 vec![
                     (
-                        "removed".into(),
+                        Arc::from(OsStr::new("removed")),
                         Err(io::Error::from(io::ErrorKind::NotFound)),
                     ),
-                    ("survivor".into(), Ok(metadata)),
+                    (Arc::from(OsStr::new("survivor")), Ok(metadata)),
                 ],
                 &cancel,
                 &control,
@@ -1781,7 +1784,7 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 1);
-        assert_eq!(entries[0].name, "survivor");
+        assert_eq!(entries[0].name.as_ref(), "survivor");
         assert!(entries[0].error.is_none());
     }
 
@@ -1823,7 +1826,7 @@ mod tests {
             panic!("expected unrelated entries");
         };
         assert_eq!(parent, 8);
-        assert_eq!(entries[0].name, "payload");
+        assert_eq!(entries[0].name.as_ref(), "payload");
         assert!(entries[0].error.is_none());
         assert!(matches!(
             receiver.recv().unwrap(),
@@ -2011,7 +2014,7 @@ mod tests {
             .find_map(|event| match event {
                 ScanEvent::Entries { entries, .. } => entries
                     .into_iter()
-                    .find(|entry| entry.name == "outside")
+                    .find(|entry| entry.name.as_ref() == "outside")
                     .and_then(|entry| entry.hardlink_group),
                 _ => None,
             })
@@ -2035,9 +2038,9 @@ mod tests {
         let alias = events
             .into_iter()
             .find_map(|event| match event {
-                ScanEvent::Entries { parent: 0, entries } => {
-                    entries.into_iter().find(|entry| entry.name == "alias")
-                }
+                ScanEvent::Entries { parent: 0, entries } => entries
+                    .into_iter()
+                    .find(|entry| entry.name.as_ref() == "alias"),
                 _ => None,
             })
             .expect("scoped scan enumerates its local root");
@@ -2058,9 +2061,9 @@ mod tests {
         let outside_entry = collect(&initial)
             .into_iter()
             .find_map(|event| match event {
-                ScanEvent::Entries { entries, .. } => {
-                    entries.into_iter().find(|entry| entry.name == "outside")
-                }
+                ScanEvent::Entries { entries, .. } => entries
+                    .into_iter()
+                    .find(|entry| entry.name.as_ref() == "outside"),
                 _ => None,
             })
             .unwrap();
@@ -2152,7 +2155,7 @@ mod tests {
                 })
                 .flatten()
                 .collect();
-            assert_eq!(names, vec![std::ffi::OsString::from("original")]);
+            assert_eq!(names, vec![Arc::<OsStr>::from(OsStr::new("original"))]);
         }
     }
 
@@ -2224,7 +2227,7 @@ mod tests {
                 .into_iter()
                 .map(|(name, inode)| {
                     (
-                        name.into(),
+                        Arc::from(OsStr::new(name)),
                         Ok(EntryMetadata {
                             kind: NodeKind::File,
                             sizes: Sizes::default(),
@@ -2243,10 +2246,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let available_before_delivery = loop {
-            if let Ok(state) = hardlinks.state.try_lock() {
-                if state.groups.len() == 2 {
-                    break true;
-                }
+            if let Ok(state) = hardlinks.state.try_lock()
+                && state.groups.len() == 2
+            {
+                break true;
             }
             if Instant::now() >= deadline {
                 break false;
@@ -2271,6 +2274,19 @@ mod tests {
     }
 
     #[test]
+    fn hardlink_id_exhaustion_preserves_existing_groups() {
+        let mut state = HardlinkState {
+            next_group: NodeId::MAX - 1,
+            groups: HashMap::new(),
+        };
+        assert_eq!(state.group((1, 42)).unwrap(), (NodeId::MAX - 1, false));
+        assert!(state.group((1, 43)).is_err());
+        assert_eq!(state.group((1, 42)).unwrap(), (NodeId::MAX - 1, true));
+        assert_eq!(state.groups.len(), 1);
+        assert!(state.group((1, 43)).is_err());
+    }
+
+    #[test]
     fn late_hardlink_alias_keeps_group_after_link_count_shrinks() {
         let (sender, receiver) = bounded(2);
         let mut emitter = Emitter {
@@ -2292,7 +2308,7 @@ mod tests {
                 .entries(
                     &task,
                     vec![(
-                        name.into(),
+                        Arc::from(OsStr::new(name)),
                         Ok(EntryMetadata {
                             kind: NodeKind::File,
                             sizes,
@@ -2373,7 +2389,7 @@ mod tests {
                             }
                         }
                         assert!(entry.error.is_none());
-                        if entry.name == "cycle" {
+                        if entry.name.as_ref() == "cycle" {
                             assert_eq!(entry.kind, NodeKind::Symlink);
                         }
                     }

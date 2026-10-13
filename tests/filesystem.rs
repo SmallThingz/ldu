@@ -460,7 +460,7 @@ fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias()
                 entries,
             } => entries
                 .iter()
-                .find(|entry| entry.name == "owner")
+                .find(|entry| entry.name.as_ref() == "owner")
                 .map(|entry| (entry.id, entry.hardlink_group.unwrap())),
             _ => None,
         };
@@ -500,7 +500,7 @@ fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias()
             .unwrap();
         if let ScanEvent::Entries { entries, .. } = &event {
             for entry in entries {
-                if entry.name == "alias" {
+                if entry.name.as_ref() == "alias" {
                     assert_eq!(entry.hardlink_group, Some(owner_group));
                     late_alias = Some(entry.id);
                 }

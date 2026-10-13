@@ -270,7 +270,7 @@ fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
 fn entry(id: NodeId, name: &str, kind: NodeKind, bytes: u64) -> crate::types::Entry {
     crate::types::Entry {
         id,
-        name: name.into(),
+        name: Arc::from(std::ffi::OsStr::new(name)),
         kind,
         sizes: crate::types::Sizes {
             apparent: bytes,

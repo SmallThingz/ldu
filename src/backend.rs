@@ -1,10 +1,13 @@
 //! Directory enumeration and no-follow metadata, with a buffered Linux backend.
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::types::{NodeKind, Sizes};
@@ -372,7 +375,7 @@ pub fn enumerate(
     buffer_size: usize,
     batch_size: usize,
     cancel: &AtomicBool,
-    emit: impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
+    emit: impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     check_cancel(cancel)?;
     let anchor = RootAnchor::open_cancellable(path, cancel)?;
@@ -396,7 +399,7 @@ pub fn enumerate_anchored(
     buffer_size: usize,
     batch_size: usize,
     cancel: &AtomicBool,
-    mut emit: impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
+    mut emit: impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     check_cancel(cancel)?;
     let batch_size = batch_size.max(1);
@@ -453,7 +456,7 @@ fn enumerate_std(
     reader: &MetadataReader,
     batch_size: usize,
     cancel: &AtomicBool,
-    emit: &mut impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
+    emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     let entries = fs::read_dir(path)?;
     let mut batch = Vec::new();
@@ -464,7 +467,7 @@ fn enumerate_std(
                 if batch.is_empty() {
                     batch.reserve_exact(batch_size);
                 }
-                batch.push(entry.file_name());
+                batch.push(Arc::from(entry.file_name()));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
@@ -546,7 +549,7 @@ fn enumerate_native(
     buffer_size: usize,
     batch_size: usize,
     cancel: &AtomicBool,
-    emit: &mut impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
+    emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     use rustix::fs::RawDir;
     use rustix::io::Errno;
@@ -584,7 +587,7 @@ fn enumerate_native(
                 if batch.is_empty() {
                     batch.reserve_exact(batch_size);
                 }
-                batch.push(OsStr::from_bytes(bytes).to_owned());
+                batch.push(Arc::from(OsStr::from_bytes(bytes)));
                 if batch.len() == batch_size {
                     flush(&mut batch, reader, emit)?;
                 }
@@ -600,9 +603,9 @@ fn enumerate_native(
 }
 
 fn flush(
-    batch: &mut Vec<OsString>,
+    batch: &mut Vec<Arc<OsStr>>,
     reader: &MetadataReader,
-    emit: &mut impl FnMut(Vec<OsString>, &MetadataReader) -> io::Result<()>,
+    emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -665,7 +668,7 @@ fn std_metadata(metadata: fs::Metadata) -> EntryMetadata {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)] // Stat field widths differ between Linux targets.
-fn native_metadata(stat: rustix::fs::Stat) -> EntryMetadata {
+pub(crate) fn native_metadata(stat: rustix::fs::Stat) -> EntryMetadata {
     use rustix::fs::FileType;
     let kind = match FileType::from_raw_mode(stat.st_mode) {
         FileType::Directory => NodeKind::Directory,
@@ -689,6 +692,7 @@ fn native_metadata(stat: rustix::fs::Stat) -> EntryMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[cfg(target_os = "linux")]
     fn fixture() -> tempfile::TempDir {
@@ -829,7 +833,7 @@ mod tests {
         let native = read(Backend::Native);
         let standard = read(Backend::Std);
         assert_eq!(native.len(), 4);
-        assert!(native.contains_key(&raw_name));
+        assert!(native.contains_key(raw_name.as_os_str()));
         for (name, expected) in standard {
             let actual = &native[&name];
             assert_eq!(actual.kind, expected.kind);
@@ -960,7 +964,7 @@ mod tests {
                 &cancel,
                 |names, reader| {
                     for name in names {
-                        assert_eq!(name, "payload");
+                        assert_eq!(name.as_ref(), "payload");
                         assert_eq!(reader.metadata(&name)?.sizes.apparent, 8);
                         count += 1;
                     }
@@ -1056,7 +1060,7 @@ mod tests {
                 &cancel,
                 |names, reader| {
                     for name in names {
-                        assert_eq!(name, raw_name);
+                        assert_eq!(name.as_ref(), raw_name.as_os_str());
                         let metadata = reader.metadata(&name)?;
                         assert_eq!(metadata.kind, NodeKind::File);
                         assert_eq!(metadata.sizes, expected.sizes);

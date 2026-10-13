@@ -66,7 +66,7 @@ impl ScopeScan {
     }
 
     fn push(&mut self, id: NodeId) {
-        if self.len % NODE_CHUNK == 0 {
+        if self.len.is_multiple_of(NODE_CHUNK) {
             self.ids.push(Vec::with_capacity(NODE_CHUNK));
         }
         self.ids.last_mut().unwrap().push(id);
@@ -209,7 +209,7 @@ impl Nodes {
     }
 
     fn push(&mut self, node: Node) {
-        if self.len % NODE_CHUNK == 0 {
+        if self.len.is_multiple_of(NODE_CHUNK) {
             self.chunks.push(Vec::with_capacity(NODE_CHUNK));
         }
         self.chunks.last_mut().unwrap().push(node);
@@ -916,12 +916,13 @@ impl Model {
                     // complete_ready releases a retained directory's old parent token
                     // if replacement metadata now describes a file or symlink.
                     node.complete = false;
-                    if was_directory && kind != NodeKind::Directory {
-                        if let Some(parent) = parent {
-                            let counts = &mut self.directories.get_mut(&parent).unwrap().children;
-                            counts.directories -= 1;
-                            counts.hidden_directories -= u32::from(hidden);
-                        }
+                    if was_directory
+                        && kind != NodeKind::Directory
+                        && let Some(parent) = parent
+                    {
+                        let counts = &mut self.directories.get_mut(&parent).unwrap().children;
+                        counts.directories -= 1;
+                        counts.hidden_directories -= u32::from(hidden);
                     }
                 }
                 let charged = if kind == NodeKind::File {
@@ -1114,7 +1115,7 @@ impl Model {
                 continue;
             }
             if entry.name.is_empty()
-                || Path::new(&entry.name).file_name() != Some(entry.name.as_os_str())
+                || Path::new(entry.name.as_ref()).file_name() != Some(entry.name.as_ref())
             {
                 self.record_error(parent, "entry has an invalid basename".into());
                 self.append_tombstone(parent, generation, entry);
@@ -1123,31 +1124,29 @@ impl Model {
             let charged = if let Some(group_id) = entry.hardlink_group {
                 // The charge for an earlier owner in this same batch has not yet
                 // reached the parent. Correct that local sum before updating it.
-                if let Some(&index) = self.hardlink_indices.get(&group_id) {
-                    if let Some(owner) = self.hardlink_groups[index].owner {
-                        if owner >= batch_start
-                            && self.is_live(owner)
-                            && generation >= self.hardlink_groups[index].metadata_generation
-                        {
-                            let old = self.hardlink_groups[index].sizes;
-                            if old != entry.sizes {
-                                self.nodes[owner as usize].sizes = entry.sizes;
-                                sizes.apparent = replace_charge(
-                                    sizes.apparent,
-                                    old.apparent,
-                                    entry.sizes.apparent,
-                                    &mut overflow,
-                                );
-                                sizes.allocated = replace_charge(
-                                    sizes.allocated,
-                                    old.allocated,
-                                    entry.sizes.allocated,
-                                    &mut overflow,
-                                );
-                                self.hardlink_groups[index].sizes = entry.sizes;
-                                changed.push(owner);
-                            }
-                        }
+                if let Some(&index) = self.hardlink_indices.get(&group_id)
+                    && let Some(owner) = self.hardlink_groups[index].owner
+                    && owner >= batch_start
+                    && self.is_live(owner)
+                    && generation >= self.hardlink_groups[index].metadata_generation
+                {
+                    let old = self.hardlink_groups[index].sizes;
+                    if old != entry.sizes {
+                        self.nodes[owner as usize].sizes = entry.sizes;
+                        sizes.apparent = replace_charge(
+                            sizes.apparent,
+                            old.apparent,
+                            entry.sizes.apparent,
+                            &mut overflow,
+                        );
+                        sizes.allocated = replace_charge(
+                            sizes.allocated,
+                            old.allocated,
+                            entry.sizes.allocated,
+                            &mut overflow,
+                        );
+                        self.hardlink_groups[index].sizes = entry.sizes;
+                        changed.push(owner);
                     }
                 }
                 self.remember_hardlink(group_id, entry.id, entry.sizes, generation, true, changed)
@@ -1156,12 +1155,7 @@ impl Model {
             } else {
                 entry.sizes
             };
-            let mut node = Node::new(
-                Arc::from(entry.name.into_boxed_os_str()),
-                Some(parent),
-                entry.kind,
-                charged,
-            );
+            let mut node = Node::new(entry.name, Some(parent), entry.kind, charged);
             node.parent_epoch = self.nodes[parent as usize].child_epoch;
             node.scan_generation = generation;
             node.hardlink_duplicate = if let Some(group_id) = entry.hardlink_group {
@@ -1425,12 +1419,11 @@ impl Iterator for Children<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
     fn entry(id: NodeId, name: &str, kind: NodeKind, apparent: u64, allocated: u64) -> Entry {
         Entry {
             id,
-            name: OsString::from(name),
+            name: Arc::from(OsStr::new(name)),
             kind,
             sizes: Sizes {
                 apparent,

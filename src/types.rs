@@ -1,16 +1,15 @@
-use serde::Serialize;
-use std::ffi::OsString;
+use std::{ffi::OsStr, sync::Arc};
 
 pub type NodeId = u32;
 pub const ROOT: NodeId = 0;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sizes {
     pub apparent: u64,
     pub allocated: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NodeKind {
     Directory,
     File,
@@ -38,7 +37,7 @@ pub enum SortMode {
 #[derive(Debug)]
 pub struct Entry {
     pub id: NodeId,
-    pub name: OsString,
+    pub name: Arc<OsStr>,
     pub kind: NodeKind,
     pub sizes: Sizes,
     pub hardlink_duplicate: bool,
