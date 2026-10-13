@@ -106,6 +106,7 @@ pub struct DeleteProgress {
 #[derive(Default)]
 struct WorkerState {
     cancel: AtomicBool,
+    finished: AtomicBool,
     examined_entries: AtomicU64,
     removed_entries: AtomicU64,
     removed_directories: AtomicU64,
@@ -117,7 +118,16 @@ struct WorkerState {
     deny_next_unlink: AtomicBool,
     #[cfg(test)]
     fail_parent_restore: AtomicBool,
+    #[cfg(all(test, target_os = "linux"))]
+    unlink_hook: std::sync::Mutex<Option<TestUnlinkHook>>,
+    #[cfg(all(test, target_os = "linux"))]
+    read_hook: std::sync::Mutex<Option<TestReadHook>>,
 }
+
+#[cfg(all(test, target_os = "linux"))]
+type TestUnlinkHook = Box<dyn FnMut(&std::ffi::OsStr, bool) -> io::Result<()> + Send>;
+#[cfg(all(test, target_os = "linux"))]
+type TestReadHook = Box<dyn FnMut(&std::ffi::OsStr) -> io::Result<()> + Send>;
 
 impl WorkerState {
     fn snapshot(&self) -> DeleteProgress {
@@ -235,13 +245,12 @@ impl Removal {
 
 pub struct DeleteHandle {
     pub receiver: Receiver<DeleteResult>,
-    pub finished: Arc<AtomicBool>,
     state: Arc<WorkerState>,
 }
 
 impl DeleteHandle {
     pub fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
+        self.state.finished.load(Ordering::Acquire)
     }
 
     /// Cooperative cancellation never waits for or joins the worker.
@@ -273,7 +282,7 @@ impl CompletionWake {
 }
 
 struct FinishedGuard {
-    finished: Arc<AtomicBool>,
+    state: Arc<WorkerState>,
     completion: CompletionWake,
     sender: Option<crossbeam_channel::Sender<DeleteResult>>,
 }
@@ -283,7 +292,7 @@ impl Drop for FinishedGuard {
         // On unwind, the receiver must already be disconnected when it wakes.
         // Otherwise it could observe Empty and consume the only notification.
         self.sender.take();
-        self.finished.store(true, Ordering::Release);
+        self.state.finished.store(true, Ordering::Release);
         self.completion.signal();
     }
 }
@@ -329,8 +338,6 @@ fn spawn_inner(
     completion: CompletionWake,
 ) -> DeleteHandle {
     let (sender, receiver) = bounded(1);
-    let finished = Arc::new(AtomicBool::new(false));
-    let worker_finished = Arc::clone(&finished);
     let worker_completion = completion.clone();
     let state = Arc::new(WorkerState::default());
     let worker_state = Arc::clone(&state);
@@ -344,19 +351,20 @@ fn spawn_inner(
         .name("ldu-delete".into())
         .spawn(move || {
             let finished_guard = FinishedGuard {
-                finished: worker_finished,
+                state: worker_state,
                 completion: worker_completion,
                 sender: Some(sender),
             };
-            let mut removal = remove_expected(&anchor, &relative, &worker_state, target)
+            let mut removal = remove_expected(&anchor, &relative, &finished_guard.state, target)
                 .unwrap_or_else(Removal::failed);
-            if let Err(error) = &removal.outcome {
-                if error.kind() != io::ErrorKind::Interrupted && removal.errors.is_empty() {
-                    removal.errors.push(DeleteError {
-                        path: worker_path,
-                        message: error.to_string(),
-                    });
-                }
+            if let Err(error) = &removal.outcome
+                && error.kind() != io::ErrorKind::Interrupted
+                && removal.errors.is_empty()
+            {
+                removal.errors.push(DeleteError {
+                    path: worker_path,
+                    message: error.to_string(),
+                });
             }
             let _ = finished_guard
                 .sender
@@ -367,7 +375,7 @@ fn spawn_inner(
                     outcome: removal.outcome,
                     target_removed: removal.target_removed,
                     errors: removal.errors,
-                    progress: worker_state.snapshot(),
+                    progress: finished_guard.state.snapshot(),
                     parent_metadata: removal.parent_metadata,
                     metadata_error: removal.metadata_error,
                 });
@@ -388,14 +396,10 @@ fn spawn_inner(
             parent_metadata: None,
             metadata_error: None,
         });
-        finished.store(true, Ordering::Release);
+        state.finished.store(true, Ordering::Release);
         completion.signal();
     }
-    DeleteHandle {
-        receiver,
-        finished,
-        state,
-    }
+    DeleteHandle { receiver, state }
 }
 
 fn validated_relative(relative: &Path) -> io::Result<PathBuf> {
@@ -586,12 +590,12 @@ fn changed_target() -> io::Error {
 fn checked_current(
     parent: &rustix::fd::OwnedFd,
     name: &std::ffi::OsStr,
-    captured: &rustix::fs::Stat,
+    captured: FileIdentity,
     state: &WorkerState,
 ) -> io::Result<bool> {
     use rustix::fs::{AtFlags, statat};
     match retry_operation(state, || statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)) {
-        Ok(current) if identity_matches(captured, &current) => Ok(true),
+        Ok(current) if captured == FileIdentity::from_stat(&current) => Ok(true),
         Ok(_) => Err(changed_target()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -602,10 +606,16 @@ fn checked_current(
 struct DirectoryFrame {
     fd: rustix::fd::OwnedFd,
     name: std::ffi::OsString,
-    captured: rustix::fs::Stat,
+    captured: FileIdentity,
     pending: Vec<DirectoryName>,
     exhausted: bool,
+    retried_removal: bool,
+    retried_read: bool,
+    read_error: Option<io::Error>,
     errors_at_entry: usize,
+    // Keep successful traversal frames compact; allocate the set only after failure.
+    #[allow(clippy::box_collection)]
+    retry_skip: Option<Box<std::collections::HashSet<std::ffi::OsString>>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -741,7 +751,7 @@ fn repair_directory_permissions(
 fn checked_path_handle(
     parent: &rustix::fd::OwnedFd,
     name: &std::ffi::OsStr,
-    expected: Option<&rustix::fs::Stat>,
+    expected: Option<FileIdentity>,
     inode: u64,
     state: &WorkerState,
 ) -> io::Result<(rustix::fd::OwnedFd, rustix::fs::Stat)> {
@@ -755,7 +765,7 @@ fn checked_path_handle(
         )
     })?;
     let captured = retry_operation(state, || fstat(&fd))?;
-    if expected.is_some_and(|expected| !identity_matches(expected, &captured))
+    if expected.is_some_and(|expected| expected != FileIdentity::from_stat(&captured))
         || (inode != 0 && inode != captured.st_ino)
     {
         return Err(changed_target());
@@ -766,56 +776,66 @@ fn checked_path_handle(
 #[cfg(target_os = "linux")]
 fn open_checked_directory(
     parent: &rustix::fd::OwnedFd,
-    name: &std::ffi::OsStr,
-    expected: Option<&rustix::fs::Stat>,
+    name: std::ffi::OsString,
+    expected: Option<FileIdentity>,
     inode: u64,
     state: &WorkerState,
 ) -> io::Result<Option<DirectoryFrame>> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let fd = match retry_operation(state, || openat(parent, name, flags, Mode::empty())) {
+    let fd = match retry_operation(state, || openat(parent, &name, flags, Mode::empty())) {
         Ok(fd) => fd,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            let (held, captured) = match checked_path_handle(parent, name, expected, inode, state) {
+            let (held, captured) = match checked_path_handle(parent, &name, expected, inode, state)
+            {
                 Err(error)
                     if error.kind() == io::ErrorKind::PermissionDenied && expected.is_none() =>
                 {
                     // An enumerated directory can be readable but not searchable.
                     // Its retained parent is inside the confirmed subtree.
                     repair_directory_permissions(parent, state, true)?;
-                    checked_path_handle(parent, name, expected, inode, state)?
+                    checked_path_handle(parent, &name, expected, inode, state)?
                 }
                 result => result?,
             };
             if FileType::from_raw_mode(captured.st_mode) != FileType::Directory {
                 return Err(changed_target());
             }
-            if !checked_current(parent, name, &captured, state)? {
+            if !checked_current(parent, &name, FileIdentity::from_stat(&captured), state)? {
                 return Ok(None);
             }
             repair_directory_permissions(&held, state, true)?;
             // Reopen the held directory itself, never resolve the entry again.
             retry_operation(state, || openat(&held, ".", flags, Mode::empty()))?
         }
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+        Err(_) => match retry_operation(state, || openat(parent, &name, flags, Mode::empty())) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        },
     };
     let captured = retry_operation(state, || fstat(&fd))?;
-    if expected.is_some_and(|expected| !identity_matches(expected, &captured))
+    if expected.is_some_and(|expected| expected != FileIdentity::from_stat(&captured))
         || (inode != 0 && inode != captured.st_ino)
     {
         return Err(changed_target());
     }
-    if !checked_current(parent, name, &captured, state)? {
+    if !checked_current(parent, &name, FileIdentity::from_stat(&captured), state)? {
         return Ok(None);
     }
     Ok(Some(DirectoryFrame {
         fd,
-        name: name.to_owned(),
-        captured,
+        name,
+        captured: FileIdentity::from_stat(&captured),
         pending: Vec::new(),
         exhausted: false,
+        retried_removal: false,
+        retried_read: false,
+        read_error: None,
         errors_at_entry: 0,
+        retry_skip: None,
     }))
 }
 
@@ -834,6 +854,10 @@ fn unlink_entry(
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
         let name = name.as_cow_c_str()?;
+        if let Some(hook) = state.unlink_hook.lock().unwrap().as_mut() {
+            state.check_cancel()?;
+            hook(std::ffi::OsStr::from_bytes(name.to_bytes()), directory)?;
+        }
         if state
             .failed_names
             .lock()
@@ -864,7 +888,7 @@ fn retry_failed_unlink(
     parent: &rustix::fd::OwnedFd,
     name: &std::ffi::OsStr,
     directory: bool,
-    captured: Option<&rustix::fs::Stat>,
+    captured: Option<FileIdentity>,
     inode: u64,
     restore_parent: bool,
     state: &WorkerState,
@@ -872,9 +896,10 @@ fn retry_failed_unlink(
     target_removed: Option<&mut bool>,
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, chownat};
-    if original_error.kind() != io::ErrorKind::PermissionDenied {
+    if original_error.kind() == io::ErrorKind::Interrupted {
         return Err(original_error);
     }
+    let permission_denied = original_error.kind() == io::ErrorKind::PermissionDenied;
     let (target, captured) = match checked_path_handle(parent, name, captured, inode, state) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             if let Some(target_removed) = target_removed {
@@ -882,7 +907,11 @@ fn retry_failed_unlink(
             }
             return Ok(());
         }
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied && !restore_parent => {
+        Err(error)
+            if permission_denied
+                && error.kind() == io::ErrorKind::PermissionDenied
+                && !restore_parent =>
+        {
             repair_directory_permissions(parent, state, true)?;
             checked_path_handle(parent, name, captured, inode, state)?
         }
@@ -891,16 +920,21 @@ fn retry_failed_unlink(
     if (FileType::from_raw_mode(captured.st_mode) == FileType::Directory) != directory {
         return Err(changed_target());
     }
-    if !checked_current(parent, name, &captured, state)? {
+    if !checked_current(parent, name, FileIdentity::from_stat(&captured), state)? {
         if let Some(target_removed) = target_removed {
             *target_removed = true;
         }
         return Ok(());
     }
-    let repaired = repair_directory_permissions(parent, state, !restore_parent);
+    let repaired = if permission_denied {
+        repair_directory_permissions(parent, state, !restore_parent)
+    } else {
+        Ok(None)
+    };
     // Sticky directories may additionally require ownership of the selected
     // inode. EMPTY_PATH acts on the retained inode and never follows a link.
-    let ownership_error = if FileType::from_raw_mode(captured.st_mode) != FileType::Symlink
+    let ownership_error = if permission_denied
+        && FileType::from_raw_mode(captured.st_mode) != FileType::Symlink
         && captured.st_uid != rustix::process::geteuid().as_raw()
     {
         retry_operation(state, || {
@@ -916,51 +950,56 @@ fn retry_failed_unlink(
     } else {
         None
     };
-    let retry = checked_current(parent, name, &captured, state).and_then(|exists| {
-        if exists {
-            unlink_entry(parent, name, directory, state)
-        } else {
-            Ok(())
-        }
-    });
+    let retry = checked_current(parent, name, FileIdentity::from_stat(&captured), state).and_then(
+        |exists| {
+            if exists {
+                unlink_entry(parent, name, directory, state)
+            } else {
+                Ok(())
+            }
+        },
+    );
     // Record the unlink boundary before restoring an external parent's mode.
     // Restoration diagnostics must not resurrect a successfully removed target.
-    if retry.is_ok() {
-        if let Some(target_removed) = target_removed {
-            *target_removed = true;
-        }
+    if retry.is_ok()
+        && let Some(target_removed) = target_removed
+    {
+        *target_removed = true;
     }
     // The target's containing directory can lie outside the requested subtree.
     // Restore its permissions even after cooperative cancellation.
-    if restore_parent {
-        if let Ok(Some(original_mode)) = repaired.as_ref() {
-            let restore_state = WorkerState::default();
-            #[cfg(test)]
-            let restoration = if state.fail_parent_restore.load(Ordering::Relaxed) {
-                Err(io::Error::other("injected parent restoration failure"))
-            } else {
-                chmod_held(parent, *original_mode, &restore_state)
-            };
-            #[cfg(not(test))]
-            let restoration = chmod_held(parent, *original_mode, &restore_state);
-            let restoration =
-                restoration.and_then(|()| verify_held_mode(parent, *original_mode, &restore_state));
-            restoration.map_err(|error| {
-                let path = std::fs::read_link(descriptor_path(parent))
-                    .unwrap_or_else(|_| descriptor_path(parent));
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "could not restore permissions of {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
-        }
+    if restore_parent && let Ok(Some(original_mode)) = repaired.as_ref() {
+        let restore_state = WorkerState::default();
+        #[cfg(test)]
+        let restoration = if state.fail_parent_restore.load(Ordering::Relaxed) {
+            Err(io::Error::other("injected parent restoration failure"))
+        } else {
+            chmod_held(parent, *original_mode, &restore_state)
+        };
+        #[cfg(not(test))]
+        let restoration = chmod_held(parent, *original_mode, &restore_state);
+        let restoration =
+            restoration.and_then(|()| verify_held_mode(parent, *original_mode, &restore_state));
+        restoration.map_err(|error| {
+            let path = std::fs::read_link(descriptor_path(parent))
+                .unwrap_or_else(|_| descriptor_path(parent));
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not restore permissions of {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
     }
     match retry {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(error),
+        Err(error)
+            if error.kind() == io::ErrorKind::Interrupted
+                || (repaired.is_ok() && ownership_error.is_none()) =>
+        {
+            Err(error)
+        }
         Err(error) => {
             let mut message = error.to_string();
             if let Err(repair_error) = repaired {
@@ -1010,16 +1049,16 @@ fn remove_from_parent(
         }
         Err(error) => return Err(error),
     };
+    let captured = FileIdentity::from_stat(&captured);
     state.examined();
-    if expected.is_some_and(|expected| expected.target != Some(FileIdentity::from_stat(&captured)))
-    {
+    if expected.is_some_and(|expected| expected.target != Some(captured)) {
         return Err(changed_target());
     }
-    if !checked_current(parent, name, &captured, state)? {
+    if !checked_current(parent, name, captured, state)? {
         *target_removed = true;
         return Ok(());
     }
-    if FileType::from_raw_mode(captured.st_mode) != FileType::Directory {
+    if captured.kind != FileType::Directory {
         return match unlink_entry(parent, name, false, state) {
             Ok(()) => {
                 *target_removed = true;
@@ -1029,7 +1068,7 @@ fn remove_from_parent(
                 parent,
                 name,
                 false,
-                Some(&captured),
+                Some(captured),
                 0,
                 true,
                 state,
@@ -1038,7 +1077,8 @@ fn remove_from_parent(
             ),
         };
     }
-    let Some(root) = open_checked_directory(parent, name, Some(&captured), 0, state)? else {
+    let Some(root) = open_checked_directory(parent, name.to_owned(), Some(captured), 0, state)?
+    else {
         *target_removed = true;
         return Ok(());
     };
@@ -1052,7 +1092,7 @@ fn remove_from_parent(
         if let Some(next) = stack.last_mut().unwrap().pending.pop() {
             let frame = stack.last().unwrap();
             path.push(&next.name);
-            match open_checked_directory(&frame.fd, &next.name, None, next.inode, state) {
+            match open_checked_directory(&frame.fd, next.name, None, next.inode, state) {
                 Ok(Some(mut child)) => {
                     child.errors_at_entry = errors.len();
                     stack.push(child);
@@ -1066,58 +1106,106 @@ fn remove_from_parent(
         }
         let frame = stack.last_mut().unwrap();
         if !frame.exhausted {
-            match read_directory_batch(
-                &frame.fd,
-                &mut buffer,
-                &mut frame.pending,
-                state,
-                path,
-                errors,
-            ) {
+            match read_directory_batch(frame, &mut buffer, state, path, errors) {
                 Ok(exhausted) => frame.exhausted = exhausted,
                 Err(error) => {
-                    record_error(errors, path.as_path(), error)?;
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                    if !frame.retried_read {
+                        frame.retried_read = true;
+                        if error.kind() == io::ErrorKind::PermissionDenied
+                            && let Err(error) = repair_directory_permissions(&frame.fd, state, true)
+                        {
+                            frame.exhausted = true;
+                            frame.read_error = Some(error);
+                        }
+                        continue;
+                    }
                     frame.exhausted = true;
+                    frame.read_error = Some(error);
                 }
             }
             continue;
         }
-        let finished = stack.pop().unwrap();
+        let mut finished = stack.pop().unwrap();
         let is_target = stack.is_empty();
         let containing_parent = stack.last().map(|frame| &frame.fd).unwrap_or(parent);
-        let result = checked_current(containing_parent, &finished.name, &finished.captured, state)
+        let mut directory_removed = false;
+        let result = checked_current(containing_parent, &finished.name, finished.captured, state)
             .and_then(|exists| {
                 if !exists {
-                    if is_target {
-                        *target_removed = true;
-                    }
+                    directory_removed = true;
                     return Ok(());
                 }
                 match unlink_entry(containing_parent, &finished.name, true, state) {
                     Ok(()) => {
+                        directory_removed = true;
+                        Ok(())
+                    }
+                    Err(error)
+                        if finished.retried_removal
+                            || error.raw_os_error()
+                                == Some(rustix::io::Errno::NOTEMPTY.raw_os_error()) =>
+                    {
+                        Err(error)
+                    }
+                    Err(error) => {
+                        finished.retried_removal = true;
+                        retry_failed_unlink(
+                            containing_parent,
+                            &finished.name,
+                            true,
+                            Some(finished.captured),
+                            0,
+                            is_target,
+                            state,
+                            error,
+                            Some(&mut directory_removed),
+                        )
+                    }
+                }
+            });
+        if directory_removed {
+            // A successful rmdir (or confirmed absence) proves that earlier
+            // descendant failures no longer remain inside this directory.
+            // Parent permission restoration errors are recorded below.
+            errors.truncate(finished.errors_at_entry);
+            if is_target {
+                *target_removed = true;
+            }
+        }
+        if let Err(mut error) = result {
+            if !finished.retried_removal
+                && finished.read_error.is_none()
+                && error.raw_os_error() == Some(rustix::io::Errno::NOTEMPTY.raw_os_error())
+            {
+                match prepare_directory_retry(&mut finished, containing_parent, state, path, errors)
+                {
+                    Ok(true) => {
+                        stack.push(finished);
+                        continue;
+                    }
+                    Ok(false) => {
+                        errors.truncate(finished.errors_at_entry);
                         if is_target {
                             *target_removed = true;
                         }
-                        Ok(())
+                        if !stack.is_empty() {
+                            path.pop();
+                        }
+                        continue;
                     }
-                    Err(error) => retry_failed_unlink(
-                        containing_parent,
-                        &finished.name,
-                        true,
-                        Some(&finished.captured),
-                        0,
-                        is_target,
-                        state,
-                        error,
-                        if is_target {
-                            Some(&mut *target_removed)
-                        } else {
-                            None
-                        },
-                    ),
+                    Err(retry_error) => error = retry_error,
                 }
-            });
-        if let Err(error) = result {
+            }
+            // A read failure is irrelevant if removal proved the directory empty.
+            // Keep any external-parent permission restoration error separately.
+            if !(is_target && *target_removed)
+                && let Some(read_error) = finished.read_error.take()
+            {
+                record_error(errors, path.as_path(), read_error)?;
+            }
             // A retained descendant already explains why its ancestors remain.
             if !(errors.len() > finished.errors_at_entry
                 && error.raw_os_error() == Some(rustix::io::Errno::NOTEMPTY.raw_os_error()))
@@ -1132,13 +1220,43 @@ fn remove_from_parent(
     Ok(())
 }
 
-/// Consume one whole getdents buffer before suspending its descriptor. Files
-/// retain the direct unlink fast path; errors alone allocate full paths.
+/// Revisit only children that have not exhausted their own attempts. Keeping
+/// failed subtrees out of ancestor rescans bounds both retries and diagnostics.
+#[cfg(target_os = "linux")]
+fn prepare_directory_retry(
+    frame: &mut DirectoryFrame,
+    parent: &rustix::fd::OwnedFd,
+    state: &WorkerState,
+    path: &Path,
+    errors: &[DeleteError],
+) -> io::Result<bool> {
+    if !checked_current(parent, &frame.name, frame.captured, state)? {
+        return Ok(false);
+    }
+    retry_operation(state, || {
+        rustix::fs::seek(&frame.fd, rustix::fs::SeekFrom::Start(0))
+    })?;
+    let mut skipped = std::collections::HashSet::new();
+    for error in &errors[frame.errors_at_entry..] {
+        state.check_cancel()?;
+        if let Ok(relative) = error.path.strip_prefix(path)
+            && let Some(Component::Normal(name)) = relative.components().next()
+            && !skipped.contains(name)
+        {
+            skipped.insert(name.to_owned());
+        }
+    }
+    frame.retry_skip = (!skipped.is_empty()).then(|| Box::new(skipped));
+    frame.retried_removal = true;
+    frame.exhausted = false;
+    Ok(true)
+}
+
+/// Consume one whole getdents buffer before suspending its descriptor.
 #[cfg(target_os = "linux")]
 fn read_directory_batch(
-    fd: &rustix::fd::OwnedFd,
+    frame: &mut DirectoryFrame,
     buffer: &mut Vec<u8>,
-    pending: &mut Vec<DirectoryName>,
     state: &WorkerState,
     path: &Path,
     errors: &mut Vec<DeleteError>,
@@ -1146,9 +1264,15 @@ fn read_directory_batch(
     use rustix::fs::{AtFlags, FileType, RawDir, statat};
     use rustix::io::Errno;
     use std::os::unix::ffi::OsStrExt;
-    // The caller drains each batch before reading again. Retain its allocation
-    // for wide directory trees instead of rebuilding it for every getdents call.
-    debug_assert!(pending.is_empty());
+    // The caller drains each batch before reading again. Retain its allocations
+    // for wide directory trees instead of rebuilding them for every getdents.
+    debug_assert!(frame.pending.is_empty());
+    #[cfg(test)]
+    if let Some(hook) = state.read_hook.lock().unwrap().as_mut() {
+        state.check_cancel()?;
+        hook(&frame.name)?;
+    }
+    let fd = &frame.fd;
     loop {
         let capacity = buffer.capacity();
         {
@@ -1161,17 +1285,28 @@ fn read_directory_batch(
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(Errno::INTR) => continue,
-                    Err(Errno::INVAL) if capacity < 1024 * 1024 => break,
+                    Err(Errno::INVAL) if capacity < 1024 * 1024 => {
+                        break;
+                    }
                     Err(error) => {
-                        record_error(errors, path, error.into())?;
-                        return Ok(true);
+                        return Err(error.into());
                     }
                 };
                 let bytes = entry.file_name().to_bytes();
                 if bytes != b"." && bytes != b".." {
+                    let name = std::ffi::OsStr::from_bytes(bytes);
+                    if frame
+                        .retry_skip
+                        .as_ref()
+                        .is_some_and(|skipped| skipped.contains(name))
+                    {
+                        if entries.is_buffer_empty() {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
                     state.examined();
                     let kind = entry.file_type();
-                    let name = std::ffi::OsStr::from_bytes(bytes);
                     let mut is_directory = kind == FileType::Directory;
                     if !is_directory {
                         if let Err(error) = unlink_entry(fd, entry.file_name(), false, state) {
@@ -1196,7 +1331,7 @@ fn read_directory_batch(
                                     Ok(stat) => {
                                         is_directory = FileType::from_raw_mode(stat.st_mode)
                                             == FileType::Directory;
-                                        captured = Some(stat);
+                                        captured = Some(FileIdentity::from_stat(&stat));
                                     }
                                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                                         continue;
@@ -1207,25 +1342,25 @@ fn read_directory_batch(
                                     }
                                 }
                             }
-                            if !is_directory {
-                                if let Err(error) = retry_failed_unlink(
+                            if !is_directory
+                                && let Err(error) = retry_failed_unlink(
                                     fd,
                                     name,
                                     false,
-                                    captured.as_ref(),
+                                    captured,
                                     entry.ino(),
                                     false,
                                     state,
                                     error,
                                     None,
-                                ) {
-                                    record_error(errors, path.join(name), error)?;
-                                }
+                                )
+                            {
+                                record_error(errors, path.join(name), error)?;
                             }
                         }
                     }
                     if is_directory {
-                        pending.push(DirectoryName {
+                        frame.pending.push(DirectoryName {
                             name: name.to_owned(),
                             inode: entry.ino(),
                         });
@@ -1318,14 +1453,14 @@ mod tests {
         use rustix::event::{EventfdFlags, eventfd};
         let completion =
             Arc::new(eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC).unwrap());
-        let finished = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(WorkerState::default());
         let wake = CompletionWake {
             fd: Some(Arc::clone(&completion)),
         };
         let (sender, receiver) = bounded(1);
         let result = std::panic::catch_unwind(|| {
             let _guard = FinishedGuard {
-                finished: Arc::clone(&finished),
+                state: Arc::clone(&state),
                 completion: wake.clone(),
                 sender: Some(sender),
             };
@@ -1336,7 +1471,7 @@ mod tests {
             receiver.try_recv(),
             Err(crossbeam_channel::TryRecvError::Disconnected)
         ));
-        assert!(finished.load(Ordering::Acquire));
+        assert!(state.finished.load(Ordering::Acquire));
         let mut count = [0_u8; 8];
         assert_eq!(
             rustix::io::read(completion.as_ref(), &mut count).unwrap(),
@@ -1344,13 +1479,13 @@ mod tests {
         );
         assert_eq!(u64::from_ne_bytes(count), 1);
         rustix::io::write(completion.as_ref(), &(u64::MAX - 1).to_ne_bytes()).unwrap();
-        finished.store(false, Ordering::Relaxed);
+        state.finished.store(false, Ordering::Relaxed);
         drop(FinishedGuard {
-            finished: Arc::clone(&finished),
+            state: Arc::clone(&state),
             completion: wake,
             sender: None,
         });
-        assert!(finished.load(Ordering::Acquire));
+        assert!(state.finished.load(Ordering::Acquire));
         assert_eq!(
             rustix::io::read(completion.as_ref(), &mut count).unwrap(),
             8
@@ -1582,6 +1717,14 @@ mod tests {
         std::fs::create_dir(work.path().join("target/removable")).unwrap();
         let state = WorkerState::default();
         let mut expected_paths = std::collections::HashSet::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&attempts);
+        *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, _| {
+            if name.as_encoded_bytes().starts_with(b"failure-") {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }));
         for n in 0..512 {
             let relative = format!("target/nested/deeper/failure-{n}");
             let path = work.path().join(&relative);
@@ -1602,6 +1745,7 @@ mod tests {
         let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
         assert!(removal.outcome.is_err());
         assert_eq!(removal.errors.len(), 512);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1024);
         for error in removal.errors {
             assert!(error.path.is_absolute());
             assert!(
@@ -1614,6 +1758,248 @@ mod tests {
         assert!(!work.path().join("target/removable").exists());
         assert_eq!(state.snapshot().removed_entries, 513);
         assert!(work.path().join("target/nested/deeper").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_read_errors_are_reported_only_after_one_retry() {
+        for persistent in [false, true] {
+            let work = fixture();
+            std::fs::create_dir_all(work.path().join("target/flaky")).unwrap();
+            std::fs::write(work.path().join("target/flaky/file"), b"remove").unwrap();
+            std::fs::create_dir(work.path().join("target/sibling")).unwrap();
+            let failures = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&failures);
+            let state = WorkerState::default();
+            *state.read_hook.lock().unwrap() = Some(Box::new(move |name| {
+                if name == "flaky" && (persistent || observed.load(Ordering::Relaxed) == 0) {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    return Err(rustix::io::Errno::IO.into());
+                }
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert_eq!(removal.outcome.is_err(), persistent);
+            assert_eq!(removal.target_removed, !persistent);
+            assert_eq!(removal.errors.len(), usize::from(persistent));
+            assert_eq!(
+                failures.load(Ordering::Relaxed),
+                if persistent { 2 } else { 1 }
+            );
+            assert!(!work.path().join("target/sibling").exists());
+            if persistent {
+                assert_eq!(
+                    removal.errors[0].path,
+                    std::path::absolute(work.path().join("target/flaky")).unwrap()
+                );
+                assert!(work.path().join("target/flaky/file").is_file());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removed_empty_directory_does_not_report_read_failure() {
+        for nested in [false, true] {
+            let work = fixture();
+            let relative = if nested { "target/flaky" } else { "flaky" };
+            std::fs::create_dir_all(work.path().join(relative)).unwrap();
+            if nested {
+                std::fs::create_dir(work.path().join("target/sibling")).unwrap();
+            }
+            let failures = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&failures);
+            let state = WorkerState::default();
+            *state.read_hook.lock().unwrap() = Some(Box::new(move |name| {
+                if name == "flaky" {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    return Err(rustix::io::Errno::IO.into());
+                }
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let requested = if nested { "target" } else { "flaky" };
+            let removal = remove_confirmed(&anchor, Path::new(requested), &state).unwrap();
+            assert_eq!(failures.load(Ordering::Relaxed), 2);
+            assert!(removal.outcome.is_ok());
+            assert!(removal.target_removed);
+            assert!(removal.errors.is_empty());
+            assert!(!work.path().join(requested).exists());
+            assert!(work.path().is_dir());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_unlink_failures_get_exactly_one_retry() {
+        for directory in [false, true] {
+            for nested in [false, true] {
+                let work = fixture();
+                let relative = if nested { "target/flaky" } else { "flaky" };
+                if nested {
+                    std::fs::create_dir(work.path().join("target")).unwrap();
+                }
+                if directory {
+                    std::fs::create_dir(work.path().join(relative)).unwrap();
+                } else {
+                    std::fs::write(work.path().join(relative), b"remove").unwrap();
+                }
+                let attempts = Arc::new(AtomicU64::new(0));
+                let observed = Arc::clone(&attempts);
+                let state = WorkerState::default();
+                *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, _| {
+                    if name == "flaky" && observed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        return Err(rustix::io::Errno::IO.into());
+                    }
+                    Ok(())
+                }));
+                let anchor = RootAnchor::open(work.path()).unwrap();
+                let requested = if nested { "target" } else { "flaky" };
+                let removal = remove_confirmed(&anchor, Path::new(requested), &state).unwrap();
+                assert!(removal.outcome.is_ok(), "{:?}", removal.errors);
+                assert!(removal.target_removed && removal.errors.is_empty());
+                assert_eq!(attempts.load(Ordering::Relaxed), 2);
+                assert!(!work.path().join(requested).exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonempty_directory_is_rescanned_once_without_following_links() {
+        use std::os::unix::fs::symlink;
+        for nested in [false, true] {
+            let work = fixture();
+            let relative = if nested { "target/changing" } else { "target" };
+            let directory = work.path().join(relative);
+            std::fs::create_dir_all(&directory).unwrap();
+            let sentinel = std::path::absolute(work.path().join("sentinel")).unwrap();
+            std::fs::write(&sentinel, b"keep").unwrap();
+            let attempts = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&attempts);
+            let state = WorkerState::default();
+            *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, is_directory| {
+                if is_directory
+                    && name == directory.file_name().unwrap()
+                    && observed.fetch_add(1, Ordering::Relaxed) == 0
+                {
+                    std::fs::create_dir_all(directory.join("late/nested"))?;
+                    std::fs::write(directory.join("late/nested/file"), b"remove")?;
+                    symlink(&sentinel, directory.join("late/link"))?;
+                }
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(removal.outcome.is_ok(), "{:?}", removal.errors);
+            assert!(removal.target_removed && removal.errors.is_empty());
+            assert_eq!(attempts.load(Ordering::Relaxed), 2);
+            assert!(!work.path().join("target").exists());
+            assert_eq!(
+                std::fs::read(work.path().join("sentinel")).unwrap(),
+                b"keep"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_second_nonempty_failure_keeps_only_that_subtree_and_finishes_siblings() {
+        let work = fixture();
+        let changing = work.path().join("target/changing");
+        std::fs::create_dir_all(&changing).unwrap();
+        for n in 0..9 {
+            let sibling = work.path().join(format!("target/sibling-{n}"));
+            std::fs::create_dir(&sibling).unwrap();
+            std::fs::write(sibling.join("file"), b"remove").unwrap();
+        }
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&attempts);
+        let state = WorkerState::default();
+        *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, directory| {
+            if directory && name == "changing" {
+                let attempt = observed.fetch_add(1, Ordering::Relaxed);
+                let late = changing.join(format!("late-{attempt}"));
+                std::fs::create_dir(&late)?;
+                std::fs::write(late.join("file"), b"remove")?;
+            }
+            Ok(())
+        }));
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+        assert!(removal.outcome.is_err() && !removal.target_removed);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(removal.errors.len(), 1);
+        assert_eq!(
+            removal.errors[0].path,
+            std::path::absolute(work.path().join("target/changing")).unwrap()
+        );
+        assert!(!work.path().join("target/changing/late-0").exists());
+        assert!(work.path().join("target/changing/late-1/file").is_file());
+        for n in 0..9 {
+            assert!(!work.path().join(format!("target/sibling-{n}")).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permission_and_nonempty_failures_share_the_two_unlink_attempt_limit() {
+        for permission_first in [false, true] {
+            let work = fixture();
+            let directory = work.path().join("target");
+            std::fs::create_dir(&directory).unwrap();
+            let attempts = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&attempts);
+            let state = WorkerState::default();
+            *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, is_directory| {
+                if is_directory && name == "target" {
+                    let attempt = observed.fetch_add(1, Ordering::Relaxed);
+                    if (attempt == 0) == permission_first {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    std::fs::write(directory.join("late"), b"remove")?;
+                }
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(removal.outcome.is_err() && !removal.target_removed);
+            assert_eq!(attempts.load(Ordering::Relaxed), 2);
+            assert_eq!(removal.errors.len(), 1);
+            assert_eq!(work.path().join("target/late").exists(), permission_first);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_during_a_directory_rescan_stops_before_the_second_rmdir() {
+        let work = fixture();
+        let directory = work.path().join("target");
+        std::fs::create_dir(&directory).unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&attempts);
+        let state = WorkerState::default();
+        state.cancel_after.store(1, Ordering::Relaxed);
+        *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, is_directory| {
+            if is_directory && name == "target" {
+                observed.fetch_add(1, Ordering::Relaxed);
+                std::fs::write(directory.join("late"), b"remove")?;
+            }
+            Ok(())
+        }));
+        let anchor = RootAnchor::open(work.path()).unwrap();
+        let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+        assert_eq!(
+            removal.outcome.unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!removal.target_removed && removal.errors.is_empty());
+        assert!(removal.parent_metadata.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(state.snapshot().removed_entries, 1);
+        assert!(work.path().join("target").is_dir());
+        assert!(!work.path().join("target/late").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -1873,7 +2259,7 @@ mod tests {
             &parent,
             std::ffi::OsStr::new("target"),
             false,
-            Some(&captured),
+            Some(FileIdentity::from_stat(&captured)),
             0,
             true,
             &WorkerState::default(),
@@ -1909,8 +2295,8 @@ mod tests {
         std::fs::write(work.path().join("target/sentinel"), b"keep").unwrap();
         let result = open_checked_directory(
             &parent,
-            std::ffi::OsStr::new("target"),
-            Some(&captured),
+            std::ffi::OsString::from("target"),
+            Some(FileIdentity::from_stat(&captured)),
             0,
             &WorkerState::default(),
         );
@@ -1920,5 +2306,52 @@ mod tests {
             b"keep"
         );
         assert!(work.path().join("original").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_ancestor_removal_discards_only_its_resolved_descendant_errors() {
+        for keep_failed_sibling in [false, true] {
+            let work = fixture();
+            let target = work.path().join("target");
+            let recovered = target.join("recovered");
+            std::fs::create_dir_all(&recovered).unwrap();
+            let vanished = recovered.join("vanished");
+            std::fs::write(&vanished, b"removed externally").unwrap();
+            if keep_failed_sibling {
+                std::fs::write(target.join("retained"), b"still present").unwrap();
+            }
+            let state = WorkerState::default();
+            {
+                let mut failed = state.failed_names.lock().unwrap();
+                failed.insert("vanished".into());
+                failed.insert("retained".into());
+            }
+            *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, directory| {
+                if directory && name == "recovered" {
+                    // Both attempts on this child failed. Another process can
+                    // still remove it before its ancestor's successful rmdir.
+                    std::fs::remove_file(&vanished)?;
+                }
+                Ok(())
+            }));
+            let anchor = RootAnchor::open(work.path()).unwrap();
+            let removal = remove_confirmed(&anchor, Path::new("target"), &state).unwrap();
+            assert!(!recovered.exists());
+            if keep_failed_sibling {
+                assert!(!removal.target_removed);
+                assert!(removal.outcome.is_err());
+                assert_eq!(removal.errors.len(), 1);
+                assert_eq!(
+                    removal.errors[0].path,
+                    std::path::absolute(target.join("retained")).unwrap()
+                );
+            } else {
+                assert!(removal.target_removed);
+                assert!(removal.outcome.is_ok());
+                assert!(removal.errors.is_empty());
+                assert!(!target.exists());
+            }
+        }
     }
 }
