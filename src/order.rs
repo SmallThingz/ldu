@@ -921,8 +921,19 @@ impl CacheState {
                             .or_insert_with(|| CachedDirectory::new(self.config));
                         let visible = self.config.show_hidden
                             || !row.name.as_encoded_bytes().starts_with(b".");
-                        match directory.order.rows.entry(row.id) {
+                        let order_changed = match directory.order.rows.entry(row.id) {
                             Entry::Occupied(mut entry) => {
+                                let previous = &entry.get().row;
+                                // Snapshots contain IDs and positions only. Keep all
+                                // metadata current without rebuilding an unchanged order.
+                                // Names and kinds also affect filtered membership.
+                                let order_changed = previous.name != row.name
+                                    || previous.kind != row.kind
+                                    || match self.config.sort_mode {
+                                        SortMode::Size => previous.size != row.size,
+                                        SortMode::Items => previous.items != row.items,
+                                        SortMode::Name => false,
+                                    };
                                 let previous_visible = self.config.show_hidden
                                     || !entry.get().row.name.as_encoded_bytes().starts_with(b".");
                                 directory.visible_count -= usize::from(previous_visible);
@@ -933,15 +944,19 @@ impl CacheState {
                                 directory.directory_count +=
                                     usize::from(visible && row.kind == NodeKind::Directory);
                                 entry.get_mut().row = row;
+                                order_changed
                             }
                             Entry::Vacant(entry) => {
                                 directory.visible_count += usize::from(visible);
                                 directory.directory_count +=
                                     usize::from(visible && row.kind == NodeKind::Directory);
                                 entry.insert(RowState { row, rank: None });
+                                true
                             }
+                        };
+                        if order_changed {
+                            self.mark_dirty(parent);
                         }
-                        self.mark_dirty(parent);
                     }
                 }
             }
@@ -1090,18 +1105,33 @@ fn run_cache(
     let mut filtering = FilterState::default();
     while !stop.load(AtomicOrdering::Acquire) {
         let timeout = if filtering.task.is_some() {
-            Duration::ZERO
+            Some(Duration::ZERO)
+        } else if state.dirty.is_empty()
+            && state.cleanup.is_empty()
+            && state.retired_rows.is_empty()
+            && state.retired.is_empty()
+            && state.retired_indices.is_empty()
+        {
+            // No deadline or reclamation remains. Updates and filter changes
+            // send commands; dropping the owner disconnects the only sender.
+            None
         } else if state.dirty.is_empty()
             && state.cleanup.is_empty()
             && state.retired_rows.is_empty()
             && state.retired.len() <= MAX_DRAIN
             && state.retired_indices.len() <= MAX_DRAIN
         {
-            SORT_INTERVAL
+            Some(SORT_INTERVAL)
         } else {
-            Duration::from_millis(2)
+            Some(Duration::from_millis(2))
         };
-        match commands.recv_timeout(timeout) {
+        let received = match timeout {
+            Some(timeout) => commands.recv_timeout(timeout),
+            None => commands
+                .recv()
+                .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
+        };
+        match received {
             Ok(command) => {
                 state.apply(command, &cache);
                 for _ in 0..MAX_DRAIN {
@@ -1190,6 +1220,211 @@ mod tests {
             &cache,
         );
         (state, cache)
+    }
+
+    #[test]
+    fn name_sort_reuses_snapshots_but_retains_updated_metrics() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Configure {
+                generation: 1,
+                config: OrderConfig {
+                    sort_mode: SortMode::Name,
+                    descending: false,
+                    ..OrderConfig::default()
+                },
+                clear: false,
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(ROOT), 1, "alpha", 10, NodeKind::File),
+                    cache_row(Some(ROOT), 2, "beta", 20, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let original = Arc::clone(&cache.load_full()[&ROOT]);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "alpha", false);
+        let filtered = finish_filter(&mut filtering, &mut state, &mailbox);
+        let mut updated = cache_row(Some(ROOT), 1, "alpha", 1000, NodeKind::File);
+        updated.row.sizes.apparent = 2000;
+        updated.row.items = 50;
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![updated],
+            },
+            &cache,
+        );
+        assert!(!state.directories[&ROOT].order.dirty);
+        assert!(Arc::ptr_eq(&original, &cache.load_full()[&ROOT]));
+        let same_filter = finish_filter(&mut filtering, &mut state, &mailbox);
+        assert!(Arc::ptr_eq(&filtered, &same_filter));
+        for (generation, sort_mode, size_mode) in [
+            (2, SortMode::Size, SizeMode::Allocated),
+            (3, SortMode::Size, SizeMode::Apparent),
+            (4, SortMode::Items, SizeMode::Allocated),
+        ] {
+            state.apply(
+                CacheCommand::Configure {
+                    generation,
+                    config: OrderConfig {
+                        sort_mode,
+                        size_mode,
+                        ..OrderConfig::default()
+                    },
+                    clear: false,
+                },
+                &cache,
+            );
+            state.publish(ROOT, &cache);
+            assert_eq!(cache.load_full()[&ROOT].ids, [1, 2]);
+        }
+    }
+
+    #[test]
+    fn active_order_metrics_republish_and_duplicate_rows_do_not() {
+        for sort_mode in [SortMode::Size, SortMode::Items, SortMode::Name] {
+            let (mut state, cache) = cache_state();
+            state.apply(
+                CacheCommand::Configure {
+                    generation: 1,
+                    config: OrderConfig {
+                        sort_mode,
+                        ..OrderConfig::default()
+                    },
+                    clear: false,
+                },
+                &cache,
+            );
+            let mut first = cache_row(Some(ROOT), 1, "alpha", 10, NodeKind::File);
+            first.row.items = 1;
+            let mut second = cache_row(Some(ROOT), 2, "beta", 20, NodeKind::File);
+            second.row.items = 2;
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![first.clone(), second],
+                },
+                &cache,
+            );
+            state.publish(ROOT, &cache);
+            let original = Arc::clone(&cache.load_full()[&ROOT]);
+            assert_eq!(original.ids, [2, 1]);
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![first.clone()],
+                },
+                &cache,
+            );
+            assert!(!state.directories[&ROOT].order.dirty);
+            match sort_mode {
+                SortMode::Size => first.row.sizes.allocated = 1000,
+                SortMode::Items => first.row.items = 1000,
+                SortMode::Name => first.row.name = Arc::from(OsStr::new("zeta")),
+            }
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![first],
+                },
+                &cache,
+            );
+            assert!(state.directories[&ROOT].order.dirty);
+            state.publish(ROOT, &cache);
+            let updated = Arc::clone(&cache.load_full()[&ROOT]);
+            assert!(!Arc::ptr_eq(&original, &updated));
+            assert_eq!(updated.ids, [1, 2]);
+        }
+    }
+
+    #[test]
+    fn kind_and_membership_changes_refresh_filtered_order() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Configure {
+                generation: 1,
+                config: OrderConfig {
+                    sort_mode: SortMode::Name,
+                    descending: false,
+                    show_hidden: false,
+                    ..OrderConfig::default()
+                },
+                clear: false,
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "alpha", 10, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "a", true);
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "alpha", 10, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [1]);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 2, "beta", 20, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert_eq!(
+            finish_filter(&mut filtering, &mut state, &mailbox).ids,
+            [1, 2]
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, ".alpha", 10, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [2]);
+        state.apply(
+            CacheCommand::Remove {
+                generation: 1,
+                ids: vec![2],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1439,6 +1674,53 @@ mod tests {
                 assert!(!clear);
             }
             _ => panic!("display change was not retried"),
+        }
+    }
+
+    #[test]
+    fn settled_worker_wakes_for_filters_and_stops_when_owner_drops() {
+        let mut worker = CachedOrderWorker::new().unwrap();
+        worker
+            .try_upsert(vec![cache_row(Some(ROOT), 1, "alpha", 10, NodeKind::File)])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.snapshot(ROOT).is_none() {
+            assert!(Instant::now() < deadline, "initial order was not published");
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.set_filter(ROOT, "alpha", false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(view) = worker.filtered_snapshot(ROOT) {
+                assert_eq!(view.ids, [1]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "filter request did not wake the worker"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.clear_filter();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.filter.snapshot.load().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "clearing the filter did not wake the worker"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The thread holds the remaining mailbox owner until run_cache returns.
+        // A stop flag alone cannot wake an indefinitely blocked receiver.
+        let mailbox = Arc::downgrade(&worker.filter);
+        drop(worker);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mailbox.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "dropping the owner left the worker blocked"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
