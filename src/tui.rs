@@ -4850,7 +4850,8 @@ impl App {
                 if self.mouse_press_view.is_some() || self.has_held_mouse() {
                     self.finish_mouse_for_input();
                 }
-                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && !mouse.modifiers.contains(KeyModifiers::CONTROL);
                 if shift || self.visual.active() {
                     if !self.visual.active() {
                         let pending = self.pending_navigation.is_some();

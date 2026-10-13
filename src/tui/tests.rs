@@ -7946,6 +7946,124 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
 }
 
 #[test]
+fn normal_control_gestures_ignore_shift_without_marking_the_old_cursor() {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for (origin, lead, intermediate) in [
+            (3, 3, None),
+            (3, 7, Some(5)),
+            (7, 3, Some(5)),
+            (3, 7, None),
+            (7, 3, None),
+        ] {
+            for pump_press in [false, true] {
+                let mut app = navigation_fixture(12, 13..=13);
+                // Keyboard navigation can leave the cursor away from a stationary pointer.
+                // Keep it outside the drag interval so an accidental mark cannot hide.
+                app.selected = Some(11);
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                let event = |kind, id, modifiers| MouseEvent {
+                    kind,
+                    column: 35,
+                    row: app.list_area.y
+                        + app.painted_rows.iter().position(|&row| row == id).unwrap() as u16,
+                    modifiers,
+                };
+                let press = event(MouseEventKind::Down(MouseButton::Left), origin, modifiers);
+                let drag = intermediate.map(|id| {
+                    event(
+                        MouseEventKind::Drag(MouseButton::Left),
+                        id,
+                        KeyModifiers::SHIFT,
+                    )
+                });
+                let release = event(
+                    MouseEventKind::Up(MouseButton::Left),
+                    lead,
+                    KeyModifiers::SHIFT,
+                );
+                app.mouse(press);
+                if pump_press {
+                    app.pump_visual();
+                    terminal
+                        .draw(|frame| app.draw(frame, false, false))
+                        .unwrap();
+                }
+                assert!(
+                    app.visual.is_empty(),
+                    "press marked the old cursor: {modifiers:?}"
+                );
+                assert!(
+                    !app.visual.active(),
+                    "Ctrl press must retain normal click behavior"
+                );
+                if let Some(drag) = drag {
+                    app.mouse(drag);
+                    app.pump_visual();
+                    terminal
+                        .draw(|frame| app.draw(frame, false, false))
+                        .unwrap();
+                }
+                app.mouse(release);
+                finish_visual(&mut app);
+                assert!(
+                    app.visual.is_empty(),
+                    "{modifiers:?}: {origin} -> {lead}, intermediate={intermediate:?}, pump_press={pump_press}"
+                );
+                assert_eq!(app.visual.active(), origin != lead);
+                assert_eq!(app.selected, Some(lead));
+                assert_eq!(app.directory, ROOT);
+                assert!(app.mouse_press_view.is_none() && app.mouse_baseline.is_none());
+                assert!(!app.has_held_mouse() && !app.mouse_dragging && app.drag_scroll.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn normal_control_shift_directory_click_matches_control_click() {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        let mut app = browser_fixture();
+        app.selected = Some(2);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let row = app.list_area.y + app.painted_rows.iter().position(|&id| id == 1).unwrap() as u16;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 35,
+            row,
+            modifiers,
+        };
+        app.mouse(press);
+        app.pump_visual();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(app.directory, ROOT, "press must not navigate");
+        assert!(app.visual.is_empty() && !app.visual.active());
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            modifiers: KeyModifiers::NONE,
+            ..press
+        });
+        assert_eq!(app.directory, 1, "{modifiers:?}");
+        assert!(app.visual.is_empty() && !app.visual.active());
+        assert!(app.mouse_press_view.is_none() && app.normal_click.is_none());
+    }
+}
+
+#[test]
 fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
     for (button, release_only) in [
         (MouseButton::Left, false),
@@ -7960,8 +8078,8 @@ fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
                 KeyModifiers::SHIFT,
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ] {
-                if !existing && modifiers.contains(KeyModifiers::SHIFT) {
-                    continue; // Normal Shift gestures retain their separate range-anchor behavior.
+                if !existing && modifiers == KeyModifiers::SHIFT {
+                    continue; // Pure Shift retains its separate normal-mode range-anchor behavior.
                 }
                 let mut app = navigation_fixture(12, 13..=13);
                 app.selected = Some(3);
