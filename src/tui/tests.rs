@@ -1,5 +1,11 @@
 use super::*;
-#[cfg(target_os = "linux")]
+
+fn filesystem_fixture() -> tempfile::TempDir {
+    std::fs::create_dir_all(".tmp").unwrap();
+    tempfile::tempdir_in(".tmp").unwrap()
+}
+
+#[cfg(unix)]
 fn test_confirmed_target() -> ConfirmedTarget {
     let anchor = RootAnchor::open(std::path::Path::new(".")).unwrap();
     delete::capture(&anchor, std::path::Path::new("unmodified-test-target")).unwrap()
@@ -172,7 +178,7 @@ fn info_long_spaced_unicode_path_scrolls_without_losing_title_or_close_hint() {
     assert_eq!(rendered(&terminal), first);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn delete_long_spaced_target_can_scroll_to_last_component_with_pinned_choices() {
     let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
@@ -255,7 +261,7 @@ fn header_clipping_preserves_graphemes_and_column_budget() {
     assert_eq!(clipped, "1\u{fe0f}\u{20e3}…");
     assert!(Line::from(clipped).width() <= 4);
 }
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
     for key in [KeyCode::Enter, KeyCode::Char('y')] {
@@ -351,7 +357,7 @@ fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn guarded_delete_capture(
     app: &mut App,
     until: Instant,
@@ -437,7 +443,7 @@ fn hover_guard_uses_configured_window_and_zero_disables_it() {
     assert!(app.mouse_delete_guard(2, changed).is_none());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn guarded_delete_discards_early_confirmation_before_or_after_capture_arrives() {
     for warning in [false, true] {
@@ -492,7 +498,7 @@ fn guarded_delete_discards_early_confirmation_before_or_after_capture_arrives() 
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn expired_hover_guard_keeps_fresh_confirmation_while_capture_finishes() {
     let mut app = browser_fixture();
@@ -535,7 +541,7 @@ fn expired_hover_guard_keeps_fresh_confirmation_while_capture_finishes() {
     assert!(matches!(app.take_ready_confirmation(), Action::Continue));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn guarded_delete_can_cancel_immediately_by_key_option_or_close() {
     for cancellation in 0..4 {
@@ -569,7 +575,7 @@ fn guarded_delete_can_cancel_immediately_by_key_option_or_close() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn quit_question_keeps_guard_with_target_without_blocking_quit_or_retaining_enter() {
     for approve in [false, true] {
@@ -693,11 +699,10 @@ fn recent_hover_does_not_lock_visual_confirmation_or_the_queue() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn hover_guard_stays_with_deferred_delete_target_when_capture_worker_is_busy() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("root-file"), b"target").unwrap();
     let mut app = browser_fixture_at(fixture.path().to_path_buf());
     app.selected = Some(2);
@@ -749,11 +754,10 @@ fn hover_guard_stays_with_deferred_delete_target_when_capture_worker_is_busy() {
     assert!(app.modal.is_none() && app.delete_guard_deadline().is_none());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn display_toggles_and_help_preserve_recent_hover_guard_for_delete() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("root-file"), b"target").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     for code in ['g', 'c', 'b', '?'] {
@@ -840,7 +844,7 @@ fn disabled_mouse_ignores_hover_wheel_and_selection_gestures() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn guarded_warning_tints_blank_cells_and_popup_and_can_be_suppressed() {
     for warning in [false, true] {
@@ -907,7 +911,7 @@ fn guarded_warning_tints_blank_cells_and_popup_and_can_be_suppressed() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn mouse_press_during_guard_cannot_confirm_when_released_after_expiry() {
     for paint_guard in [false, true] {
@@ -1047,7 +1051,7 @@ fn pending_batch_confirmation_advances_once_after_identity_checks() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
     for (width, height) in [(80, 4), (38, 6)] {
@@ -1658,7 +1662,7 @@ fn parent_selection_validation_waits_after_membership_and_sort_changes() {
     assert_eq!(app.visual.len(), 1023);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn parent_selection_retains_confirmation_until_late_marks_have_a_sorted_order() {
     let mut app = navigation_fixture(1024, 1025..=1025);
@@ -2316,8 +2320,7 @@ fn idle_frame_gate_observes_late_main_and_directory_preview_orders() {
 
 #[test]
 fn preview_published_after_frame_observation_still_requests_a_frame() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("root-file"), "late preview").unwrap();
     let mut app = finished_frame_fixture(fixture.path().to_owned());
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
@@ -2337,7 +2340,7 @@ fn preview_published_after_frame_observation_still_requests_a_frame() {
     assert!(!gate.needs_frame(&app));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn busy_queue_still_allows_reviewable_delete_confirmation() {
     let mut app = browser_fixture();
@@ -2451,7 +2454,7 @@ fn ctrl_c_remains_available_while_stopping() {
     ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn queue_mouse_fixture(count: u32, area: Rect) -> (App, DeleteQueue, Vec<QueueId>) {
     let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
     let mut queue = DeleteQueue::new().unwrap();
@@ -2476,7 +2479,7 @@ fn queue_mouse_fixture(count: u32, area: Rect) -> (App, DeleteQueue, Vec<QueueId
     (app, queue, ids)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_mouse_reorders_painted_waiting_jobs_in_both_directions() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2545,7 +2548,7 @@ fn queue_mouse_reorders_painted_waiting_jobs_in_both_directions() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2592,7 +2595,7 @@ fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
     assert!(app.queue_drag.is_none());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_mouse_rejects_stale_rows_and_cancels_on_keys_resize_and_close() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2654,7 +2657,7 @@ fn queue_mouse_rejects_stale_rows_and_cancels_on_keys_resize_and_close() {
     assert!(app.queue_drag.is_none());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_mouse_hover_click_and_right_click_follow_painted_jobs() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2705,7 +2708,7 @@ fn queue_mouse_hover_click_and_right_click_follow_painted_jobs() {
     ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_click_actions_require_matching_unchanged_release_and_never_follow_drag() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2788,7 +2791,7 @@ fn queue_click_actions_require_matching_unchanged_release_and_never_follow_drag(
     assert!(queue.is_paused());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_wheel_scrolls_over_summary_and_footer_but_not_outside_popup() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2827,7 +2830,7 @@ fn queue_wheel_scrolls_over_summary_and_footer_but_not_outside_popup() {
     assert!(queue.is_paused());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_scroll_indicator_preserves_endpoints_without_walking_the_queue() {
     let area = Rect::new(0, 0, 100, 24);
@@ -2846,7 +2849,7 @@ fn queue_scroll_indicator_preserves_endpoints_without_walking_the_queue() {
     assert_eq!(app.queue_view.scroll_position, 0);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queue_selection_follows_job_identity_after_reorder_and_neighbor_removal() {
     let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
@@ -2891,7 +2894,7 @@ fn queue_selection_follows_job_identity_after_reorder_and_neighbor_removal() {
     assert!(!screen.contains("Esc: close"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn paused_queue_resize_paints_current_capacity_without_an_idle_correction() {
     fn paint(
@@ -3023,7 +3026,7 @@ fn refresh_keys_target_only_the_selected_folder_or_current_directory() {
     assert_eq!(app.directory, 1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn single_target_capture_admission_survives_confirmation_cancellation() {
     let mut app = browser_fixture();
@@ -3076,7 +3079,7 @@ fn single_target_capture_admission_survives_confirmation_cancellation() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn deferred_single_target_retry_keeps_its_target_and_respects_cancellation() {
     let mut app = browser_fixture();
@@ -3203,7 +3206,7 @@ fn refreshed_directory_auto_selection_requests_native_priority_without_initial_s
     assert_eq!(app.scan_focus(), Some(rediscovered));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn cancelled_batch_must_retire_before_another_capture_worker_is_admitted() {
     let mut app = browser_fixture();
@@ -3277,11 +3280,10 @@ fn cancelled_batch_must_retire_before_another_capture_worker_is_admitted() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn background_delete_failure_preserves_batch_cancellation_and_retry() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let target = fixture.path().join("root-file");
     std::fs::write(&target, b"retained").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
@@ -3386,12 +3388,12 @@ fn background_delete_failure_preserves_batch_cancellation_and_retry() {
     queue.cancel_all();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn approved_quit_cancels_direct_and_queued_parent_requests_before_scan_completion() {
     for direct in [false, true] {
         for header in [false, true] {
-            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            let fixture = filesystem_fixture();
             std::fs::write(fixture.path().join("retained"), b"paused").unwrap();
             let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
             let mut queue = DeleteQueue::new().unwrap();
@@ -3466,7 +3468,7 @@ fn approved_quit_cancels_direct_and_queued_parent_requests_before_scan_completio
 
 #[test]
 fn immediate_shutdown_cancels_parent_work_on_an_already_stopped_listing() {
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
     let mut queue = DeleteQueue::new().unwrap();
     let mut app = navigation_fixture(1024, 1025..=1025);
@@ -3540,10 +3542,10 @@ fn declined_header_quit_keeps_pending_parent_selection_and_late_children() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn quit_warning_retires_unconfirmed_batch_while_confirmed_queue_finishes() {
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::create_dir(fixture.path().join("folder")).unwrap();
     std::fs::write(fixture.path().join("root-file"), b"confirmed").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
@@ -3599,11 +3601,11 @@ fn quit_warning_retires_unconfirmed_batch_while_confirmed_queue_finishes() {
     assert!(matches!(app.modal, Some(Modal::Quit { .. })));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn quit_warning_preserves_confirmed_admission_and_clears_later_requests() {
     for dispatching in [false, true] {
-        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let fixture = filesystem_fixture();
         std::fs::write(fixture.path().join("root-file"), b"retained").unwrap();
         let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
         let mut app = browser_fixture_at(fixture.path().to_owned());
@@ -3740,11 +3742,10 @@ fn confirmed_batch_admission_blocks_bypass_keys_and_guards_quit_immediately() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn batch_final_events_after_empty_observation_reach_the_fifo() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
     let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
@@ -3852,11 +3853,10 @@ fn batch_final_events_after_empty_observation_reach_the_fifo() {
     queue.cancel_all();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn cancelled_batch_retires_large_published_failures_without_dropping_them() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
     app.modal = Some(Modal::Enqueueing);
@@ -3907,10 +3907,10 @@ fn cancelled_batch_retires_large_published_failures_without_dropping_them() {
     assert!(app.retired_delete_notices.is_empty());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
     for state in 0..4 {
@@ -3999,13 +3999,12 @@ fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn bounded_batch_admission_keeps_fifo_prefix_cancellation_and_quit_state() {
     const COUNT: NodeId = 256;
     for outcome in 0..4 {
-        std::fs::create_dir_all(".tmp").unwrap();
-        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let fixture = filesystem_fixture();
         let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
         let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
         let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
@@ -4449,12 +4448,12 @@ fn visual_aliases_mark_and_batch_without_affecting_normal_queue_keys() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn directory_removal_cancels_retained_batch_inside_header_quit_question() {
     for deferred in [false, true] {
         for close in [false, true] {
-            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            let fixture = filesystem_fixture();
             std::fs::create_dir(fixture.path().join("folder")).unwrap();
             let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
             let mut app = browser_fixture_at(fixture.path().to_owned());
@@ -4511,7 +4510,7 @@ fn directory_removal_cancels_retained_batch_inside_header_quit_question() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn pending_batch_waits_for_prior_input_and_supports_cancel_epoch_and_quit() {
     for delete in [KeyCode::Char('d'), KeyCode::Char('D'), KeyCode::Delete] {
@@ -4919,7 +4918,7 @@ fn pending_visual_inputs_preserve_toggle_navigation_and_click_order() {
     assert_eq!(app.selected, Some(3));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn queued_visual_cursor_changes_block_target_actions_but_stable_toggles_do_not() {
     for code in [
@@ -5997,11 +5996,10 @@ fn blocked_refresh_retries_finish_one_bounded_pass_and_rearm_on_changes() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn paused_overlap_refresh_sleeps_then_admits_new_and_unblocked_scopes() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::create_dir(fixture.path().join("blocked")).unwrap();
     std::fs::create_dir(fixture.path().join("fresh")).unwrap();
     let options = ScanOptions {
@@ -6157,13 +6155,12 @@ fn paused_overlap_refresh_sleeps_then_admits_new_and_unblocked_scopes() {
     assert!(fixture.path().join("blocked").is_dir());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn manual_refresh_after_cancelled_quit_restores_survivor_reconciliation() {
-    std::fs::create_dir_all(".tmp").unwrap();
     for key in ['r', 'R'] {
         for blocked in [false, true] {
-            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            let fixture = filesystem_fixture();
             for name in ["manual", "survivors"] {
                 std::fs::create_dir(fixture.path().join(name)).unwrap();
             }
@@ -6369,11 +6366,11 @@ fn manual_refresh_after_cancelled_quit_restores_survivor_reconciliation() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn failed_directory_refresh_backlog_preserves_later_confirmed_deletion() {
     const COUNT: NodeId = 8192;
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("later"), b"confirmed later job").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
@@ -8555,9 +8552,9 @@ fn entering_visual_with_shift_mouse_waits_for_normal_navigation() {
                     if dragged { lead_row } else { pressed_row },
                     KeyModifiers::NONE,
                 ));
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 let (mut batch, mut retired) = (None, VecDeque::new());
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 if pending {
                     assert!(matches!(
                         app.key(
@@ -8582,7 +8579,7 @@ fn entering_visual_with_shift_mouse_waits_for_normal_navigation() {
                     "{name}, dragged={dragged}, pending={pending}"
                 );
                 assert_eq!(app.selected, Some(if dragged { lead } else { pressed }));
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 if pending {
                     resume_batch(&mut app, &mut batch, &retired);
                     assert_eq!(batch.as_ref().unwrap().remaining, app.visual.snapshot());
@@ -9108,7 +9105,7 @@ fn incremental_delete_preserves_folder_neighbor_and_live_scan_without_success_di
     assert_eq!(app.selected, Some(2));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn removal_invalidates_visible_and_suspended_target_dialogs_only() {
     for suspended in [false, true] {
@@ -9271,7 +9268,7 @@ fn preview_layout_scales_and_keeps_mouse_hits_in_the_main_pane() {
 
 #[test]
 fn file_preview_is_async_clears_old_text_and_stops_on_narrow_resize() {
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(
         fixture.path().join("root-file"),
         "preview hello\nsecond line\n",
@@ -9379,7 +9376,7 @@ fn file_preview_is_async_clears_old_text_and_stops_on_narrow_resize() {
 #[cfg(unix)]
 #[test]
 fn symlink_preview_shows_only_wrapped_destination_and_obeys_request_gates() {
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("root-file"), "PRIVATE-FILE-CONTENTS").unwrap();
     std::fs::create_dir(fixture.path().join("folder")).unwrap();
     std::fs::write(
@@ -9519,7 +9516,7 @@ fn symlink_preview_shows_only_wrapped_destination_and_obeys_request_gates() {
 #[test]
 fn refreshed_directory_replacement_switches_to_file_or_link_preview() {
     for kind in [NodeKind::File, NodeKind::Symlink] {
-        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let fixture = filesystem_fixture();
         let path = fixture.path().join("folder");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("remove-me"), "old child").unwrap();
@@ -9980,8 +9977,7 @@ fn empty_startup_navigation_settles_on_scan_completion_errors_and_leaf_roots() {
 
 #[test]
 fn cold_entry_with_pending_movement_prioritizes_the_folder_then_its_selected_child() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     let mut app = browser_fixture_at(fixture.path().to_owned());
     app.directory = 1;
     app.selected = Some(5);
@@ -11105,11 +11101,10 @@ fn compact_header_retains_trailing_path_help_and_integrated_queue_key() {
     assert!(!header.contains("D queue") && !header.contains("v select"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
-    std::fs::create_dir_all(".tmp").unwrap();
-    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let fixture = filesystem_fixture();
     std::fs::write(fixture.path().join("root-file"), b"retained").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let mut app = browser_fixture_at(fixture.path().to_owned());

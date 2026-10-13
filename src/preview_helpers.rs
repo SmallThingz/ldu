@@ -1,4 +1,6 @@
 //! Fixed, read-only system previews. Runs only on the latest-preview worker.
+//! Requires non-reaping child status checks so process-group ownership survives
+//! until descendants are stopped. Unsupported platforms retain file details.
 use super::{FileContents, READ_LIMIT, archive_magic, text_contents};
 use std::{
     ffi::OsString,
@@ -596,6 +598,33 @@ mod tests {
         assert_eq!(result.kind, "Archive");
         assert_eq!(result.text.as_deref(), Some("PK\\u{3}\\u{4}anchored\n"));
         assert!(!result.truncated);
+    }
+
+    #[test]
+    fn helper_descriptor_path_reads_the_opened_file_after_path_replacement() {
+        let (directory, executable, input) = fixture("/bin/cat \"$1\"");
+        let original = directory.path().join("input");
+        std::fs::rename(&original, directory.path().join("moved")).unwrap();
+        std::fs::write(&original, b"replacement must not be read").unwrap();
+        let result = run(
+            &executable,
+            &["/dev/fd/0"],
+            input,
+            std::ffi::OsStr::new(""),
+            &AtomicBool::new(false),
+            Instant::now() + TIME_LIMIT,
+            &Control::default(),
+        )
+        .unwrap();
+        // BSD systems may omit the fd filesystem. Such helpers must fail closed
+        // and leave archive details available, never reopen the display path.
+        if Path::new("/dev/fd").is_dir() {
+            let (bytes, truncated) = result.expect("descriptor path must be usable");
+            assert_eq!(bytes, b"PK\x03\x04anchored\n");
+            assert!(!truncated);
+        } else {
+            assert!(result.is_none());
+        }
     }
 
     #[test]

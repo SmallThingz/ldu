@@ -4,7 +4,12 @@ use crate::{
     types::{NodeId, NodeKind},
 };
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
 #[path = "preview_helpers.rs"]
 mod helpers;
 use arc_swap::ArcSwapOption;
@@ -44,7 +49,13 @@ pub struct FilePreview {
     result: Arc<ArcSwapOption<FileContents>>,
     wake: Sender<()>,
     revision: u64,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    stopped: bool,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     helper_control: Arc<helpers::Control>,
 }
 
@@ -55,14 +66,29 @@ impl FilePreview {
         let (wake, receiver) = bounded(1);
         let requests = Arc::clone(&request);
         let results = Arc::clone(&result);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
         let helper_control = Arc::new(helpers::Control::default());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
         let control = Arc::clone(&helper_control);
         std::thread::Builder::new()
             .name("ldu-preview".into())
             .spawn(move || {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 let mut helpers = None;
                 while receiver.recv().is_ok() {
                     let Some(request) = requests.load_full() else {
@@ -77,9 +103,19 @@ impl FilePreview {
                     }
                     let mut contents = read_contents(
                         &request,
-                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "dragonfly"
+                        ))]
                         &mut helpers,
-                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "dragonfly"
+                        ))]
                         &control,
                     )
                     .unwrap_or(FileContents {
@@ -104,7 +140,13 @@ impl FilePreview {
             result,
             wake,
             revision: 0,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            stopped: false,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "dragonfly"
+            ))]
             helper_control,
         })
     }
@@ -127,8 +169,7 @@ impl FilePreview {
         relative: PathBuf,
         kind: NodeKind,
     ) {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if self.helper_control.is_shutdown() {
+        if self.stopped {
             return;
         }
         if self.matches(id, kind) {
@@ -150,7 +191,12 @@ impl FilePreview {
     pub fn clear(&mut self) {
         if let Some(previous) = self.request.swap(None) {
             previous.cancelled.store(true, Ordering::Relaxed);
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "dragonfly"
+            ))]
             self.helper_control.cancel();
         }
         self.result.store(None);
@@ -159,8 +205,14 @@ impl FilePreview {
     /// Stop future helper launches and synchronously signal any owned helper.
     /// Never wait for a filesystem operation, process spawn, worker, or process reap.
     pub fn shutdown(&mut self) {
+        self.stopped = true;
         self.clear();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
         self.helper_control.shutdown();
     }
 
@@ -214,56 +266,10 @@ fn open_parent(request: &Request) -> io::Result<rustix::fd::OwnedFd> {
     {
         return Err(io::Error::other("invalid preview path"));
     }
-    #[cfg(not(target_os = "linux"))]
-    use rustix::fs::{Mode, OFlags, openat};
     cancelled(request)?;
-    #[cfg(target_os = "linux")]
     let parent = request
         .anchor
         .open_parent_cancellable(&request.relative, &request.cancelled)?;
-    #[cfg(not(target_os = "linux"))]
-    let parent = {
-        use std::path::{Component, Path};
-        let root = request.anchor.root_path();
-        let mut fd = rustix::fs::open(
-            if root.is_absolute() { "/" } else { "." },
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?;
-        for part in root.components() {
-            let name = match part {
-                Component::Normal(name) => name,
-                Component::ParentDir => std::ffi::OsStr::new(".."),
-                Component::RootDir | Component::CurDir => continue,
-                _ => return Err(io::Error::other("invalid scan root")),
-            };
-            cancelled(request)?;
-            fd = openat(
-                &fd,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
-        }
-        for part in request
-            .relative
-            .parent()
-            .unwrap_or(Path::new(""))
-            .components()
-        {
-            let Component::Normal(name) = part else {
-                return Err(io::Error::other("invalid preview path"));
-            };
-            cancelled(request)?;
-            fd = openat(
-                &fd,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
-        }
-        fd
-    };
     Ok(parent)
 }
 
@@ -386,8 +392,20 @@ fn escape_path(mut bytes: &[u8]) -> (String, bool) {
 
 fn read_contents(
     request: &Request,
-    #[cfg(any(target_os = "linux", target_os = "macos"))] helpers: &mut Option<helpers::Catalog>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))] control: &helpers::Control,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    helpers: &mut Option<helpers::Catalog>,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    control: &helpers::Control,
 ) -> io::Result<FileContents> {
     cancelled(request)?;
     if request.kind == NodeKind::Symlink {
@@ -398,7 +416,12 @@ fn read_contents(
     }
     let (mut file, length) = open_file(request)?;
     let (bytes, truncated) = read_prefix(&mut file, length, || cancelled(request))?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     if let Some(contents) = helpers::preview(
         &mut file,
         &bytes,
@@ -732,9 +755,19 @@ mod tests {
             assert!(
                 read_contents(
                     &request,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &mut Some(helpers::Catalog::empty()),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &helpers::Control::default()
                 )
                 .is_err(),
@@ -766,17 +799,31 @@ mod tests {
         assert_eq!(contents.text.as_deref(), Some("last"));
         assert!(preview.snapshot_matches(Some(&contents)));
         assert!(!preview.snapshot_matches(None));
-        #[cfg(target_os = "linux")]
         {
             std::fs::rename(&root, directory.path().join("moved")).unwrap();
             std::fs::create_dir(&root).unwrap();
             std::fs::write(root.join("last"), "replacement").unwrap();
+            #[cfg(not(target_vendor = "apple"))]
             rustix::fs::mkfifoat(
                 rustix::fs::CWD,
                 directory.path().join("moved/fifo"),
                 rustix::fs::Mode::RUSR,
             )
             .unwrap();
+            #[cfg(target_vendor = "apple")]
+            {
+                // Keep FIFO rejection covered without unsafe Darwin syscall glue.
+                let output = std::process::Command::new("mkfifo")
+                    .args(["-m", "400"])
+                    .arg(directory.path().join("moved/fifo"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "mkfifo failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             let request = Request {
                 id: 3,
                 revision: 3,
@@ -788,9 +835,19 @@ mod tests {
             assert_eq!(
                 read_contents(
                     &request,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &mut Some(helpers::Catalog::empty()),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &helpers::Control::default()
                 )
                 .unwrap()
@@ -805,9 +862,19 @@ mod tests {
             assert!(
                 read_contents(
                     &request,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &mut Some(helpers::Catalog::empty()),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &helpers::Control::default()
                 )
                 .is_err()
@@ -816,9 +883,19 @@ mod tests {
             assert_eq!(
                 read_contents(
                     &request,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &mut Some(helpers::Catalog::empty()),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &helpers::Control::default()
                 )
                 .err()
@@ -863,9 +940,19 @@ mod tests {
             };
             let result = read_contents(
                 &request,
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &mut Some(helpers::Catalog::empty()),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &helpers::Control::default(),
             )
             .unwrap();
@@ -879,9 +966,19 @@ mod tests {
             assert!(
                 read_contents(
                     &request,
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &mut Some(helpers::Catalog::empty()),
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "dragonfly"
+                    ))]
                     &helpers::Control::default()
                 )
                 .is_err()
@@ -899,9 +996,19 @@ mod tests {
         assert!(
             read_contents(
                 &request,
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &mut Some(helpers::Catalog::empty()),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &helpers::Control::default()
             )
             .is_err()
@@ -915,9 +1022,19 @@ mod tests {
         assert!(
             read_contents(
                 &request,
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &mut Some(helpers::Catalog::empty()),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
                 &helpers::Control::default()
             )
             .is_err()
@@ -939,7 +1056,6 @@ mod tests {
         preview.shutdown();
         assert!(preview.selected().is_none() && preview.snapshot().is_none());
         preview.request(2, Arc::clone(&old.anchor), "file".into(), NodeKind::File);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
             preview.selected().is_none(),
             "stopped preview must not restart"
