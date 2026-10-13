@@ -620,7 +620,17 @@ fn enumerate_std(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
 ) -> io::Result<()> {
-    let entries = fs::read_dir(path)?;
+    enumerate_std_entries(fs::read_dir(path)?, reader, batch_size, cancel, emit)
+}
+
+#[cfg(any(target_os = "linux", not(unix)))]
+fn enumerate_std_entries(
+    entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>,
+    reader: &MetadataReader,
+    batch_size: usize,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Vec<Arc<OsStr>>, &MetadataReader) -> io::Result<()>,
+) -> io::Result<()> {
     let mut batch = Vec::new();
     for entry in entries {
         check_cancel(cancel)?;
@@ -631,8 +641,9 @@ fn enumerate_std(
                 }
                 batch.push(Arc::from(entry.file_name()));
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
+                // ReadDir permanently ends after an error, including EINTR.
+                // Keep the prefix without misreporting its missing tail as complete.
                 flush(&mut batch, reader, emit)?;
                 return Err(error);
             }
@@ -914,6 +925,45 @@ mod tests {
             .prefix("backend-")
             .tempdir_in(".tmp")
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standard_iterator_error_preserves_prefix_and_reports_incomplete_listing() {
+        for batch_size in [1, 8] {
+            for kind in [io::ErrorKind::Interrupted, io::ErrorKind::PermissionDenied] {
+                let directory = fixture();
+                fs::write(directory.path().join("first"), b"kept").unwrap();
+                fs::write(directory.path().join("second"), b"kept").unwrap();
+                let anchor = RootAnchor::open(directory.path()).unwrap();
+                let reader = MetadataReader::Native(anchor.open_directory(Path::new("")).unwrap());
+                let mut entries = fs::read_dir(directory.path()).unwrap();
+                let first = entries.next().unwrap().unwrap();
+                let expected = first.file_name();
+                assert!(entries.next().is_some(), "fixture must have an unread tail");
+                // Match ReadDir's error behavior: a real prefix, then an error,
+                // then permanent EOF. Retrying next() cannot recover the tail.
+                let interrupted = std::iter::once(Ok(first))
+                    .chain(std::iter::once(Err(io::Error::new(kind, "read stopped"))))
+                    .fuse();
+                let mut seen = Vec::new();
+                let error = enumerate_std_entries(
+                    interrupted,
+                    &reader,
+                    batch_size,
+                    &AtomicBool::new(false),
+                    &mut |names, reader| {
+                        assert_eq!(names.len(), 1);
+                        assert_eq!(reader.metadata(&names[0])?.sizes.apparent, 4);
+                        seen.extend(names);
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+                assert_eq!(seen, vec![Arc::<OsStr>::from(expected)]);
+            }
+        }
     }
 
     #[cfg(unix)]
