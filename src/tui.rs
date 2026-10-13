@@ -117,6 +117,7 @@ impl DeleteReport {
         height: usize,
         horizontal: usize,
         width: usize,
+        accent: Color,
     ) -> Vec<Line<'static>> {
         (scroll..scroll.saturating_add(height).min(self.lines()))
             .map(|row| {
@@ -126,13 +127,8 @@ impl DeleteReport {
                 } else {
                     printable(OsStr::new(&error.message))
                 };
-                Line::from(horizontal_slice(&text, horizontal, width)).style(Style::default().fg(
-                    if row % 2 == 0 {
-                        Color::Cyan
-                    } else {
-                        Color::White
-                    },
-                ))
+                Line::from(horizontal_slice(&text, horizontal, width))
+                    .style(Style::default().fg(if row % 2 == 0 { accent } else { Color::White }))
             })
             .collect()
     }
@@ -158,9 +154,14 @@ enum Modal {
         count: usize,
         ready: bool,
         reviewable: bool,
+        confirm_requested: bool,
         scroll: u16,
     },
     Enqueueing,
+    ConfirmQuit {
+        previous: Box<Option<Modal>>,
+        reviewable: bool,
+    },
     Quit {
         reviewable: bool,
     },
@@ -172,11 +173,21 @@ enum Modal {
         target: String,
         scroll: u16,
         reviewable: bool,
+        confirm_requested: bool,
         confirmed: Option<ConfirmedTarget>,
         capture: Option<Receiver<io::Result<ConfirmedTarget>>>,
     },
 }
 impl Modal {
+    fn underlying(&self) -> &Self {
+        match self {
+            Self::ConfirmQuit { previous, .. } => {
+                previous.as_ref().as_ref().map_or(self, Self::underlying)
+            }
+            _ => self,
+        }
+    }
+
     fn help(visual: bool) -> Self {
         Self::Text {
             title: "Help",
@@ -202,6 +213,83 @@ impl Modal {
         }
     }
 }
+fn underlying_modal_slot(slot: &mut Option<Modal>) -> &mut Option<Modal> {
+    match slot {
+        Some(Modal::ConfirmQuit { previous, .. }) => underlying_modal_slot(previous),
+        _ => slot,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseControl {
+    Help,
+    Queue,
+    VisualDelete,
+    SelectionClear,
+    Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ControlPress {
+    control: MouseControl,
+    area: Rect,
+    position: (u16, u16),
+    dialog: Option<(std::mem::Discriminant<Modal>, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderRightPress {
+    position: (u16, u16),
+    frame: Rect,
+    dialog: Option<(std::mem::Discriminant<Modal>, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DialogOption {
+    key: KeyEvent,
+    area: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct DialogOptionPress {
+    option: DialogOption,
+    position: (u16, u16),
+    dialog: Option<(std::mem::Discriminant<Modal>, usize)>,
+    frame: Rect,
+    queue_target: Option<QueueId>,
+}
+
+#[derive(Default)]
+struct DialogMouse {
+    accent: Color,
+    options: [Option<DialogOption>; 4],
+    press: Option<DialogOptionPress>,
+    hovered: Option<KeyEvent>,
+    scroll_area: Rect,
+    scroll_max: usize,
+}
+
+impl DialogMouse {
+    fn option(&mut self, area: Rect, row: u16, key: KeyEvent, line: &Line<'_>) {
+        let width = line.width();
+        // Never turn a clipped or unpainted choice into a destructive hitbox.
+        if row >= area.height || width == 0 || width > usize::from(area.width) {
+            return;
+        }
+        if let Some(slot) = self.options.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(DialogOption {
+                key,
+                area: Rect::new(area.x, area.y + row, width as u16, 1),
+            });
+        }
+    }
+
+    fn scroll(&mut self, popup: Rect, lines: usize, height: u16) {
+        self.scroll_area = popup;
+        self.scroll_max = lines.saturating_sub(usize::from(height));
+    }
+}
+
 enum Action {
     Continue,
     Refresh(NodeId),
@@ -224,10 +312,30 @@ struct PendingMouse {
     lead: NodeId,
     dragged: bool,
     released: bool,
+    origin_selected: bool,
     mode: RangeMode,
     edge: isize,
     view: Arc<CachedSnapshot>,
     offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ParentSelection {
+    epoch: u64,
+    initial_end: usize,
+    cursor: Option<NodeId>,
+    membership_revision: u64,
+    order_revision: u64,
+    order_cursor: usize,
+    order_rejected: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ParentPress {
+    directory: NodeId,
+    area: Rect,
+    position: (u16, u16),
+    activate: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +344,23 @@ struct PendingHover {
     row: u16,
     directory: NodeId,
     child_epoch: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserTarget {
+    Entry(NodeId),
+    Parent,
+}
+
+struct RightPress {
+    target: BrowserTarget,
+    directory: NodeId,
+    epoch: u64,
+    position: (u16, u16),
+    area: Rect,
+    view: Arc<CachedSnapshot>,
+    offset: usize,
+    valid: bool,
 }
 
 struct PendingScroll {
@@ -250,8 +375,22 @@ enum VisualIntent {
     Navigate(Navigation, bool),
     ToggleCurrent,
     ToggleStable(NodeId),
+    SelectStable(NodeId),
+    ToggleParent,
+    Parent(Option<bool>),
     Hover(PendingHover),
     Mouse(PendingMouse),
+}
+
+struct QueueDrag {
+    id: QueueId,
+    row: u16,
+    pressed: (u16, u16),
+    button: MouseButton,
+    active: bool,
+    moved: bool,
+    edge: isize,
+    next_step: Instant,
 }
 
 #[derive(Default)]
@@ -263,6 +402,8 @@ struct QueueView {
     paused: bool,
     rows: Vec<(QueueId, bool, String)>,
     selected: Option<QueueId>,
+    // Endpoints are exact; the linked queue uses a midpoint when both ends are hidden.
+    scroll_position: usize,
 }
 
 struct Preview {
@@ -335,6 +476,7 @@ struct FrameSnapshot {
     model_revision: u64,
     directory: NodeId,
     selected: Option<NodeId>,
+    parent_selected: bool,
     offset: usize,
     view: Arc<CachedSnapshot>,
     available: Option<Arc<CachedSnapshot>>,
@@ -351,6 +493,7 @@ impl FrameSnapshot {
             model_revision: app.model.revision(),
             directory: app.directory,
             selected: app.selected,
+            parent_selected: app.parent_selected,
             offset: app.offset,
             view: Arc::clone(&app.view),
             available: app.current_snapshot(),
@@ -372,6 +515,7 @@ impl FrameSnapshot {
         self.model_revision == app.model.revision()
             && self.directory == app.directory
             && self.selected == app.selected
+            && self.parent_selected == app.parent_selected
             && self.offset == app.offset
             && Arc::ptr_eq(&self.view, &app.view)
             && if app.filter.is_empty() {
@@ -439,12 +583,186 @@ impl FrameGate {
     }
 }
 
+struct BreadcrumbPart {
+    text: String,
+    width: usize,
+    target: Option<NodeId>,
+    separator: bool,
+}
+
+#[derive(Default)]
+struct Breadcrumbs {
+    directory: Option<NodeId>,
+    parts: Vec<BreadcrumbPart>,
+    width: usize,
+    hits: Vec<(Rect, NodeId)>,
+    hovered: Option<NodeId>,
+    pressed: Option<(NodeId, NodeId, Rect, (u16, u16))>,
+}
+
+impl Breadcrumbs {
+    fn sync(&mut self, root: &std::path::Path, model: &Model, directory: NodeId) {
+        // Names and ancestry stay fixed for a node ID. Rebuild only when the
+        // displayed directory changes, not for progress or hover redraws.
+        if self.directory == Some(directory) {
+            return;
+        }
+        self.directory = Some(directory);
+        self.parts.clear();
+        self.width = 0;
+        self.hits.clear();
+        self.hovered = None;
+        self.pressed = None;
+        let mut components = root.components().peekable();
+        while let Some(component) = components.next() {
+            self.push(
+                printable(component.as_os_str()),
+                components.peek().is_none().then_some(ROOT),
+            );
+        }
+        if self.parts.is_empty() {
+            self.push(".".to_owned(), Some(ROOT));
+        }
+        let mut ancestors = Vec::new();
+        let mut id = directory;
+        while id != ROOT {
+            ancestors.push(id);
+            let Some(parent) = model.node(id).parent else {
+                break;
+            };
+            id = parent;
+        }
+        for id in ancestors.into_iter().rev() {
+            self.push(printable(&model.node(id).name), Some(id));
+        }
+    }
+
+    fn push(&mut self, text: String, target: Option<NodeId>) {
+        let separator = self.parts.last().is_some_and(|part| part.text != "/");
+        let width = Line::from(text.as_str()).width();
+        self.width += width + usize::from(separator);
+        self.parts.push(BreadcrumbPart {
+            text,
+            width,
+            target,
+            separator,
+        });
+    }
+
+    fn line(&mut self, width: usize, area: Rect, modal: bool, accent: Color) -> Line<'static> {
+        self.hits.clear();
+        let mut line = Line::default();
+        if width == 0 || area.height == 0 {
+            return line;
+        }
+        let Some(last) = self.parts.last() else {
+            return line;
+        };
+        if self.width > width && last.width + 2 > width {
+            let text = breadcrumb_tail(&last.text, width);
+            let shown = Line::from(text.as_str()).width();
+            line.spans
+                .push(Span::styled("…", Style::default().fg(Color::Gray)));
+            if shown > 1 {
+                let target = last.target;
+                self.add_hit(area, 1, shown - 1, target);
+                line.spans.push(Span::styled(
+                    text['…'.len_utf8()..].to_owned(),
+                    self.style(target, modal, accent),
+                ));
+            }
+            return line;
+        }
+        let mut first = 0;
+        let mut offset = 0;
+        if self.width > width {
+            first = self.parts.len() - 1;
+            let mut used = self.parts[first].width + 2;
+            while first > 0 && used + self.parts[first - 1].width < width {
+                first -= 1;
+                used += self.parts[first].width + 1;
+            }
+            line.spans
+                .push(Span::styled("…/", Style::default().fg(Color::Gray)));
+            offset = 2;
+        }
+        for index in first..self.parts.len() {
+            let part = &self.parts[index];
+            if part.separator && (index > first || first == 0) {
+                line.spans
+                    .push(Span::styled("/", Style::default().fg(Color::Gray)));
+                offset += 1;
+            }
+            let target = part.target;
+            let part_width = part.width;
+            line.spans.push(Span::styled(
+                part.text.clone(),
+                self.style(target, modal, accent),
+            ));
+            self.add_hit(area, offset, part_width, target);
+            offset += part_width;
+        }
+        line
+    }
+
+    fn style(&self, target: Option<NodeId>, modal: bool, accent: Color) -> Style {
+        if target.is_none() {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+        } else if !modal && self.hovered == target {
+            Style::default()
+                .bg(accent)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    }
+
+    fn add_hit(&mut self, area: Rect, offset: usize, width: usize, target: Option<NodeId>) {
+        if width > 0
+            && let Some(target) = target
+        {
+            self.hits.push((
+                Rect::new(area.x + offset as u16, area.y, width as u16, 1),
+                target,
+            ));
+        }
+    }
+}
+
+fn breadcrumb_tail(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let line = Line::from(text);
+    let mut skip = line.width().saturating_sub(width - 1);
+    let mut output = String::from("…");
+    for grapheme in line.styled_graphemes(Style::default()) {
+        if skip > 0 {
+            skip = skip.saturating_sub(Span::raw(grapheme.symbol).width());
+        } else {
+            output.push_str(grapheme.symbol);
+        }
+    }
+    output
+}
+
 struct App {
     model: Model,
     root: PathBuf,
     report_root: PathBuf,
     directory: NodeId,
     selected: Option<NodeId>,
+    parent_selected: bool,
+    parent_navigation: bool,
+    parent_select_pending: bool,
+    parent_selection: Option<ParentSelection>,
+    #[cfg(test)]
+    parent_select_checks: usize,
+    parent_select_view: Option<Arc<CachedSnapshot>>,
+    parent_area: Rect,
+    parent_press: Option<ParentPress>,
+    right_press: Option<RightPress>,
     view: Arc<CachedSnapshot>,
     empty: Arc<CachedSnapshot>,
     view_directory: NodeId,
@@ -474,13 +792,14 @@ struct App {
     delete_notice_retirer: Retirer<DeleteReport>,
     started: bool,
     queue_view: QueueView,
+    queue_area: Rect,
+    queue_drag: Option<QueueDrag>,
     baseline_finished: bool,
     visual: VisualSelection,
     range_requested: bool,
     prioritize_requested: bool,
     list_area: Rect,
-    back_area: Rect,
-    back_hovered: bool,
+    breadcrumbs: Breadcrumbs,
     hover_position: Option<(u16, u16)>,
     mouse_dragging: bool,
     drag_anchor: Option<NodeId>,
@@ -503,6 +822,17 @@ struct App {
     deferred_delete: Option<DeleteRequest>,
     mouse_press_view: Option<Arc<CachedSnapshot>>,
     normal_click: Option<NodeId>,
+    help_area: Rect,
+    header_queue_area: Rect,
+    header_delete_area: Rect,
+    selection_clear_area: Rect,
+    dialog_close_area: Rect,
+    dialog_mouse: DialogMouse,
+    control_frame: Rect,
+    painted_control_dialog: Option<(std::mem::Discriminant<Modal>, usize)>,
+    control_hovered: Option<MouseControl>,
+    control_press: Option<ControlPress>,
+    header_right_press: Option<HeaderRightPress>,
 }
 
 impl App {
@@ -527,6 +857,16 @@ impl App {
             root,
             directory: ROOT,
             selected: None,
+            parent_selected: false,
+            parent_navigation: false,
+            parent_select_pending: false,
+            parent_selection: None,
+            #[cfg(test)]
+            parent_select_checks: 0,
+            parent_select_view: None,
+            parent_area: Rect::default(),
+            parent_press: None,
+            right_press: None,
             view: Arc::clone(&empty),
             empty: Arc::clone(&empty),
             view_directory: ROOT,
@@ -556,13 +896,14 @@ impl App {
             delete_notice_retirer: Retirer::new()?,
             started: false,
             queue_view: QueueView::default(),
+            queue_area: Rect::default(),
+            queue_drag: None,
             baseline_finished: false,
             visual: VisualSelection::new(ROOT)?,
             range_requested: false,
             prioritize_requested: false,
             list_area: Rect::default(),
-            back_area: Rect::default(),
-            back_hovered: false,
+            breadcrumbs: Breadcrumbs::default(),
             hover_position: None,
             mouse_dragging: false,
             drag_anchor: None,
@@ -585,10 +926,26 @@ impl App {
             deferred_delete: None,
             mouse_press_view: None,
             normal_click: None,
+            help_area: Rect::default(),
+            header_queue_area: Rect::default(),
+            header_delete_area: Rect::default(),
+            selection_clear_area: Rect::default(),
+            dialog_close_area: Rect::default(),
+            dialog_mouse: DialogMouse::default(),
+            control_frame: Rect::default(),
+            painted_control_dialog: None,
+            control_hovered: None,
+            control_press: None,
+            header_right_press: None,
         })
     }
 
     fn reset_order(&mut self, keep_previous: bool) {
+        if !keep_previous {
+            self.parent_selected = false;
+            self.parent_navigation = false;
+            self.parent_press = None;
+        }
         if self.view_directory != self.directory {
             self.filter.clear();
             self.filter_editing = false;
@@ -618,7 +975,26 @@ impl App {
 
     fn changed(&mut self, ids: Vec<NodeId>) {
         for id in ids {
-            if !self.model.is_live(id) {
+            let live = self.model.is_live(id);
+            if self.parent_select_pending
+                && let Some(selection) = &mut self.parent_selection
+                && selection.epoch == self.model.node(self.directory).child_epoch
+                && self.model.node(id).parent == Some(self.directory)
+            {
+                if !live {
+                    selection.membership_revision = selection.membership_revision.wrapping_add(1);
+                } else if id as usize >= selection.initial_end && !self.visual.contains(id) {
+                    // Entry admission is already bounded. Select only new direct
+                    // children here; size updates never restart the initial walk.
+                    self.visual.select(id);
+                    selection.membership_revision = selection.membership_revision.wrapping_add(1);
+                    #[cfg(test)]
+                    {
+                        self.parent_select_checks += 1;
+                    }
+                }
+            }
+            if !live {
                 self.removals.push(id);
             } else if (id as usize) < self.next_new && self.pending_set.insert(id) {
                 if self.pending.len() >= PENDING_LIMIT {
@@ -662,10 +1038,10 @@ impl App {
 
     fn show_delete_notice(&mut self) -> bool {
         // Large reports must also be cheap to dismiss, not just cheap to paint.
-        if let Some(report) = self.retired_delete_notices.pop_front() {
-            if let Err(report) = self.delete_notice_retirer.try_retire(report) {
-                self.retired_delete_notices.push_front(report);
-            }
+        if let Some(report) = self.retired_delete_notices.pop_front()
+            && let Err(report) = self.delete_notice_retirer.try_retire(report)
+        {
+            self.retired_delete_notices.push_front(report);
         }
         if self.modal.is_none() && !self.delete_notices.is_empty() {
             self.modal = Some(Modal::DeleteErrors {
@@ -679,10 +1055,10 @@ impl App {
     }
 
     fn dismiss_delete_notice(&mut self) {
-        if let Some(report) = self.delete_notices.pop_front() {
-            if let Err(report) = self.delete_notice_retirer.try_retire(report) {
-                self.retired_delete_notices.push_back(report);
-            }
+        if let Some(report) = self.delete_notices.pop_front()
+            && let Err(report) = self.delete_notice_retirer.try_retire(report)
+        {
+            self.retired_delete_notices.push_back(report);
         }
         self.show_delete_notice();
     }
@@ -726,11 +1102,9 @@ impl App {
     fn deletion_succeeded(&mut self, id: NodeId, parent_metadata_available: bool) {
         let parent = self.model.node(id).parent;
         self.removed(id);
-        if !parent_metadata_available {
-            if let Some(parent) = parent {
-                let changed = self.model.mark_metadata_uncertain(parent);
-                self.changed(changed);
-            }
+        if !parent_metadata_available && let Some(parent) = parent {
+            let changed = self.model.mark_metadata_uncertain(parent);
+            self.changed(changed);
         }
     }
 
@@ -747,6 +1121,7 @@ impl App {
             baseline.remove(&id);
         }
         for modal in [&mut self.modal, &mut self.previous_modal] {
+            let modal = underlying_modal_slot(modal);
             if matches!(modal.as_ref(), Some(Modal::Text { title: "Info", .. }))
                 || matches!(modal.as_ref(), Some(Modal::Delete { id: target, .. }) if !self.model.is_live(*target))
             {
@@ -877,7 +1252,7 @@ impl App {
                 navigation.cursor = None;
             }
         }
-        if (self.mouse_press_view.is_some() || self.has_held_mouse())
+        if (self.mouse_press_view.is_some() || self.has_held_mouse() || self.right_press.is_some())
             && self.pending_navigation.is_none()
         {
             return;
@@ -893,51 +1268,48 @@ impl App {
                     .cursor
                     .is_some_and(|cursor| cursor.next.is_some())
             });
-        if !traversing {
-            if let Some(view) = self
+        if !traversing
+            && let Some(view) = self
                 .current_snapshot()
                 .filter(|view| view.child_epoch == self.model.node(self.directory).child_epoch)
+            && !Arc::ptr_eq(&self.view, &view)
+        {
+            let row = (self.view_directory == self.directory)
+                .then(|| self.selection_screen_row())
+                .flatten();
+            self.view_directory = self.directory;
+            self.view = view;
+            if let Some(navigation) = self.pending_navigation.as_mut() {
+                navigation.cursor = None;
+            }
+            if self.cursor_mode == CursorMode::Top {
+                self.selected = None;
+                self.offset = 0;
+                self.pending_navigation = Some(Navigation::new(Some(false), 0));
+            } else if self.selected.is_some_and(|id| {
+                !self.eligible(id)
+                    || self.model.node(id).parent != Some(self.directory)
+                    || (!self.filter.is_empty() && !self.view.positions.contains_key(&id))
+            }) {
+                self.selected = None;
+                self.focus_after_selection = true;
+                self.prioritize_requested = true;
+            }
+            if self.selected.is_none() && !self.parent_selected && self.pending_navigation.is_none()
             {
-                if !Arc::ptr_eq(&self.view, &view) {
-                    let row = (self.view_directory == self.directory)
-                        .then(|| self.selection_screen_row())
-                        .flatten();
-                    self.view_directory = self.directory;
-                    self.view = view;
-                    if let Some(navigation) = self.pending_navigation.as_mut() {
-                        navigation.cursor = None;
-                    }
-                    if self.cursor_mode == CursorMode::Top {
-                        self.selected = None;
-                        self.offset = 0;
-                        self.pending_navigation = Some(Navigation::new(Some(false), 0));
-                    } else if self.selected.is_some_and(|id| {
-                        !self.eligible(id)
-                            || self.model.node(id).parent != Some(self.directory)
-                            || (!self.filter.is_empty() && !self.view.positions.contains_key(&id))
-                    }) {
-                        self.selected = None;
-                        self.focus_after_selection = true;
-                        self.prioritize_requested = true;
-                    }
-                    if self.selected.is_none() && self.pending_navigation.is_none() {
-                        self.pending_navigation = Some(Navigation::new(Some(false), 0));
-                    }
-                    if let (Some(row), Some(index)) = (row, self.selection_index()) {
-                        self.offset = self.offset_for_row(index, row);
-                    }
-                    if self.mouse_press_view.is_none() && !self.has_held_mouse() {
-                        self.scroll_selection(
-                            if self.hover_position.is_some() || self.cursor_pending() {
-                                0
-                            } else {
-                                SCROLL_MARGIN
-                            },
-                        );
-                    } else {
-                        self.keep_selection_visible();
-                    }
-                }
+                self.pending_navigation = Some(Navigation::new(Some(false), 0));
+            }
+            if let (Some(row), Some(index)) = (row, self.selection_index()) {
+                self.offset = self.offset_for_row(index, row);
+            }
+            if self.mouse_press_view.is_none() && !self.has_held_mouse() {
+                self.scroll_selection(if self.hover_position.is_some() || self.cursor_pending() {
+                    0
+                } else {
+                    SCROLL_MARGIN
+                });
+            } else {
+                self.keep_selection_visible();
             }
         }
         self.advance_navigation();
@@ -952,6 +1324,7 @@ impl App {
     }
 
     fn update_filter(&mut self) {
+        self.parent_selected = false;
         self.track_selection();
         let visual = self.visual.active();
         self.clear_visual_intent();
@@ -1033,6 +1406,9 @@ impl App {
     }
 
     fn scroll_selection(&mut self, margin: usize) {
+        if self.parent_selected {
+            return;
+        }
         let Some(index) = self.selection_index() else {
             self.offset = 0;
             return;
@@ -1065,7 +1441,496 @@ impl App {
         }
     }
 
+    fn focus_parent(&mut self, top: bool) {
+        self.parent_selected = true;
+        self.parent_navigation = false;
+        self.selected = None;
+        self.cursor_mode = CursorMode::Tracked;
+        self.pending_navigation = None;
+        self.range_requested = false;
+        self.focus_after_selection = false;
+        self.hover_position = None;
+        if top {
+            self.offset = 0;
+        }
+        // A queued Enter follows the synthetic row without binding a fake ID.
+        for intent in &mut self.visual_intents {
+            match intent {
+                VisualIntent::ToggleCurrent => *intent = VisualIntent::ToggleParent,
+                VisualIntent::ToggleParent => {}
+                _ => break,
+            }
+        }
+    }
+
+    fn browser_edge_selection(&mut self, end: bool) {
+        if end {
+            self.parent_navigation = false;
+            self.edge_selection(true);
+        } else {
+            let select = self.range_requested && self.visual.active();
+            self.focus_parent(true);
+            if select {
+                self.select_parent_contents(false);
+            }
+        }
+    }
+
+    fn browser_move_selection(&mut self, amount: isize) {
+        if self.parent_selected {
+            if amount <= 0
+                || !self
+                    .model
+                    .has_children(self.directory, false, self.config.show_hidden)
+                || (!self.filter.is_empty()
+                    && !Arc::ptr_eq(&self.view, &self.empty)
+                    && self.view.ids.is_empty())
+            {
+                return;
+            }
+            self.parent_selected = false;
+            self.parent_navigation = false;
+            self.pending_navigation = Some(Navigation::new(Some(false), amount - 1));
+            self.advance_navigation();
+        } else {
+            self.parent_navigation = true;
+            self.move_selection(amount);
+        }
+    }
+
+    fn select_parent_contents(&mut self, remove: bool) {
+        self.cancel_parent_selection();
+        self.filter.clear();
+        self.filter_editing = false;
+        self.order.clear_filter();
+        if !self.config.show_hidden {
+            self.config.show_hidden = true;
+            self.reset_order(true);
+        }
+        self.visual.enter(self.directory, None);
+        self.parent_select_pending = !remove;
+        self.parent_selection = (!remove).then(|| ParentSelection {
+            epoch: self.model.node(self.directory).child_epoch,
+            initial_end: self.model.len(),
+            cursor: self.model.first_child(self.directory),
+            membership_revision: 0,
+            order_revision: 0,
+            order_cursor: 0,
+            order_rejected: false,
+        });
+        // An empty, finished listing completes in the input turn without
+        // scheduling selection work. Growing folders still wait for admission.
+        if self.model.child_count(self.directory) == 0 {
+            self.pump_parent_selection();
+        }
+    }
+
+    fn cancel_parent_selection(&mut self) {
+        self.parent_select_pending = false;
+        self.parent_selection = None;
+        if let Some(view) = self.parent_select_view.take() {
+            self.visual
+                .retire_snapshot_and_order(im::HashSet::new(), view);
+        }
+    }
+
+    fn finish_parent_selection(&mut self, incomplete: bool) {
+        // Select-all is a completed action. Commit its materialized marks before
+        // another Shift gesture can reuse and shrink the original empty baseline.
+        if let Some(anchor) = self
+            .parent_select_view
+            .as_ref()
+            .and_then(|view| view.ids.first())
+            .copied()
+            .or_else(|| self.model.first_child(self.directory))
+            .filter(|&id| self.visual.contains(id))
+        {
+            self.visual.reanchor(anchor);
+        }
+        if incomplete {
+            // Preserve the known marks, but reject any retained confirmation:
+            // an incomplete enumeration cannot satisfy an all-entry request.
+            self.clear_visual_intent();
+            *self.background_modal_slot() = Some(Modal::notice(
+                "Selection incomplete",
+                "Folder listing incomplete. Refresh to select all entries.".to_owned(),
+            ));
+        } else {
+            self.cancel_parent_selection();
+        }
+    }
+
+    fn parent_selection_work(&self) -> bool {
+        self.parent_selection.is_some_and(|selection| {
+            selection.cursor.is_some()
+                || (!selection.order_rejected
+                    && selection.order_revision == selection.membership_revision
+                    && self.parent_select_view.as_ref().is_some_and(|view| {
+                        view.generation == self.order.generation()
+                            && selection.order_cursor < view.ids.len()
+                    }))
+        })
+    }
+
+    fn pump_parent_selection(&mut self) -> bool {
+        if !self.parent_select_pending {
+            return false;
+        }
+        let Some(mut selection) = self.parent_selection else {
+            self.cancel_parent_selection();
+            return true;
+        };
+        if !self.visual.active() || selection.epoch != self.model.node(self.directory).child_epoch {
+            self.cancel_parent_selection();
+            return true;
+        }
+        let mut progressed = false;
+        let mut budget = 256;
+        while let Some(id) = selection.cursor {
+            // Appended children are handled by changed(), including an append
+            // after the initial tail was removed. Retained sibling links keep
+            // the initial walk valid when an unvisited child disappears.
+            if id as usize >= selection.initial_end {
+                selection.cursor = None;
+                break;
+            }
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            progressed = true;
+            selection.cursor = self.model.next_sibling(id);
+            if self.model.is_live(id) && self.model.node(id).parent == Some(self.directory) {
+                self.visual.select(id);
+            }
+            #[cfg(test)]
+            {
+                self.parent_select_checks += 1;
+            }
+        }
+        self.parent_selection = Some(selection);
+        if selection.cursor.is_some() {
+            return progressed;
+        }
+        // Finishing direct enumeration need not wait for descendant sizes.
+        let listed = self.model.listing_complete(self.directory);
+        let stopped = !listed && self.model.finished;
+        if stopped {
+            self.finish_parent_selection(true);
+            return true;
+        }
+        if !listed {
+            return progressed;
+        }
+        let count = self.model.child_count(self.directory);
+        if count == 0 {
+            self.finish_parent_selection(false);
+            return true;
+        }
+        if self.visual.len() != count {
+            return progressed;
+        }
+        // Admission can mark new children before ordering catches up. Validate
+        // one complete sorted view before releasing a retained confirmation;
+        // count alone cannot detect same-length replacement snapshots.
+        if self
+            .parent_select_view
+            .as_ref()
+            .is_none_or(|view| view.generation != self.order.generation())
+            || selection.order_revision != selection.membership_revision
+            || selection.order_rejected
+        {
+            let Some(view) = self.order.snapshot(self.directory).filter(|view| {
+                view.child_epoch == selection.epoch
+                    && view.ids.len() == count
+                    && self
+                        .parent_select_view
+                        .as_ref()
+                        .is_none_or(|attempted| !Arc::ptr_eq(attempted, view))
+            }) else {
+                return progressed;
+            };
+            if let Some(previous) = self.parent_select_view.replace(view) {
+                self.visual
+                    .retire_snapshot_and_order(im::HashSet::new(), previous);
+            }
+            selection.order_cursor = 0;
+            selection.order_revision = selection.membership_revision;
+            selection.order_rejected = false;
+        }
+        let view = self
+            .parent_select_view
+            .as_ref()
+            .expect("parent order exists");
+        for _ in 0..budget {
+            let Some(&id) = view.ids.get(selection.order_cursor) else {
+                break;
+            };
+            progressed = true;
+            #[cfg(test)]
+            {
+                self.parent_select_checks += 1;
+            }
+            if !self.model.is_live(id)
+                || self.model.node(id).parent != Some(self.directory)
+                || !self.visual.contains(id)
+            {
+                selection.order_rejected = true;
+                break;
+            }
+            selection.order_cursor += 1;
+        }
+        self.parent_selection = Some(selection);
+        if !selection.order_rejected && selection.order_cursor == view.ids.len() {
+            self.view = Arc::clone(view);
+            self.view_directory = self.directory;
+            self.finish_parent_selection(false);
+            return true;
+        }
+        progressed
+    }
+
+    fn cancel_right_press(&mut self) {
+        if let Some(press) = self.right_press.take() {
+            self.visual
+                .retire_snapshot_and_order(im::HashSet::new(), press.view);
+        }
+    }
+
+    fn select_clicked_entry(&mut self, id: NodeId) {
+        if !self.eligible(id) || self.model.node(id).parent != Some(self.directory) {
+            self.bind_visual_cursor(None);
+            return;
+        }
+        if !self.visual.active() {
+            self.visual.enter(self.directory, None);
+        }
+        self.parent_selected = false;
+        self.selected = Some(id);
+        self.cursor_mode = CursorMode::Tracked;
+        self.pending_navigation = None;
+        self.range_requested = false;
+        if !self.visual.contains(id) {
+            self.visual.toggle(id);
+        } else {
+            self.visual.reanchor(id);
+        }
+        self.bind_visual_cursor(Some(id));
+        self.prioritize_requested = true;
+    }
+
+    fn right_browser_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let right_event = matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Right)
+                | MouseEventKind::Up(MouseButton::Right)
+                | MouseEventKind::Drag(MouseButton::Right)
+        );
+        if self.modal.is_some() {
+            self.cancel_right_press();
+            return right_event;
+        }
+        if let Some(press) = self.right_press.as_mut() {
+            match mouse.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Right) => {
+                    if mouse.kind != MouseEventKind::Moved
+                        || press.position != (mouse.column, mouse.row)
+                    {
+                        press.valid = false;
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Right) => {
+                    let press = self.right_press.take().expect("right press exists");
+                    let area = match press.target {
+                        BrowserTarget::Entry(_) => self.list_area,
+                        BrowserTarget::Parent => self.parent_area,
+                    };
+                    let valid = press.valid
+                        && press.directory == self.directory
+                        && press.epoch == self.model.node(self.directory).child_epoch
+                        && press.position == (mouse.column, mouse.row)
+                        && press.area == area
+                        && area.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        && match press.target {
+                            BrowserTarget::Entry(id) => {
+                                self.eligible(id)
+                                    && self.model.node(id).parent == Some(self.directory)
+                                    && self
+                                        .painted_rows
+                                        .get(usize::from(mouse.row.saturating_sub(area.y)))
+                                        == Some(&id)
+                            }
+                            BrowserTarget::Parent => true,
+                        };
+                    self.visual
+                        .retire_snapshot_and_order(im::HashSet::new(), press.view);
+                    if valid {
+                        self.finish_mouse_for_input();
+                        if !self.visual.active() {
+                            self.visual.enter(self.directory, None);
+                        }
+                        match press.target {
+                            BrowserTarget::Entry(id) => {
+                                if self.visual_busy() {
+                                    self.try_enqueue_visual(VisualIntent::SelectStable(id));
+                                } else {
+                                    self.select_clicked_entry(id);
+                                }
+                            }
+                            BrowserTarget::Parent => {
+                                if self.visual_busy() {
+                                    self.try_enqueue_visual(VisualIntent::Parent(Some(false)));
+                                } else {
+                                    self.focus_parent(false);
+                                    self.select_parent_contents(false);
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown => self.cancel_right_press(),
+                _ => {}
+            }
+        }
+        if mouse.kind != MouseEventKind::Down(MouseButton::Right) {
+            return right_event;
+        }
+        if self.mouse_press_view.is_some()
+            || self.has_held_mouse()
+            || self.parent_press.is_some()
+            || self.painted_directory != self.directory
+            || self.painted_view.child_epoch != self.model.node(self.directory).child_epoch
+        {
+            return true;
+        }
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let (target, area) = if self.parent_area.contains(position) {
+            (BrowserTarget::Parent, self.parent_area)
+        } else if self.list_area.contains(position) {
+            let Some(&id) = self
+                .painted_rows
+                .get(usize::from(mouse.row - self.list_area.y))
+            else {
+                return true;
+            };
+            if !self.eligible(id) || self.model.node(id).parent != Some(self.directory) {
+                return true;
+            }
+            (BrowserTarget::Entry(id), self.list_area)
+        } else {
+            return true;
+        };
+        self.hover_position = None;
+        self.normal_click = None;
+        self.cursor_mode = CursorMode::Tracked;
+        self.right_press = Some(RightPress {
+            target,
+            directory: self.directory,
+            epoch: self.model.node(self.directory).child_epoch,
+            position: (mouse.column, mouse.row),
+            area,
+            view: Arc::clone(&self.painted_view),
+            offset: self.painted_offset,
+            valid: true,
+        });
+        true
+    }
+
+    fn parent_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.modal.is_some() {
+            self.parent_press = None;
+            return false;
+        }
+        if let Some(press) = self.parent_press.as_mut() {
+            match mouse.kind {
+                MouseEventKind::Up(MouseButton::Left) => {
+                    let activate = press.activate
+                        && press.directory == self.directory
+                        && press.area == self.parent_area
+                        && press.position == (mouse.column, mouse.row)
+                        && self
+                            .parent_area
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+                    self.parent_press = None;
+                    if activate && !self.visual.active() {
+                        self.navigate_parent();
+                    }
+                    return true;
+                }
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                    if mouse.kind != MouseEventKind::Moved
+                        || press.position != (mouse.column, mouse.row)
+                    {
+                        press.activate = false;
+                    }
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.parent_press = None,
+                _ => {}
+            }
+        }
+        if self.mouse_press_view.is_some()
+            || self.has_held_mouse()
+            || !self
+                .parent_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.finish_mouse_for_input();
+                let visual = self.visual.active();
+                let select = visual.then_some(mouse.modifiers.contains(KeyModifiers::CONTROL));
+                if visual && self.visual_busy() {
+                    if !self.try_enqueue_visual(VisualIntent::Parent(select)) {
+                        return true;
+                    }
+                } else {
+                    self.focus_parent(false);
+                    if let Some(remove) = select {
+                        self.select_parent_contents(remove);
+                    }
+                }
+                self.parent_press = Some(ParentPress {
+                    directory: self.directory,
+                    area: self.parent_area,
+                    position: (mouse.column, mouse.row),
+                    activate: !visual,
+                });
+                true
+            }
+            MouseEventKind::Moved => {
+                if self.visual.active() && self.visual_busy() {
+                    self.try_enqueue_visual(VisualIntent::Parent(None));
+                } else {
+                    self.focus_parent(false);
+                }
+                true
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.list_area.height > 0 => {
+                // The pinned row is part of the scrollable pane's mouse surface.
+                self.mouse(MouseEvent {
+                    row: self.list_area.y,
+                    ..mouse
+                });
+                if self.visual.active() && self.visual_busy() {
+                    self.try_enqueue_visual(VisualIntent::Parent(None));
+                } else {
+                    self.focus_parent(false);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn edge_selection(&mut self, end: bool) {
+        self.parent_selected = false;
         self.track_selection();
         self.pending_navigation = Some(Navigation::new(Some(end), 0));
         self.advance_navigation();
@@ -1163,6 +2028,14 @@ impl App {
         let mut complete = false;
         for _ in 0..budget {
             let Some(index) = cursor.next else {
+                if self.parent_navigation && backwards && cursor.remaining > 0 {
+                    let select = self.range_requested && self.visual.active();
+                    self.focus_parent(true);
+                    if select {
+                        self.select_parent_contents(false);
+                    }
+                    return;
+                }
                 complete = cursor.target.is_some();
                 break;
             };
@@ -1189,6 +2062,8 @@ impl App {
             }
         }
         if complete {
+            self.parent_selected = false;
+            self.parent_navigation = false;
             let previous_selected = self.selected;
             self.selected = cursor.target;
             if self.cursor_mode == CursorMode::Waiting {
@@ -1205,10 +2080,11 @@ impl App {
                         .begin_range(Arc::clone(&self.view), id, RangeMode::Add);
                 }
                 self.range_requested = false;
-            } else if self.visual.active() && previous_selected != self.selected {
-                if let Some(id) = self.selected {
-                    self.visual.reanchor(id);
-                }
+            } else if self.visual.active()
+                && previous_selected != self.selected
+                && let Some(id) = self.selected
+            {
+                self.visual.reanchor(id);
             }
             if let Some(end) = navigation.end {
                 self.offset = if end {
@@ -1243,7 +2119,74 @@ impl App {
         }
         self.reset_order(true);
     }
+    fn request_quit_confirmation(&mut self) -> Action {
+        if matches!(self.modal, Some(Modal::ConfirmQuit { .. })) {
+            return Action::Continue;
+        }
+        let mut previous = self.modal.take();
+        if let Some(
+            Modal::Delete {
+                confirm_requested,
+                reviewable,
+                ..
+            }
+            | Modal::Batch {
+                confirm_requested,
+                reviewable,
+                ..
+            },
+        ) = previous.as_mut()
+        {
+            // Returning from an unrelated prompt requires a new confirmation.
+            *confirm_requested = false;
+            *reviewable = false;
+        }
+        self.dialog_mouse.press = None;
+        self.dialog_mouse.hovered = None;
+        self.modal = Some(Modal::ConfirmQuit {
+            previous: Box::new(previous),
+            reviewable: false,
+        });
+        Action::Continue
+    }
+
+    fn finishing_deletions(&self) -> bool {
+        self.modal
+            .as_ref()
+            .is_some_and(|modal| matches!(modal.underlying(), Modal::Quit { .. }))
+    }
+
+    fn background_modal_slot(&mut self) -> &mut Option<Modal> {
+        if self.finishing_deletions() {
+            &mut self.previous_modal
+        } else {
+            underlying_modal_slot(&mut self.modal)
+        }
+    }
+
+    fn approve_quit_confirmation(&mut self, deleting: bool) -> Action {
+        if !deleting {
+            Action::Quit
+        } else if matches!(self.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
+            // A previous quit request is already waiting for confirmed jobs.
+            Action::Continue
+        } else {
+            self.previous_modal = self.modal.take();
+            self.modal = Some(Modal::Quit { reviewable: false });
+            Action::QuitWarning
+        }
+    }
+
     fn key(&mut self, key: KeyEvent, anchor: Option<Arc<RootAnchor>>, deleting: bool) -> Action {
+        self.breadcrumbs.pressed = None;
+        self.header_right_press = None;
+        self.cancel_right_press();
+        self.dialog_mouse.press = None;
+        self.dialog_mouse.hovered = None;
+        self.parent_press = None;
+        self.control_press = None;
+        self.control_hovered = None;
+        self.queue_drag = None;
         let previous_hover = self.hover_position;
         let interrupt =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
@@ -1293,6 +2236,37 @@ impl App {
             )
         {
             self.normal_click = None;
+        }
+        if matches!(self.modal, Some(Modal::ConfirmQuit { .. })) {
+            let Some(Modal::ConfirmQuit {
+                previous,
+                reviewable,
+            }) = self.modal.take()
+            else {
+                unreachable!()
+            };
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => self.modal = *previous,
+                KeyCode::Enter | KeyCode::Char('y') if reviewable => {
+                    self.modal = *previous;
+                    return self.approve_quit_confirmation(deleting);
+                }
+                _ if interrupt => {
+                    self.modal = *previous;
+                    return if matches!(self.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
+                        Action::Quit
+                    } else {
+                        self.approve_quit_confirmation(deleting)
+                    };
+                }
+                _ => {
+                    self.modal = Some(Modal::ConfirmQuit {
+                        previous,
+                        reviewable,
+                    })
+                }
+            }
+            return Action::Continue;
         }
         // Ctrl-C remains an escape hatch before a dialog has been painted and
         // in terminals too small to display ordinary confirmation choices.
@@ -1405,6 +2379,7 @@ impl App {
                         _ => Action::Continue,
                     };
                 }
+                Modal::ConfirmQuit { .. } => unreachable!("quit confirmation handled above"),
                 Modal::Quit { reviewable } => match key.code {
                     KeyCode::Enter | KeyCode::Char('q') if reviewable => return Action::Quit,
                     KeyCode::Esc | KeyCode::Char('n') => self.modal = self.previous_modal.take(),
@@ -1420,6 +2395,7 @@ impl App {
                     count,
                     ready,
                     reviewable,
+                    mut confirm_requested,
                     mut scroll,
                 } => match key.code {
                     KeyCode::Char('y') | KeyCode::Enter if ready && reviewable && count > 0 => {
@@ -1429,14 +2405,22 @@ impl App {
                         self.modal = Some(Modal::Enqueueing);
                         return Action::BatchConfirm;
                     }
-                    KeyCode::Char('n') | KeyCode::Esc => return Action::BatchCancel,
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.cancel_deferred_batch();
+                        return Action::BatchCancel;
+                    }
                     other => {
-                        scroll_key(other, &mut scroll);
+                        if reviewable && matches!(other, KeyCode::Char('y') | KeyCode::Enter) {
+                            confirm_requested = true;
+                        } else {
+                            scroll_key(other, &mut scroll);
+                        }
                         self.modal = Some(Modal::Batch {
                             target,
                             count,
                             ready,
                             reviewable,
+                            confirm_requested,
                             scroll,
                         })
                     }
@@ -1448,6 +2432,7 @@ impl App {
                     target,
                     mut scroll,
                     reviewable,
+                    mut confirm_requested,
                     confirmed,
                     capture,
                 } => {
@@ -1457,7 +2442,13 @@ impl App {
                         {
                             return Action::Delete(id, anchor, relative, confirmed.unwrap());
                         }
-                        KeyCode::Char('n') | KeyCode::Esc => return Action::Continue,
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            self.deferred_delete = None;
+                            return Action::Continue;
+                        }
+                        KeyCode::Char('y') | KeyCode::Enter if reviewable => {
+                            confirm_requested = true;
+                        }
                         other => scroll_key(other, &mut scroll),
                     }
                     self.modal = Some(Modal::Delete {
@@ -1467,6 +2458,7 @@ impl App {
                         target,
                         scroll,
                         reviewable,
+                        confirm_requested,
                         confirmed,
                         capture,
                     });
@@ -1476,33 +2468,6 @@ impl App {
                     text,
                     mut scroll,
                 } => match key.code {
-                    KeyCode::Enter
-                        if matches!(
-                            title,
-                            "Selecting entries" | "Preparing selection" | "Stopping selection"
-                        ) =>
-                    {
-                        self.modal = Some(Modal::Text {
-                            title,
-                            text,
-                            scroll,
-                        });
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')
-                        if matches!(
-                            title,
-                            "Stopping selection"
-                                | "Preparing selection"
-                                | "Selecting entries"
-                                | "Stopping target"
-                        ) =>
-                    {
-                        if title == "Stopping target" {
-                            self.deferred_delete = None;
-                        } else {
-                            self.cancel_deferred_batch();
-                        }
-                    }
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {}
                     KeyCode::Char('?') if title != "Help" => {
                         self.modal = Some(Modal::help(self.visual.active()))
@@ -1638,10 +2603,12 @@ impl App {
                         if !self.try_enqueue_visual(VisualIntent::ToggleCurrent) {
                             self.hover_position = previous_hover;
                         }
-                    } else if let Some(id) = self.selected {
-                        if !self.try_enqueue_visual(VisualIntent::ToggleStable(id)) {
-                            self.hover_position = previous_hover;
-                        }
+                    } else if self.parent_selected {
+                        self.try_enqueue_visual(VisualIntent::ToggleParent);
+                    } else if let Some(id) = self.selected
+                        && !self.try_enqueue_visual(VisualIntent::ToggleStable(id))
+                    {
+                        self.hover_position = previous_hover;
                     }
                 }
                 return Action::Continue;
@@ -1690,6 +2657,9 @@ impl App {
                     self.visual
                         .enter(self.directory, self.selected.filter(|_| !pending));
                     self.range_requested = pending;
+                    if self.parent_selected {
+                        self.select_parent_contents(false);
+                    }
                 }
             }
             KeyCode::Esc if self.visual.active() => {
@@ -1707,25 +2677,29 @@ impl App {
                 if !self.visual.active() && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 let direction = if key.code == KeyCode::Up { -1 } else { 1 };
-                self.move_selection(direction * self.page_size as isize);
+                self.browser_move_selection(direction * self.page_size as isize);
             }
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::Home => self.edge_selection(false),
-            KeyCode::End => self.edge_selection(true),
-            KeyCode::PageUp => self.move_selection(-(self.page_size as isize)),
-            KeyCode::PageDown => self.move_selection(self.page_size as isize),
+            KeyCode::Up | KeyCode::Char('k') => self.browser_move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.browser_move_selection(1),
+            KeyCode::Home => self.browser_edge_selection(false),
+            KeyCode::End => self.browser_edge_selection(true),
+            KeyCode::PageUp => self.browser_move_selection(-(self.page_size as isize)),
+            KeyCode::PageDown => self.browser_move_selection(self.page_size as isize),
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Char('<') => {
                 self.navigate_parent();
             }
             KeyCode::Enter if self.visual.active() => {
-                if let Some(id) = self.selected {
+                if self.parent_selected {
+                    self.select_parent_contents(false);
+                } else if let Some(id) = self.selected {
                     self.visual.toggle(id);
                     self.range_requested = false;
                 }
             }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(id) = self.selected {
+                if self.parent_selected {
+                    self.navigate_parent();
+                } else if let Some(id) = self.selected {
                     self.navigate_directory(id);
                 }
             }
@@ -1787,11 +2761,18 @@ impl App {
                                 .as_ref()
                                 .is_some_and(|finished| !finished.load(Ordering::Acquire))
                             {
+                                self.modal = Some(Modal::Delete {
+                                    id: request.id,
+                                    anchor: Arc::clone(&request.anchor),
+                                    relative: request.relative.clone(),
+                                    target: request.target.clone(),
+                                    scroll: 0,
+                                    reviewable: false,
+                                    confirm_requested: false,
+                                    confirmed: None,
+                                    capture: None,
+                                });
                                 self.deferred_delete = Some(request);
-                                self.modal = Some(Modal::notice(
-                                    "Stopping target",
-                                    "Waiting for the previous target check to stop.".to_owned(),
-                                ));
                             } else {
                                 self.open_delete(request);
                             }
@@ -1820,39 +2801,36 @@ impl App {
         self.queue_view.cancelling = queue.is_cancelling();
         self.queue_view.pending = queue.pending().len();
         self.queue_view.paused = queue.is_paused();
-        self.queue_view.status = if queue.is_updating() {
-            "Updating queue".to_owned()
-        } else if let Some(progress) = queue.progress() {
-            format!(
-                "{} · {} removed · {} queued",
-                if queue.is_cancelling() {
-                    "Cancelling"
-                } else {
-                    "Deleting"
-                },
-                progress.removed_entries,
-                queue.pending().len()
-            )
-        } else if !queue.pending().is_empty() {
-            format!(
-                "{} queued{}",
-                queue.pending().len(),
-                if queue.is_paused() { " · Paused" } else { "" }
-            )
+        self.queue_view.status = if !queue.pending().is_empty() {
+            format!("{} queued", queue.pending().len())
+        } else if queue.active().is_some() || queue.is_updating() {
+            "deleting…".to_owned()
         } else {
             String::new()
         };
         let Some(Modal::Queue { selected, offset }) = self.modal.as_mut() else {
             self.queue_view.rows.clear();
+            self.queue_drag = None;
+            self.queue_area = Rect::default();
             return;
         };
+        let row_area = queue_layout(area).2[1];
+        if self.queue_area != row_area
+            || self.queue_drag.as_ref().is_some_and(|drag| {
+                queue.entry(drag.id).is_none()
+                    || queue.active().is_some_and(|entry| entry.id == drag.id) != drag.active
+            })
+        {
+            self.queue_drag = None;
+        }
+        self.queue_area = row_area;
         if selected.is_none_or(|id| queue.entry(id).is_none()) {
             *selected = queue.first_id();
         }
         if offset.is_none_or(|id| queue.entry(id).is_none()) {
             *offset = *selected;
         }
-        let visible = usize::from(queue_layout(area).2[1].height).clamp(1, 12);
+        let visible = usize::from(queue_layout(area).2[1].height).clamp(1, 15);
         if queue.pending().len() + usize::from(queue.active().is_some()) <= visible {
             *offset = queue.first_id();
         }
@@ -1885,6 +2863,16 @@ impl App {
             ));
             cursor = queue.next_id(id);
         }
+        let last_position = (queue.pending().len() + usize::from(queue.active().is_some()))
+            .saturating_sub(self.queue_view.rows.len());
+        self.queue_view.scroll_position =
+            if self.queue_view.rows.first().map(|row| row.0) == queue.first_id() {
+                0
+            } else if self.queue_view.rows.last().map(|row| row.0) == queue.last_id() {
+                last_position
+            } else {
+                last_position.div_ceil(2)
+            };
     }
 
     fn queue_navigate(&mut self, queue: &DeleteQueue, end: Option<bool>, amount: isize) {
@@ -1911,17 +2899,248 @@ impl App {
         }
     }
 
+    /// Queue gestures use the painted IDs, never row indices into a changing queue.
+    fn queue_mouse(&mut self, mouse: MouseEvent, queue: &mut DeleteQueue) -> Option<Action> {
+        if !matches!(self.modal, Some(Modal::Queue { .. })) {
+            self.queue_drag = None;
+            return None;
+        }
+        self.hover_position = None;
+        self.breadcrumbs.hovered = None;
+        self.normal_click = None;
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let inside = self.queue_area.contains(position);
+        let inside_popup = inside || queue_layout(self.control_frame).0.contains(position);
+        let painted = inside
+            .then(|| {
+                self.queue_view
+                    .rows
+                    .get(usize::from(mouse.row - self.queue_area.y))
+            })
+            .flatten()
+            .filter(|(id, active, _)| {
+                queue.entry(*id).is_some()
+                    && queue.active().is_some_and(|entry| entry.id == *id) == *active
+            })
+            .map(|(id, active, _)| (*id, *active));
+        let mut action = Action::Continue;
+        match mouse.kind {
+            MouseEventKind::Moved if self.queue_drag.is_none() => {
+                if let (Some((id, _)), Some(Modal::Queue { selected, .. })) =
+                    (painted, self.modal.as_mut())
+                {
+                    *selected = Some(id);
+                }
+            }
+            MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
+                self.finish_mouse_for_input();
+                self.queue_drag = None;
+                if let Some((id, active)) = painted {
+                    if let Some(Modal::Queue { selected, .. }) = self.modal.as_mut() {
+                        *selected = Some(id);
+                    }
+                    if mouse.modifiers.is_empty() {
+                        self.queue_drag = Some(QueueDrag {
+                            id,
+                            row: mouse.row,
+                            pressed: (mouse.column, mouse.row),
+                            button,
+                            active,
+                            moved: false,
+                            edge: 0,
+                            next_step: Instant::now(),
+                        });
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self
+                    .queue_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.button == MouseButton::Left)
+                {
+                    self.queue_drag_to(mouse, queue);
+                } else {
+                    self.queue_drag = None;
+                }
+            }
+            MouseEventKind::Up(button @ (MouseButton::Left | MouseButton::Right)) => {
+                // Some terminals omit the final drag event before release.
+                if button == MouseButton::Left
+                    && self.queue_drag.as_ref().is_some_and(|drag| {
+                        drag.button == button && drag.pressed != (mouse.column, mouse.row)
+                    })
+                {
+                    self.queue_drag_to(mouse, queue);
+                }
+                if let Some(drag) = self.queue_drag.take()
+                    && drag.button == button
+                    && !drag.moved
+                    && drag.pressed == (mouse.column, mouse.row)
+                    && painted == Some((drag.id, drag.active))
+                {
+                    if let Some(Modal::Queue { selected, .. }) = self.modal.as_mut() {
+                        *selected = Some(drag.id);
+                    }
+                    action = if button == MouseButton::Right {
+                        Action::QueueDelete
+                    } else {
+                        Action::QueuePause
+                    };
+                }
+                // A browser press held while opening the queue still needs its release.
+                self.mouse(mouse);
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if inside_popup => {
+                self.queue_drag = None;
+                self.queue_navigate(
+                    queue,
+                    None,
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        -3
+                    } else {
+                        3
+                    },
+                );
+            }
+            MouseEventKind::Drag(_) | MouseEventKind::Down(_) | MouseEventKind::Moved => {
+                self.queue_drag = None;
+            }
+            _ => {}
+        }
+        Some(action)
+    }
+
+    fn queue_drag_to(&mut self, mouse: MouseEvent, queue: &mut DeleteQueue) {
+        let Some(drag) = self.queue_drag.as_mut() else {
+            return;
+        };
+        drag.moved = true;
+        if drag.active || queue.pending().get(drag.id).is_none() || self.queue_area.is_empty() {
+            self.queue_drag = None;
+            return;
+        }
+        drag.row = mouse.row;
+        // Moving out through the side does not keep reordering off-screen.
+        if mouse.column < self.queue_area.x || mouse.column >= self.queue_area.right() {
+            drag.edge = 0;
+            return;
+        }
+        let edge = if mouse.row <= self.queue_area.y {
+            -1
+        } else if mouse.row >= self.queue_area.bottom().saturating_sub(1) {
+            1
+        } else {
+            0
+        };
+        if drag.edge != edge {
+            drag.next_step = Instant::now() + FRAME_INTERVAL;
+        }
+        drag.edge = edge;
+        let id = drag.id;
+        let Some(source_row) = self.queue_view.rows.iter().position(|row| row.0 == id) else {
+            self.queue_drag = None;
+            return;
+        };
+        let target_row = usize::from(mouse.row.saturating_sub(self.queue_area.y))
+            .min(self.queue_view.rows.len().saturating_sub(1));
+        let Some(&(target, active, _)) = self.queue_view.rows.get(target_row) else {
+            return;
+        };
+        let target = if active {
+            queue.pending().front().map(|entry| entry.id)
+        } else {
+            Some(target)
+        };
+        let Some(target) =
+            target.filter(|target| *target != id && queue.pending().get(*target).is_some())
+        else {
+            return;
+        };
+        let direction = if target_row < source_row { -1 } else { 1 };
+        // At most a painted page is examined. Never partially reorder toward a
+        // target that disappeared or is no longer on this side of the press.
+        let mut cursor = id;
+        let mut steps = 0;
+        for count in 1..=self.queue_view.rows.len() {
+            let next = if direction < 0 {
+                queue.previous_id(cursor)
+            } else {
+                queue.next_id(cursor)
+            };
+            let Some(next) = next else { break };
+            cursor = next;
+            if cursor == target {
+                steps = count;
+                break;
+            }
+        }
+        if steps == 0 {
+            return;
+        }
+        for _ in 0..steps.min(12) {
+            if !queue.move_pending(id, direction) {
+                return;
+            }
+        }
+        self.queue_drag_viewport(queue, id, target_row.max(usize::from(active)));
+    }
+
+    fn queue_drag_viewport(&mut self, queue: &DeleteQueue, id: QueueId, row: usize) {
+        let mut first = id;
+        for _ in 0..row.min(14) {
+            let Some(previous) = queue.previous_id(first) else {
+                break;
+            };
+            first = previous;
+        }
+        if let Some(Modal::Queue { selected, offset }) = self.modal.as_mut() {
+            *selected = Some(id);
+            *offset = Some(first);
+        }
+    }
+
+    /// One linked-list swap per timer tick keeps edge drags independent of queue length.
+    fn pump_queue_drag(&mut self, queue: &mut DeleteQueue) -> bool {
+        let Some(drag) = self.queue_drag.as_mut() else {
+            return false;
+        };
+        if !matches!(self.modal, Some(Modal::Queue { .. }))
+            || queue.entry(drag.id).is_none()
+            || queue.active().is_some_and(|entry| entry.id == drag.id) != drag.active
+            || self.queue_area.is_empty()
+        {
+            self.queue_drag = None;
+            return false;
+        }
+        if drag.button != MouseButton::Left || drag.active || !drag.moved {
+            return false;
+        }
+        let now = Instant::now();
+        if drag.edge == 0 || now < drag.next_step {
+            return false;
+        }
+        drag.next_step = now + FRAME_INTERVAL;
+        let id = drag.id;
+        let row = usize::from(drag.row.saturating_sub(self.queue_area.y))
+            .min(usize::from(self.queue_area.height.saturating_sub(1)));
+        if !queue.move_pending(id, drag.edge) {
+            // A queue boundary must not keep an otherwise idle UI repainting.
+            drag.edge = 0;
+            return false;
+        }
+        self.queue_drag_viewport(queue, id, row);
+        true
+    }
+
     fn cancel_deferred_batch(&mut self) {
-        self.waiting_batch = None;
-        for modal in [&mut self.modal, &mut self.previous_modal] {
-            if matches!(
-                modal,
-                Some(Modal::Text {
-                    title: "Selecting entries",
-                    ..
-                })
-            ) {
-                *modal = None;
+        let pending = self.waiting_batch.take().is_some() || self.deferred_batch.is_some();
+        if pending {
+            for modal in [&mut self.modal, &mut self.previous_modal] {
+                let modal = underlying_modal_slot(modal);
+                if matches!(modal, Some(Modal::Batch { .. })) {
+                    *modal = None;
+                }
             }
         }
         if let Some(request) = self.deferred_batch.take() {
@@ -1931,18 +3150,22 @@ impl App {
     }
 
     fn open_delete(&mut self, request: DeleteRequest) {
-        if matches!(
-            self.modal,
-            Some(Modal::Text {
-                title: "Stopping target",
+        let (confirm_requested, reviewable) = match self.modal.as_ref() {
+            Some(Modal::Delete {
+                id,
+                relative,
+                confirm_requested,
+                reviewable,
                 ..
-            })
-        ) {
-            self.modal = None;
-        }
+            }) if *id == request.id && *relative == request.relative => {
+                (*confirm_requested, *reviewable)
+            }
+            _ => (false, false),
+        };
         if !self.model.is_live(request.id)
             || self.model.path(request.id) != self.root.join(&request.relative)
         {
+            self.modal = None;
             return;
         }
         let (capture, finished) =
@@ -1954,7 +3177,8 @@ impl App {
             relative: request.relative,
             target: request.target,
             scroll: 0,
-            reviewable: false,
+            reviewable,
+            confirm_requested,
             confirmed: None,
             capture: Some(capture),
         });
@@ -1970,6 +3194,49 @@ impl App {
         }
     }
 
+    fn batch_confirmation_state(&self) -> (bool, bool) {
+        match self.modal {
+            Some(Modal::Batch {
+                confirm_requested,
+                reviewable,
+                ..
+            }) => (confirm_requested, reviewable),
+            _ => (false, false),
+        }
+    }
+
+    fn confirmation_ready(&self) -> bool {
+        matches!(
+            self.modal,
+            Some(
+                Modal::Delete {
+                    confirm_requested: true,
+                    reviewable: true,
+                    confirmed: Some(_),
+                    ..
+                } | Modal::Batch {
+                    confirm_requested: true,
+                    reviewable: true,
+                    ready: true,
+                    count: 1..,
+                    ..
+                }
+            )
+        )
+    }
+
+    fn take_ready_confirmation(&mut self) -> Action {
+        if self.confirmation_ready() {
+            self.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false,
+            )
+        } else {
+            Action::Continue
+        }
+    }
+
     fn pump_confirmation(&mut self) {
         if self
             .capture_inflight
@@ -1977,66 +3244,49 @@ impl App {
             .is_some_and(|finished| finished.load(Ordering::Acquire))
         {
             self.capture_inflight = None;
-            if matches!(
-                self.modal,
-                Some(Modal::Text {
-                    title: "Stopping target",
-                    ..
-                })
-            ) {
-                self.modal = None;
-            }
         }
         if self.capture_inflight.is_none()
             && (self.modal.is_none()
                 || matches!(
                     self.modal,
-                    Some(Modal::Text {
-                        title: "Stopping target",
+                    Some(Modal::Delete {
+                        confirmed: None,
+                        capture: None,
                         ..
                     })
                 ))
+            && let Some(request) = self.deferred_delete.take()
         {
-            if let Some(request) = self.deferred_delete.take() {
-                self.open_delete(request);
-            }
+            self.open_delete(request);
         }
         let mut error = None;
-        let modal = if matches!(self.modal, Some(Modal::Quit { .. })) {
-            self.previous_modal.as_mut()
-        } else {
-            self.modal.as_mut()
-        };
+        let modal = self.background_modal_slot().as_mut();
         if let Some(Modal::Delete {
             confirmed, capture, ..
         }) = modal
+            && let Some(receiver) = capture.as_ref()
         {
-            if let Some(receiver) = capture.as_ref() {
-                match receiver.try_recv() {
-                    Ok(Ok(target)) => {
-                        *confirmed = Some(target);
-                        *capture = None;
-                    }
-                    Ok(Err(failure)) => error = Some(failure.to_string()),
-                    Err(TryRecvError::Disconnected) => {
-                        error = Some("Could not check deletion target.".to_owned())
-                    }
-                    Err(TryRecvError::Empty) => {}
+            match receiver.try_recv() {
+                Ok(Ok(target)) => {
+                    *confirmed = Some(target);
+                    *capture = None;
                 }
+                Ok(Err(failure)) => error = Some(failure.to_string()),
+                Err(TryRecvError::Disconnected) => {
+                    error = Some("Could not check deletion target.".to_owned())
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
         if let Some(error) = error {
             let notice = Modal::notice("Cannot delete", printable(OsStr::new(&error)));
-            if matches!(self.modal, Some(Modal::Quit { .. })) {
-                self.previous_modal = Some(notice);
-            } else {
-                self.modal = Some(notice);
-            }
+            *self.background_modal_slot() = Some(notice);
         }
     }
 
     fn visual_busy(&self) -> bool {
-        self.visual.is_pending()
+        self.parent_select_pending
+            || self.visual.is_pending()
             || self.pending_navigation.is_some()
             || self.range_requested
             || !self.visual_intents.is_empty()
@@ -2053,10 +3303,12 @@ impl App {
             || !self.unsent.is_empty()
             || !self.removals.is_empty()
             || self.visual.is_pending()
+            || self.parent_selection_work()
             || self.pending_navigation.is_some()
             || self.range_requested
     }
 
+    #[cfg(test)]
     fn visual_input_available(&self) -> bool {
         self.modal.is_some() || self.visual_intents.len() < VISUAL_INTENT_LIMIT
     }
@@ -2070,6 +3322,8 @@ impl App {
                         | VisualIntent::ScrollViewport(_)
                         | VisualIntent::Hover(_)
                         | VisualIntent::Mouse(_)
+                        | VisualIntent::Parent(_)
+                        | VisualIntent::SelectStable(_)
                 )
             })
     }
@@ -2167,6 +3421,7 @@ impl App {
     }
 
     fn focus_mouse_lead(&mut self, view: &CachedSnapshot, anchor: NodeId, lead: NodeId) {
+        self.parent_selected = false;
         let live = |id| self.eligible(id) && self.model.node(id).parent == Some(self.directory);
         // Keep deleted endpoints as frozen range positions, and repair focus
         // separately. Any longer search continues through bounded navigation.
@@ -2231,17 +3486,33 @@ impl App {
     }
 
     fn finish_mouse_for_input(&mut self) {
+        self.finish_mouse_capture(true);
+    }
+
+    fn finish_mouse_capture(&mut self, complete_shift_click: bool) {
+        self.breadcrumbs.pressed = None;
+        if !complete_shift_click
+            && self
+                .held_mouse()
+                .is_some_and(|gesture| gesture.mode == RangeMode::Invert && !gesture.dragged)
+        {
+            self.cancel_held_mouse();
+        }
         if let Some(gesture) = self.held_mouse() {
             gesture.released = true;
+            gesture.edge = 0;
         }
-        if self.mouse_dragging && !self.drag_started && self.drag_mode == RangeMode::Invert {
-            if let Some(id) = self.drag_anchor {
-                let view = self
-                    .mouse_press_view
-                    .as_ref()
-                    .map_or_else(|| Arc::clone(&self.painted_view), Arc::clone);
-                self.add_mouse_range(view, id);
-            }
+        if complete_shift_click
+            && self.mouse_dragging
+            && !self.drag_started
+            && self.drag_mode == RangeMode::Invert
+            && let Some(id) = self.drag_anchor
+        {
+            let view = self
+                .mouse_press_view
+                .as_ref()
+                .map_or_else(|| Arc::clone(&self.painted_view), Arc::clone);
+            self.add_mouse_range(view, id);
         }
         self.retire_mouse_press();
         self.mouse_dragging = false;
@@ -2249,6 +3520,28 @@ impl App {
         self.drag_anchor = None;
         self.drag_scroll = None;
         self.mouse_position = None;
+    }
+
+    fn reject_stale_mouse_geometry(&mut self, kind: MouseEventKind, size: (u16, u16)) -> bool {
+        if size == (self.control_frame.width, self.control_frame.height) {
+            return false;
+        }
+        self.header_right_press = None;
+        self.parent_press = None;
+        self.dialog_mouse.press = None;
+        self.control_press = None;
+        self.control_hovered = None;
+        self.queue_drag = None;
+        self.cancel_right_press();
+        self.cancel_breadcrumb_press();
+        if kind == MouseEventKind::Up(MouseButton::Left) {
+            // A physical release still ends capture when its old hitboxes are
+            // unusable. Keep accepted presses/ranges, without inventing a final
+            // drag endpoint, opening a directory, or completing a Shift click.
+            self.finish_mouse_capture(false);
+            self.hover_position = None;
+        }
+        true
     }
 
     fn set_drag_edge(&mut self, edge: isize, id: NodeId) {
@@ -2321,15 +3614,17 @@ impl App {
             .visual_intents
             .iter()
             .rposition(|intent| matches!(intent, VisualIntent::Mouse(gesture) if !gesture.released))
+            && let Some(VisualIntent::Mouse(gesture)) = self.visual_intents.remove(index)
         {
-            if let Some(VisualIntent::Mouse(gesture)) = self.visual_intents.remove(index) {
-                self.visual
-                    .retire_snapshot_and_order(im::HashSet::new(), gesture.view);
-            }
+            self.visual
+                .retire_snapshot_and_order(im::HashSet::new(), gesture.view);
         }
     }
 
     fn clear_visual_intent(&mut self) {
+        self.cancel_right_press();
+        self.cancel_parent_selection();
+        self.parent_press = None;
         self.hover_position = None;
         self.cancel_deferred_batch();
         self.range_requested = false;
@@ -2353,6 +3648,7 @@ impl App {
     }
 
     fn pump_visual(&mut self) -> bool {
+        let parent_progress = self.pump_parent_selection();
         let scrolled = self.pump_mouse_scroll(Instant::now());
         let model = &self.model;
         let directory = self.directory;
@@ -2361,9 +3657,11 @@ impl App {
             model.is_live(id)
                 && model.node(id).parent == Some(directory)
                 && (hidden || !model.node(id).name.as_encoded_bytes().starts_with(b"."))
-        }) || scrolled;
+        }) || scrolled
+            || parent_progress;
         for _ in 0..VISUAL_INTENT_LIMIT {
-            if self.visual.is_pending()
+            if self.parent_select_pending
+                || self.visual.is_pending()
                 || self.pending_navigation.is_some()
                 || self.range_requested
                 || self.mouse_dragging
@@ -2384,15 +3682,25 @@ impl App {
                     self.range_requested = extend;
                     self.prioritize_requested = true;
                     if let Some(end) = navigation.end {
-                        self.edge_selection(end);
+                        self.browser_edge_selection(end);
                     }
                     if navigation.amount != 0 {
-                        self.move_selection(navigation.amount);
+                        self.browser_move_selection(navigation.amount);
                     }
                 }
                 VisualIntent::ToggleCurrent => {
-                    if let Some(id) = self.selected.filter(|&id| self.eligible(id)) {
+                    if self.parent_selected {
+                        self.select_parent_contents(false);
+                    } else if let Some(id) = self.selected.filter(|&id| self.eligible(id)) {
                         self.visual.toggle(id);
+                    }
+                }
+                VisualIntent::SelectStable(id) => self.select_clicked_entry(id),
+                VisualIntent::ToggleParent => self.select_parent_contents(false),
+                VisualIntent::Parent(select) => {
+                    self.focus_parent(false);
+                    if let Some(remove) = select {
+                        self.select_parent_contents(remove);
                     }
                 }
                 VisualIntent::ToggleStable(id) => {
@@ -2420,6 +3728,7 @@ impl App {
                         {
                             self.visual.reanchor(id);
                         }
+                        self.parent_selected = false;
                         self.selected = Some(id);
                         self.prioritize_requested = true;
                     }
@@ -2436,13 +3745,26 @@ impl App {
                             || gesture.mode == RangeMode::Invert
                             || self.eligible(gesture.lead))
                     {
+                        // Live origins use selection after older queued input.
+                        // Removal discards that membership, so a vanished origin
+                        // falls back to the direction captured at physical press.
+                        let origin_selected = if self.model.is_live(gesture.anchor) {
+                            self.visual.contains(gesture.anchor)
+                        } else {
+                            gesture.origin_selected
+                        };
+                        let mode = if gesture.mode == RangeMode::Add && origin_selected {
+                            RangeMode::Remove
+                        } else {
+                            gesture.mode
+                        };
                         if !gesture.released {
                             self.retire_mouse_press();
                             self.mouse_baseline = Some(self.visual.snapshot());
                             self.mouse_press_view = Some(Arc::clone(&gesture.view));
                             self.view = Arc::clone(&gesture.view);
                             self.offset = gesture.offset;
-                            self.drag_mode = gesture.mode;
+                            self.drag_mode = mode;
                             self.drag_anchor = Some(gesture.anchor);
                         }
                         if gesture.dragged {
@@ -2450,11 +3772,8 @@ impl App {
                             if !self.model.is_live(gesture.anchor) {
                                 self.visual.remove(gesture.anchor);
                             }
-                            self.visual.begin_range(
-                                Arc::clone(&gesture.view),
-                                gesture.lead,
-                                gesture.mode,
-                            );
+                            self.visual
+                                .begin_range(Arc::clone(&gesture.view), gesture.lead, mode);
                             self.drag_started = !gesture.released;
                             self.mouse_dragging = !gesture.released;
                             if !gesture.released {
@@ -2660,6 +3979,7 @@ impl App {
             if self.visual.active() && self.selected != Some(id) {
                 self.visual.reanchor(id);
             }
+            self.parent_selected = false;
             self.selected = Some(id);
             self.bind_visual_cursor(Some(id));
         }
@@ -2667,7 +3987,420 @@ impl App {
         self.prioritize_requested = true;
     }
 
+    fn control_dialog(&self) -> Option<(std::mem::Discriminant<Modal>, usize)> {
+        self.modal.as_ref().map(|modal| {
+            // Strings move with their dialog. Their allocation identifies a
+            // replacement report or notice even if it has the same variant.
+            let identity = match modal {
+                Modal::ConfirmQuit { previous, .. } => {
+                    std::ptr::from_ref(previous.as_ref()) as usize
+                }
+                Modal::Text { text, .. } => text.as_ptr() as usize,
+                Modal::Batch { target, .. } | Modal::Delete { target, .. } => {
+                    target.as_ptr() as usize
+                }
+                Modal::DeleteErrors { .. } => self
+                    .delete_notices
+                    .front()
+                    .map_or(0, |report| report.target.as_ptr() as usize),
+                _ => 0,
+            };
+            (std::mem::discriminant(modal), identity)
+        })
+    }
+
+    fn modal_option_mouse(&mut self, mouse: MouseEvent, deleting: bool) -> Option<Action> {
+        let dialog = self.control_dialog();
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let hit = (dialog.is_some() && dialog == self.painted_control_dialog)
+            .then(|| {
+                self.dialog_mouse
+                    .options
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .find(|option| option.area.contains(position))
+            })
+            .flatten();
+        self.dialog_mouse.hovered = hit.map(|option| option.key);
+        if let Some(press) = self.dialog_mouse.press {
+            if press.dialog != dialog
+                || (matches!(self.modal, Some(Modal::Queue { .. }))
+                    && press.option.key.code == KeyCode::Char('d')
+                    && press.queue_target != self.queue_selection())
+                || press.frame != self.control_frame
+                || hit != Some(press.option)
+                || matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(_)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight
+                )
+                || (mouse.kind == MouseEventKind::Moved
+                    && press.position != (mouse.column, mouse.row))
+            {
+                self.dialog_mouse.press = None;
+                self.dialog_mouse.hovered = None;
+                // A cancelled option gesture must not become a queue gesture.
+                return Some(Action::Continue);
+            }
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.dialog_mouse.press = None;
+                return Some(self.key(press.option.key, None, deleting));
+            }
+            return Some(Action::Continue);
+        }
+        if let Some(option) = hit {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.finish_mouse_for_input();
+                self.parent_press = None;
+                self.control_press = None;
+                self.queue_drag = None;
+                self.cancel_breadcrumb_press();
+                self.dialog_mouse.press = Some(DialogOptionPress {
+                    option,
+                    position: (mouse.column, mouse.row),
+                    dialog,
+                    frame: self.control_frame,
+                    queue_target: self.queue_selection(),
+                });
+                return Some(Action::Continue);
+            }
+            if mouse.kind == MouseEventKind::Moved && self.queue_drag.is_none() {
+                return Some(Action::Continue);
+            }
+        }
+        None
+    }
+
+    fn scroll_modal_mouse(&mut self, mouse: MouseEvent) {
+        if self.control_dialog() != self.painted_control_dialog
+            || !self
+                .dialog_mouse
+                .scroll_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
+            return;
+        }
+        let up = match mouse.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                if let Some(Modal::DeleteErrors { horizontal, .. }) = self.modal.as_mut() {
+                    *horizontal = if mouse.kind == MouseEventKind::ScrollLeft {
+                        horizontal.saturating_sub(8)
+                    } else {
+                        horizontal.saturating_add(8)
+                    };
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.dialog_mouse.press = None;
+        let max = self.dialog_mouse.scroll_max;
+        match self.modal.as_mut() {
+            Some(Modal::DeleteErrors { scroll, .. }) => {
+                *scroll = if up {
+                    scroll.saturating_sub(3)
+                } else {
+                    scroll.saturating_add(3).min(max)
+                };
+            }
+            Some(
+                Modal::Text { scroll, .. }
+                | Modal::Delete { scroll, .. }
+                | Modal::Batch { scroll, .. },
+            ) => {
+                *scroll = if up {
+                    scroll.saturating_sub(3)
+                } else {
+                    scroll
+                        .saturating_add(3)
+                        .min(u16::try_from(max).unwrap_or(u16::MAX))
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn control_at(&self, column: u16, row: u16, deleting: bool) -> Option<(MouseControl, Rect)> {
+        if self.control_dialog() != self.painted_control_dialog {
+            return None;
+        }
+        let position = ratatui::layout::Position::new(column, row);
+        let controls = if self.modal.is_some() {
+            [
+                (MouseControl::Close, self.dialog_close_area),
+                (MouseControl::Help, Rect::default()),
+                (MouseControl::Queue, Rect::default()),
+                (MouseControl::VisualDelete, Rect::default()),
+            ]
+        } else {
+            [
+                (MouseControl::Help, self.help_area),
+                (
+                    MouseControl::Queue,
+                    if deleting && !self.visual.active() {
+                        self.header_queue_area
+                    } else {
+                        Rect::default()
+                    },
+                ),
+                (
+                    MouseControl::VisualDelete,
+                    if self.visual.active() {
+                        self.header_delete_area
+                    } else {
+                        Rect::default()
+                    },
+                ),
+                (
+                    MouseControl::SelectionClear,
+                    if self.visual.active() {
+                        self.selection_clear_area
+                    } else {
+                        Rect::default()
+                    },
+                ),
+            ]
+        };
+        controls
+            .into_iter()
+            .find(|(_, area)| area.contains(position))
+    }
+
+    fn header_right_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        let header = Rect::new(
+            self.control_frame.x,
+            self.control_frame.y,
+            self.control_frame.width,
+            self.control_frame.height.min(1),
+        );
+        let position = (mouse.column, mouse.row);
+        let inside = header.contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if let Some(press) = self.header_right_press.take() {
+            let unchanged = press.frame == self.control_frame
+                && press.dialog == self.control_dialog()
+                && press.position == position;
+            if unchanged && inside && mouse.kind == MouseEventKind::Up(MouseButton::Right) {
+                return Some(self.request_quit_confirmation());
+            }
+            if unchanged && mouse.kind == MouseEventKind::Moved {
+                self.header_right_press = Some(press);
+            }
+            // A drag, competing press, scroll, or replaced dialog cancels the
+            // gesture without passing its endpoint into another control.
+            return Some(Action::Continue);
+        }
+        if !inside {
+            return None;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.finish_mouse_for_input();
+                self.parent_press = None;
+                self.cancel_right_press();
+                self.cancel_breadcrumb_press();
+                self.queue_drag = None;
+                self.dialog_mouse.press = None;
+                self.dialog_mouse.hovered = None;
+                self.control_press = None;
+                self.control_hovered = None;
+                self.hover_position = None;
+                self.normal_click = None;
+                if self.control_dialog() == self.painted_control_dialog {
+                    self.header_right_press = Some(HeaderRightPress {
+                        position,
+                        frame: self.control_frame,
+                        dialog: self.control_dialog(),
+                    });
+                }
+                Some(Action::Continue)
+            }
+            MouseEventKind::Up(MouseButton::Right) | MouseEventKind::Drag(MouseButton::Right) => {
+                self.cancel_right_press();
+                Some(Action::Continue)
+            }
+            _ => None,
+        }
+    }
+
+    fn control_mouse(&mut self, mouse: MouseEvent, deleting: bool) -> Option<Action> {
+        let hit = self.control_at(mouse.column, mouse.row, deleting);
+        self.control_hovered = hit.map(|(control, _)| control);
+        if let Some(press) = self.control_press {
+            let changed =
+                self.control_dialog() != press.dialog || hit != Some((press.control, press.area));
+            if changed
+                || matches!(mouse.kind, MouseEventKind::Drag(_))
+                || (mouse.kind == MouseEventKind::Moved
+                    && press.position != (mouse.column, mouse.row))
+            {
+                self.control_press = None;
+                self.control_hovered = None;
+                // A control drag must not become a browser/queue gesture.
+                return Some(Action::Continue);
+            }
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.control_press = None;
+                self.control_hovered = None;
+                return Some(match press.control {
+                    MouseControl::Help => {
+                        self.modal = Some(Modal::help(self.visual.active()));
+                        Action::Continue
+                    }
+                    MouseControl::Queue => {
+                        self.modal = Some(Modal::Queue {
+                            selected: None,
+                            offset: None,
+                        });
+                        Action::Continue
+                    }
+                    MouseControl::VisualDelete => Action::BatchPrepare,
+                    MouseControl::SelectionClear => {
+                        self.clear_visual_intent();
+                        self.visual.exit();
+                        Action::Continue
+                    }
+                    MouseControl::Close => {
+                        let key = if matches!(self.modal, Some(Modal::Stopping)) {
+                            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+                        } else {
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+                        };
+                        self.key(key, None, deleting)
+                    }
+                });
+            }
+            return Some(Action::Continue);
+        }
+        if let Some((control, area)) = hit {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.finish_mouse_for_input();
+                self.parent_press = None;
+                self.cancel_right_press();
+                self.queue_drag = None;
+                self.cancel_breadcrumb_press();
+                self.hover_position = None;
+                self.normal_click = None;
+                self.control_press = Some(ControlPress {
+                    control,
+                    area,
+                    position: (mouse.column, mouse.row),
+                    dialog: self.control_dialog(),
+                });
+                return Some(Action::Continue);
+            }
+            // Releases and drags from another target keep their original
+            // capture, including a visual range passing through the header.
+            if mouse.kind == MouseEventKind::Moved
+                && self.mouse_press_view.is_none()
+                && !self.has_held_mouse()
+                && self.queue_drag.is_none()
+                && self.parent_press.is_none()
+                && self.right_press.is_none()
+            {
+                self.cancel_breadcrumb_press();
+                self.hover_position = None;
+                return Some(Action::Continue);
+            }
+        }
+        None
+    }
+
+    fn cancel_breadcrumb_press(&mut self) {
+        self.breadcrumbs.pressed = None;
+        self.breadcrumbs.hovered = None;
+        self.breadcrumbs.hits.clear();
+    }
+
+    fn breadcrumb_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.modal.is_some()
+            || self.breadcrumbs.directory != Some(self.directory)
+            || self.mouse_press_view.is_some()
+            || self.has_held_mouse()
+        {
+            self.breadcrumbs.pressed = None;
+            self.breadcrumbs.hovered = None;
+            return false;
+        }
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let hit = self
+            .breadcrumbs
+            .hits
+            .iter()
+            .copied()
+            .find(|(area, _)| area.contains(position));
+        self.breadcrumbs.hovered = hit.map(|(_, id)| id);
+        if let Some((directory, id, area, pressed_at)) = self.breadcrumbs.pressed {
+            if directory != self.directory
+                || hit != Some((area, id))
+                || matches!(mouse.kind, MouseEventKind::Drag(_))
+                || (mouse.kind == MouseEventKind::Moved && pressed_at != (mouse.column, mouse.row))
+            {
+                self.breadcrumbs.pressed = None;
+                return true;
+            }
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.breadcrumbs.pressed = None;
+                self.navigate_ancestor(id);
+            }
+            return true;
+        }
+        if let Some((area, id)) = hit {
+            self.hover_position = None;
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.finish_mouse_for_input();
+                self.breadcrumbs.pressed =
+                    Some((self.directory, id, area, (mouse.column, mouse.row)));
+            }
+            return true;
+        }
+        false
+    }
+
+    fn navigate_ancestor(&mut self, ancestor: NodeId) {
+        if ancestor == self.directory || !self.model.is_live(ancestor) {
+            return;
+        }
+        let mut child = self.directory;
+        while child != ROOT {
+            let Some(parent) = self.model.node(child).parent else {
+                return;
+            };
+            if parent == ancestor {
+                self.finish_mouse_for_input();
+                self.selected = Some(child);
+                self.directory = ancestor;
+                self.clear_visual_intent();
+                self.visual.reset(ancestor);
+                self.prioritize_requested = true;
+                self.reset_order(false);
+                self.cancel_breadcrumb_press();
+                return;
+            }
+            child = parent;
+        }
+    }
+
     fn mouse(&mut self, mouse: MouseEvent) {
+        // The pressed parent row owns motion and release even over a
+        // different header target. Leaving and returning cannot become a click.
+        if self.parent_press.is_some() && self.parent_mouse(mouse) {
+            return;
+        }
+        if self.right_browser_mouse(mouse) {
+            return;
+        }
+        if self.breadcrumb_mouse(mouse) {
+            return;
+        }
+        if self.parent_mouse(mouse) {
+            return;
+        }
         // Only admitted physical input owns hover mode; older replay cannot reactivate it.
         let previous_hover = self.hover_position;
         self.hover_position = None;
@@ -2683,16 +4416,6 @@ impl App {
             // Keep capture itself so held rows and visual gestures remain stable.
             self.normal_click = None;
         }
-        let captured_motion = captured
-            && matches!(
-                mouse.kind,
-                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-            );
-        self.back_hovered = self.modal.is_none()
-            && !captured_motion
-            && self
-                .back_area
-                .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
             if self.modal.is_some() {
                 self.cancel_held_mouse();
@@ -2752,26 +4475,9 @@ impl App {
             }
             return;
         }
-        if let Some(Modal::DeleteErrors { scroll, page, .. }) = self.modal.as_mut() {
-            let max = self
-                .delete_notices
-                .front()
-                .map_or(0, |report| report.lines().saturating_sub(*page));
-            match mouse.kind {
-                MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
-                MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3).min(max),
-                _ => {}
-            }
-        }
+        self.scroll_modal_mouse(mouse);
         if self.modal.is_some() {
-            self.back_hovered = false;
-            return;
-        }
-        if self.back_hovered {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.finish_mouse_for_input();
-                self.navigate_parent();
-            }
+            self.breadcrumbs.hovered = None;
             return;
         }
         if matches!(
@@ -2881,6 +4587,7 @@ impl App {
                             lead: id,
                             dragged: false,
                             released: false,
+                            origin_selected: self.visual.contains(id),
                             mode,
                             edge,
                             view: Arc::clone(&self.painted_view),
@@ -2893,6 +4600,11 @@ impl App {
                         }
                         return;
                     }
+                    let mode = if mode == RangeMode::Add && self.visual.contains(id) {
+                        RangeMode::Remove
+                    } else {
+                        mode
+                    };
                     self.mouse_position = Some((mouse.column, mouse.row));
                     self.retire_mouse_press();
                     self.mouse_baseline = Some(self.visual.snapshot());
@@ -2921,6 +4633,7 @@ impl App {
                     self.drag_anchor = Some(id);
                 }
                 self.cursor_mode = CursorMode::Tracked;
+                self.parent_selected = false;
                 self.selected = Some(id);
                 self.pending_navigation = None;
                 self.range_requested = false;
@@ -2972,6 +4685,7 @@ impl App {
                 self.visual
                     .begin_range(Arc::clone(&view), id, self.drag_mode);
                 self.view = view;
+                self.parent_selected = false;
                 self.selected = Some(id);
                 self.pending_navigation = None;
                 self.range_requested = false;
@@ -3003,6 +4717,7 @@ impl App {
                 {
                     self.visual.reanchor(id);
                 }
+                self.parent_selected = false;
                 self.selected = Some(id);
                 self.pending_navigation = None;
                 self.range_requested = false;
@@ -3028,7 +4743,7 @@ impl App {
     }
     fn phase(&self, refreshing: bool, deleting: bool) -> &'static str {
         if deleting {
-            "Deleting…"
+            "deleting…"
         } else if refreshing {
             "Refreshing…"
         } else if !self.started {
@@ -3216,21 +4931,55 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame<'_>, refreshing: bool, deleting: bool) {
         let area = frame.area();
+        if self.control_frame != area {
+            self.header_right_press = None;
+            self.dialog_mouse.press = None;
+            self.dialog_mouse.hovered = None;
+            self.control_press = None;
+            self.control_hovered = None;
+        }
+        self.control_frame = area;
         let header = Rect::new(area.x, area.y, area.width, area.height.min(1));
-        let hint = if self.visual.active() && !self.filter_editing {
-            if area.width >= 60 {
-                "d delete  Esc clear  ? help"
-            } else if area.width >= 40 {
-                "d delete  ? help"
-            } else {
-                "? help"
-            }
+        let visual = self.visual.active();
+        let selection_label = visual.then(|| format!("{} selected", self.visual.len()));
+        let hint = if let Some(count) = selection_label.as_ref() {
+            ["[D] delete  ? help", "delete  ? help", "delete"]
+                .into_iter()
+                .find(|hint| count.len() + hint.len() + 2 <= usize::from(area.width))
+                .unwrap_or("")
         } else {
             "? help"
         };
-        let columns = split_edges(header, Direction::Horizontal, 2, hint.len() as u16 + 2);
-        self.back_area = columns[0];
-        let mut phase_text = if self.filter_editing {
+        let delete_label = if hint.starts_with("[D]") {
+            "[D] delete"
+        } else if hint.starts_with("delete") {
+            "delete"
+        } else {
+            ""
+        };
+        let columns = split_edges(
+            header,
+            Direction::Horizontal,
+            0,
+            hint.len() as u16 + 2 * u16::from(!hint.is_empty()),
+        );
+        let busy =
+            deleting || self.queue_view.pending > 0 || self.queue_view.marks.active.is_some();
+        let queue_status = if !busy {
+            String::new()
+        } else if self.queue_view.pending > 0 {
+            format!("{} queued", self.queue_view.pending)
+        } else {
+            "deleting…".to_owned()
+        };
+        let mut phase_text = if let Some(label) = &selection_label {
+            if self.modal.is_none() && self.control_hovered == Some(MouseControl::SelectionClear) {
+                // Keep the component's painted width and hitbox stable on hover.
+                format!("{:<width$}", "X selected", width = label.len())
+            } else {
+                label.clone()
+            }
+        } else if self.filter_editing {
             format!(
                 "Filter /{}",
                 clipped_tail(
@@ -3238,47 +4987,27 @@ impl App {
                     usize::from(columns[1].width).saturating_sub(8)
                 )
             )
-        } else if self.visual.active() && area.width < 40 {
-            format!("Visual {}", self.visual.len())
-        } else if self.visual.active() {
-            format!(
-                "Visual · {} selected{}",
-                self.visual.len(),
-                if !self.visual_input_available() {
-                    " · Input full"
-                } else if self.visual.is_pending()
-                    || self.pending_navigation.is_some()
-                    || self.range_requested
-                    || !self.visual_intents.is_empty()
-                    || self.mouse_dragging
-                {
-                    " · Selecting…"
-                } else {
-                    ""
-                }
-            )
-        } else if self.queue_view.status.is_empty() {
-            self.phase(refreshing, deleting).to_owned()
+        } else if busy {
+            queue_status.clone()
         } else {
-            self.queue_view.status.clone()
+            self.phase(refreshing, false).to_owned()
         };
-        if !self.filter_editing && !self.filter.is_empty() {
+        if (!self.filter_editing || visual) && !self.filter.is_empty() {
             let _ = write!(phase_text, " · /{}", self.filter);
         }
-        let busy = deleting || !self.queue_view.status.is_empty();
-        if busy {
-            if self.visual.active() || self.filter_editing {
-                phase_text.push_str(" · Deleting…");
+        if busy && !visual {
+            if self.filter_editing {
+                let _ = write!(phase_text, " · {queue_status}");
             }
             phase_text.push_str(" [D]");
         }
         let width = usize::from(columns[1].width);
-        let phase_budget = if self.visual.active() || self.filter_editing {
+        let phase_budget = if visual || self.filter_editing {
             width
         } else {
             width.saturating_sub(width.min(12) + 2)
         };
-        let phase_text = if busy && phase_budget >= 4 {
+        let phase_text = if busy && !visual && phase_budget >= 4 {
             format!(
                 "{} [D]",
                 clipped(phase_text.trim_end_matches(" [D]"), phase_budget - 4)
@@ -3289,34 +5018,23 @@ impl App {
         let phase = phase_text.as_str();
         let path_budget =
             usize::from(columns[1].width).saturating_sub(Line::from(phase).width() + 3);
-        let path = clipped_path_tail(
-            &printable(self.model.path(self.directory).as_os_str()),
+        self.breadcrumbs
+            .sync(&self.root, &self.model, self.directory);
+        let mut label = self.breadcrumbs.line(
             path_budget,
+            columns[1],
+            self.modal.is_some(),
+            Color::Cyan,
         );
-        let label = if path.is_empty() {
-            phase.to_owned()
-        } else {
-            format!("{path}  {phase}")
-        };
+        if label.width() > 0 && !phase.is_empty() {
+            label.spans.push(Span::raw("  "));
+        }
+        let phase_offset = label.width();
+        label.spans.push(Span::raw(phase.to_owned()));
+        let label_width = label.width();
         let header_style = Style::default().bg(Color::DarkGray).fg(Color::White);
-        let back_enabled = self.model.node(self.directory).parent.is_some();
-        let back_style = if back_enabled && self.back_hovered && self.modal.is_none() {
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            header_style.fg(if back_enabled {
-                Color::White
-            } else {
-                Color::Gray
-            })
-        };
-        frame.render_widget(Paragraph::new("←─").style(back_style), columns[0]);
         if self.filter_editing && self.modal.is_none() && columns[1].width > 0 {
-            let x = Line::from(label.as_str())
-                .width()
-                .min(usize::from(columns[1].width - 1));
+            let x = label_width.min(usize::from(columns[1].width - 1));
             frame.set_cursor_position((columns[1].x + x as u16, columns[1].y));
         }
         frame.render_widget(Paragraph::new(label).style(header_style), columns[1]);
@@ -3326,6 +5044,94 @@ impl App {
                 .style(header_style),
             columns[2],
         );
+        let previous = [
+            self.help_area,
+            self.header_queue_area,
+            self.header_delete_area,
+            self.selection_clear_area,
+        ];
+        self.help_area = if hint.ends_with("? help") && columns[2].width >= 6 {
+            Rect::new(columns[2].right() - 6, columns[2].y, 6, columns[2].height)
+        } else {
+            Rect::default()
+        };
+        self.header_queue_area = if busy
+            && !visual
+            && phase.ends_with("[D]")
+            && label_width >= 3
+            && label_width <= usize::from(columns[1].width)
+        {
+            Rect::new(
+                columns[1].x + label_width as u16 - 3,
+                columns[1].y,
+                3,
+                columns[1].height,
+            )
+        } else {
+            Rect::default()
+        };
+        self.header_delete_area =
+            if !delete_label.is_empty() && columns[2].width >= hint.len() as u16 {
+                Rect::new(
+                    columns[2].right() - hint.len() as u16,
+                    columns[2].y,
+                    delete_label.len() as u16,
+                    columns[2].height,
+                )
+            } else {
+                Rect::default()
+            };
+        self.selection_clear_area = if let Some(label) = selection_label
+            .as_ref()
+            .filter(|label| label.len() <= phase_budget && label_width <= width)
+        {
+            Rect::new(
+                columns[1].x + phase_offset as u16,
+                columns[1].y,
+                label.len() as u16,
+                columns[1].height,
+            )
+        } else {
+            Rect::default()
+        };
+        if previous
+            != [
+                self.help_area,
+                self.header_queue_area,
+                self.header_delete_area,
+                self.selection_clear_area,
+            ]
+        {
+            self.control_hovered = None;
+        }
+        for (control, label, hitbox) in [
+            (MouseControl::Help, "? help", self.help_area),
+            (MouseControl::Queue, "[D]", self.header_queue_area),
+            (
+                MouseControl::VisualDelete,
+                delete_label,
+                self.header_delete_area,
+            ),
+        ] {
+            frame.render_widget(
+                Paragraph::new(label).style(mouse_control_style(
+                    header_style,
+                    self.modal.is_none() && self.control_hovered == Some(control),
+                    Color::Cyan,
+                )),
+                hitbox,
+            );
+        }
+        if self.control_hovered == Some(MouseControl::SelectionClear) && self.modal.is_none() {
+            frame.render_widget(
+                Paragraph::new("X selected").style(mouse_control_style(
+                    header_style,
+                    true,
+                    Color::Cyan,
+                )),
+                self.selection_clear_area,
+            );
+        }
         let body = Rect::new(
             area.x,
             area.y + area.height.min(1),
@@ -3348,27 +5154,65 @@ impl App {
                 && self.queue_view.marks.active.is_none()
                 && !matches!(self.modal, Some(Modal::Quit { .. } | Modal::Stopping))
         }) {
-            if !self.file_preview.matches(id, self.model.node(id).kind) {
-                if let Some(anchor) = self
+            if !self.file_preview.matches(id, self.model.node(id).kind)
+                && let Some(anchor) = self
                     .file_anchor
                     .as_ref()
                     .and_then(|anchor| anchor.get())
                     .cloned()
-                {
-                    if let Ok(relative) = self.model.path(id).strip_prefix(&self.root) {
-                        self.file_preview.request(
-                            id,
-                            anchor,
-                            relative.to_owned(),
-                            self.model.node(id).kind,
-                        );
-                    }
-                }
+                && let Ok(relative) = self.model.path(id).strip_prefix(&self.root)
+            {
+                self.file_preview.request(
+                    id,
+                    anchor,
+                    relative.to_owned(),
+                    self.model.node(id).kind,
+                );
             }
         } else {
             self.file_preview.clear();
         }
+        let parent_area = Rect::new(body.x, body.y, body.width, body.height.min(1));
+        if self.parent_area != parent_area {
+            self.parent_press = None;
+        }
+        self.parent_area = parent_area;
+        let parent_style = if self.parent_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        frame.render_widget(
+            Paragraph::new(if self.parent_selected {
+                "› ../"
+            } else {
+                "  ../"
+            })
+            .style(parent_style),
+            parent_area,
+        );
+        let body = Rect::new(
+            body.x,
+            body.y.saturating_add(parent_area.height),
+            body.width,
+            body.height.saturating_sub(parent_area.height),
+        );
         self.list_area = body;
+        if self.right_press.as_ref().is_some_and(|press| {
+            self.modal.is_some()
+                || press.directory != self.directory
+                || press.epoch != self.model.node(self.directory).child_epoch
+                || press.area
+                    != match press.target {
+                        BrowserTarget::Entry(_) => self.list_area,
+                        BrowserTarget::Parent => self.parent_area,
+                    }
+        }) {
+            self.cancel_right_press();
+        }
         if self.modal.is_some()
             || self.hover_position.is_some_and(|(column, row)| {
                 !body.contains(ratatui::layout::Position::new(column, row))
@@ -3381,12 +5225,18 @@ impl App {
         self.page_size = page_size;
         // Earlier keyboard navigation may still own self.view. Freeze the
         // physical rows under a queued press without retargeting that work.
-        let held_view = self.visual_intents.iter().find_map(|intent| match intent {
-            VisualIntent::Mouse(gesture) if !gesture.released => {
-                Some((Arc::clone(&gesture.view), gesture.offset))
-            }
-            _ => None,
-        });
+        let held_view = self
+            .right_press
+            .as_ref()
+            .map(|press| (Arc::clone(&press.view), press.offset))
+            .or_else(|| {
+                self.visual_intents.iter().find_map(|intent| match intent {
+                    VisualIntent::Mouse(gesture) if !gesture.released => {
+                        Some((Arc::clone(&gesture.view), gesture.offset))
+                    }
+                    _ => None,
+                })
+            });
         if held_view.is_none() && self.mouse_press_view.is_none() {
             // Held captures keep their viewport even when resizing clips the
             // pressed row. Hover otherwise suppresses only the keyboard margin.
@@ -3579,6 +5429,9 @@ impl App {
                 );
             }
         }
+        let old_close_area = self.dialog_close_area;
+        self.dialog_close_area = Rect::default();
+        self.dialog_mouse.accent = Color::Cyan;
         if let Some(modal) = self.modal.as_mut() {
             draw_modal(
                 frame,
@@ -3586,8 +5439,27 @@ impl App {
                 modal,
                 &mut self.queue_view,
                 self.delete_notices.front(),
+                &mut self.dialog_close_area,
+                &mut self.dialog_mouse,
+            );
+            if self.dialog_close_area != old_close_area {
+                self.control_hovered = None;
+            }
+            let marker = if self.dialog_close_area.width == 3 {
+                "[x]"
+            } else {
+                "x"
+            };
+            frame.render_widget(
+                Paragraph::new(marker).style(mouse_control_style(
+                    Style::default().bg(Color::Black).fg(Color::Yellow),
+                    self.control_hovered == Some(MouseControl::Close),
+                    Color::Cyan,
+                )),
+                self.dialog_close_area,
             );
         }
+        self.painted_control_dialog = self.control_dialog();
     }
 }
 
@@ -3612,7 +5484,7 @@ fn spinner_frame(tick: u128) -> &'static str {
     FRAMES[(tick % FRAMES.len() as u128) as usize]
 }
 
-fn controls(keys: &'static str, action: &'static str) -> Line<'static> {
+fn controls(keys: &'static str, action: &'static str, accent: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             keys,
@@ -3622,9 +5494,7 @@ fn controls(keys: &'static str, action: &'static str) -> Line<'static> {
         ),
         Span::styled(
             action,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -3656,8 +5526,74 @@ fn split_edges(area: Rect, direction: Direction, leading: u16, trailing: u16) ->
 fn queue_layout(area: Rect) -> (Rect, Rect, [Rect; 3]) {
     let popup = centered(area, area.width.min(76), area.height.min(20));
     let inner = Block::bordered().inner(popup);
-    let regions = split_edges(inner, Direction::Vertical, 2, 4);
-    (popup, inner, [regions[0], regions[1], regions[2]])
+    let regions = split_edges(inner, Direction::Vertical, 1, 2);
+    (popup, inner, regions)
+}
+
+fn mouse_control_style(base: Style, hovered: bool, accent: Color) -> Style {
+    if hovered {
+        base.bg(accent)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
+}
+
+fn dialog_close_area(popup: Rect) -> Rect {
+    if popup.is_empty() {
+        return Rect::default();
+    }
+    let width = if popup.width >= 5 { 3 } else { 1 };
+    let border = u16::from(popup.width >= 3);
+    Rect::new(popup.right() - border - width, popup.y, width, 1)
+}
+
+fn dialog_option(
+    mouse: &mut DialogMouse,
+    area: Rect,
+    row: u16,
+    key: KeyEvent,
+    keys: &'static str,
+    action: &'static str,
+) -> Line<'static> {
+    let mut line = controls(keys, action, mouse.accent);
+    mouse.option(area, row, key, &line);
+    if mouse.hovered == Some(key) {
+        for span in &mut line.spans {
+            span.style = mouse_control_style(span.style, true, mouse.accent);
+        }
+    }
+    line
+}
+
+fn draw_dialog_scrollbar(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    content: Rect,
+    position: usize,
+    total: usize,
+    accent: Color,
+) {
+    let visible = usize::from(content.height);
+    if popup.width < 2 || visible == 0 || total <= visible {
+        return;
+    }
+    // Only the visible rail is drawn; even a million-error report remains O(height).
+    let thumb = ((visible as u128 * visible as u128) / total as u128).max(1) as usize;
+    let max = total - visible;
+    let start = ((position.min(max) as u128 * (visible - thumb) as u128) / max as u128) as usize;
+    for row in 0..visible {
+        frame.render_widget(
+            Paragraph::new(if (start..start + thumb).contains(&row) {
+                "█"
+            } else {
+                "│"
+            })
+            .style(Style::default().bg(Color::Black).fg(accent)),
+            Rect::new(popup.right() - 1, content.y + row as u16, 1, 1),
+        );
+    }
 }
 
 fn draw_modal(
@@ -3666,19 +5602,22 @@ fn draw_modal(
     modal: &mut Modal,
     queue: &mut QueueView,
     report: Option<&DeleteReport>,
+    close_area: &mut Rect,
+    mouse: &mut DialogMouse,
 ) {
+    mouse.options.fill(None);
+    mouse.scroll_area = Rect::default();
+    mouse.scroll_max = 0;
     let width = area.width.min(76);
     let inner_width = width.saturating_sub(2);
     let style = Style::default().bg(Color::Black).fg(Color::White);
+    let accent = mouse.accent;
     let border = |title: &'static str| {
         Block::bordered()
             .border_type(BorderType::Plain)
             .title(
-                Line::from(format!(" {title} ")).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Line::from(format!(" {title} "))
+                    .style(Style::default().fg(accent).add_modifier(Modifier::BOLD)),
             )
             .border_style(Style::default().fg(Color::Gray))
             .style(style)
@@ -3693,11 +5632,12 @@ fn draw_modal(
                 return;
             };
             let popup = centered(area, width, area.height.min(24));
+            *close_area = dialog_close_area(popup);
             let block = border("Delete failed");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let regions = split_edges(inner, Direction::Vertical, 3, 2);
+            let regions = split_edges(inner, Direction::Vertical, 3, 1);
             *page = usize::from(regions[1].height).max(1);
             *scroll = (*scroll).min(report.lines().saturating_sub(*page));
             let first = if report.errors.is_empty() {
@@ -3711,7 +5651,7 @@ fn draw_modal(
                 .min(report.errors.len());
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("Deletion inside this target failed:"),
+                    Line::from("Could not delete everything in:"),
                     Line::from(horizontal_slice(
                         &report.target,
                         *horizontal,
@@ -3730,15 +5670,17 @@ fn draw_modal(
                     usize::from(regions[1].height),
                     *horizontal,
                     usize::from(inner.width),
+                    accent,
                 ))
                 .style(style),
                 regions[1],
             );
+            mouse.scroll(popup, report.lines(), regions[1].height);
+            draw_dialog_scrollbar(frame, popup, regions[1], *scroll, report.lines(), accent);
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("↑↓ / PgUp/PgDown  ←→: scroll")
+                    Line::from("↑↓ / wheel / PgUp/PgDown  ←→: scroll")
                         .style(Style::default().fg(Color::DarkGray)),
-                    controls("Enter / Esc", ": close"),
                 ])
                 .style(style),
                 regions[2],
@@ -3749,6 +5691,7 @@ fn draw_modal(
             count,
             ready,
             reviewable,
+            confirm_requested,
             scroll,
         } => {
             let paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
@@ -3759,18 +5702,27 @@ fn draw_modal(
                     .saturating_add(6),
             );
             let popup = centered(area, width, height);
+            *close_area = dialog_close_area(popup);
             let block = border("Delete selection?");
             let inner = block.inner(popup);
             let regions = split_edges(inner, Direction::Vertical, 1, 3);
             let geometry = inner.width >= 32 && regions[1].height > 0 && regions[2].height == 3;
-            *reviewable = geometry && *ready && *count > 0;
+            *reviewable = geometry;
+            *confirm_requested &= geometry;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             if !geometry {
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::from("Resize to review"),
-                        controls("n / Esc", ": cancel"),
+                        dialog_option(
+                            mouse,
+                            inner,
+                            1,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            "n / Esc",
+                            ": cancel",
+                        ),
                     ])
                     .style(style),
                     inner,
@@ -3778,8 +5730,12 @@ fn draw_modal(
                 return;
             }
             frame.render_widget(
-                Paragraph::new(format!("Permanently remove {count} selected entries in:"))
-                    .style(style),
+                Paragraph::new(if *ready {
+                    format!("Delete {count} entries in:")
+                } else {
+                    "Delete selected entries in:".to_owned()
+                })
+                .style(style),
                 regions[0],
             );
             clamp_scroll(scroll, target_lines, regions[1].height);
@@ -3789,16 +5745,35 @@ fn draw_modal(
                     .style(style.add_modifier(Modifier::BOLD)),
                 regions[1],
             );
+            mouse.scroll(popup, target_lines, regions[1].height);
+            draw_dialog_scrollbar(
+                frame,
+                popup,
+                regions[1],
+                usize::from(*scroll),
+                target_lines,
+                accent,
+            );
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("↑↓ / PgUp / PgDown: scroll")
+                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
                         .style(Style::default().fg(Color::DarkGray)),
-                    if *ready {
-                        controls("y / Enter", ": enqueue selected")
-                    } else {
-                        Line::from("Checking targets…").style(Style::default().fg(Color::DarkGray))
-                    },
-                    controls("n / Esc", ": cancel"),
+                    dialog_option(
+                        mouse,
+                        regions[2],
+                        1,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        "y / Enter",
+                        ": enqueue selected",
+                    ),
+                    dialog_option(
+                        mouse,
+                        regions[2],
+                        2,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": cancel",
+                    ),
                 ])
                 .style(style),
                 regions[2],
@@ -3806,6 +5781,7 @@ fn draw_modal(
         }
         Modal::Queue { .. } => {
             let (popup, inner, regions) = queue_layout(area);
+            *close_area = dialog_close_area(popup);
             let block = border("Deletion queue");
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
@@ -3817,16 +5793,7 @@ fn draw_modal(
                 format!("{} queued", queue.pending)
             };
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(summary).style(Style::default().fg(Color::Cyan)),
-                    Line::from(if queue.paused {
-                        "Pending paused"
-                    } else {
-                        "Pending running"
-                    })
-                    .style(Style::default().fg(Color::DarkGray)),
-                ])
-                .style(style),
+                Paragraph::new(Line::from(summary).style(Style::default().fg(accent))).style(style),
                 regions[0],
             );
             let rows: Vec<_> = queue
@@ -3844,11 +5811,7 @@ fn draw_modal(
                             } else {
                                 "queued  "
                             },
-                            Style::default().fg(if *active {
-                                Color::Cyan
-                            } else {
-                                Color::DarkGray
-                            }),
+                            Style::default().fg(if *active { accent } else { Color::DarkGray }),
                         ),
                         Span::raw(clipped(target, usize::from(inner.width).saturating_sub(8))),
                     ]);
@@ -3864,76 +5827,191 @@ fn draw_modal(
                 })
                 .collect();
             frame.render_widget(Paragraph::new(rows).style(style), regions[1]);
+            draw_dialog_scrollbar(
+                frame,
+                popup,
+                regions[1],
+                queue.scroll_position,
+                queue
+                    .pending
+                    .saturating_add(usize::from(queue.marks.active.is_some())),
+                accent,
+            );
+            let mut actions = dialog_option(
+                mouse,
+                regions[2],
+                0,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                "Click / Space",
+                if queue.paused {
+                    ": resume waiting"
+                } else {
+                    ": pause waiting"
+                },
+            );
+            let remove_x = u16::try_from(actions.width())
+                .unwrap_or(u16::MAX)
+                .saturating_add(3);
+            let remove_area = Rect::new(
+                regions[2].x.saturating_add(remove_x),
+                regions[2].y,
+                regions[2].width.saturating_sub(remove_x),
+                regions[2].height,
+            );
+            let remove = dialog_option(
+                mouse,
+                remove_area,
+                0,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                "Right-click / d",
+                ": remove/cancel",
+            );
+            actions.spans.push(Span::raw(" · "));
+            actions.spans.extend(remove.spans);
             frame.render_widget(
                 Paragraph::new(vec![
-                    controls("Space / p", ": pause/resume pending"),
-                    controls("d / x / c", ": remove selected / cancel active"),
-                    controls("Shift+↑↓ / K J", ": reorder queued"),
-                    controls("↑↓ / D / Esc", ": select / close"),
+                    actions,
+                    Line::from(vec![
+                        Span::styled("Hover", Style::default().fg(Color::Yellow)),
+                        Span::raw(": select · "),
+                        Span::styled("Drag / Shift+↑↓", Style::default().fg(Color::Yellow)),
+                        Span::raw(": reorder"),
+                    ]),
                 ])
                 .style(style),
                 regions[2],
             );
         }
-        Modal::Quit { reviewable } => {
-            let popup = centered(area, width, area.height.min(8));
-            let block = border("Deletions in progress");
+        Modal::ConfirmQuit { reviewable, .. } => {
+            let popup = centered(area, width.min(24), area.height.min(4));
+            *close_area = dialog_close_area(popup);
+            let block = border("Quit LDU?");
             let inner = block.inner(popup);
-            *reviewable = inner.width >= 32 && inner.height >= 6;
+            *reviewable = inner.width >= 14 && inner.height >= 2;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let progress = if queue.status.is_empty() {
-                "Waiting for confirmed deletions.".to_owned()
-            } else {
-                queue.status.clone()
-            };
             let lines = if *reviewable {
                 vec![
-                    Line::from("Finishing deletions. Scanning stopped."),
-                    Line::from(progress).style(Style::default().fg(Color::Cyan)),
-                    Line::from("Quits when deletion finishes."),
-                    controls("Ctrl-C", ": cancel all and quit"),
-                    controls("q / Enter", ": cancel all and quit"),
-                    controls("n / Esc", ": keep browsing"),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        0,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        "y / Enter",
+                        ": yes",
+                    ),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        1,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": no",
+                    ),
+                ]
+            } else {
+                vec![Line::from("Resize to review")]
+            };
+            frame.render_widget(Paragraph::new(lines).style(style), inner);
+        }
+        Modal::Quit { reviewable } => {
+            let popup = centered(area, width, area.height.min(6));
+            *close_area = dialog_close_area(popup);
+            let block = border("Exit after deletion?");
+            let inner = block.inner(popup);
+            *reviewable = inner.width >= 32 && inner.height >= 4;
+            frame.render_widget(Clear, popup);
+            frame.render_widget(block, popup);
+            let lines = if *reviewable {
+                vec![
+                    Line::from("Finishing deletions before exit."),
+                    Line::from(if queue.status.is_empty() {
+                        "Waiting for deletion.".to_owned()
+                    } else {
+                        queue.status.clone()
+                    })
+                    .style(Style::default().fg(accent)),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        2,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        "Enter / q",
+                        ": cancel and exit",
+                    ),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        3,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": keep browsing",
+                    ),
                 ]
             } else {
                 vec![
-                    controls("Ctrl-C", ": cancel all and quit"),
-                    Line::from("Scanning stopped."),
-                    Line::from(progress),
-                    controls("n / Esc", ": keep browsing"),
+                    Line::from("Resize to review"),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        1,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": keep browsing",
+                    ),
                 ]
             };
             frame.render_widget(Paragraph::new(lines).style(style), inner);
         }
         Modal::Enqueueing => {
-            let popup = centered(area, width, area.height.min(6));
+            let popup = centered(area, width, area.height.min(5));
+            *close_area = dialog_close_area(popup);
             let block = border("Enqueueing selection");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("Adding selected entries to the queue."),
-                    Line::from("Queued deletions continue."),
-                    controls("n / Esc", ": stop adding"),
-                    controls("q / Ctrl-C", ": review quit"),
+                    Line::from("Adding selection to the queue."),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        1,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": stop adding",
+                    ),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        2,
+                        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                        "q / Ctrl-C",
+                        ": exit options",
+                    ),
                 ])
                 .style(style),
                 inner,
             );
         }
         Modal::Stopping => {
-            let popup = centered(area, width, area.height.min(6));
+            let popup = centered(area, width, area.height.min(4));
+            *close_area = dialog_close_area(popup);
             let block = border("Stopping deletions");
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("Cancelling deletions; exiting shortly."),
-                    Line::from(queue.status.clone()).style(Style::default().fg(Color::Cyan)),
-                    controls("Ctrl-C", ": quit now"),
+                    Line::from("Cancelling deletions…"),
+                    dialog_option(
+                        mouse,
+                        inner,
+                        1,
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                        "Ctrl-C",
+                        ": exit now",
+                    ),
                 ])
                 .style(style),
                 inner,
@@ -3943,7 +6021,7 @@ fn draw_modal(
             target,
             scroll,
             reviewable,
-            confirmed,
+            confirm_requested,
             ..
         } => {
             let target_paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
@@ -3957,17 +6035,26 @@ fn draw_modal(
                     .saturating_add(5),
             );
             let popup = centered(area, width, height);
+            *close_area = dialog_close_area(popup);
             let block = border("Delete?");
             let inner = block.inner(popup);
             let regions = split_edges(inner, Direction::Vertical, prompt_height, 3);
             let geometry = inner.width >= 18 && regions[1].height > 0 && regions[2].height == 3;
-            *reviewable = geometry && confirmed.is_some();
+            *reviewable = geometry;
+            *confirm_requested &= geometry;
             frame.render_widget(Clear, popup);
             if !geometry {
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::from("Resize to review"),
-                        controls("n / Esc", ": cancel"),
+                        dialog_option(
+                            mouse,
+                            popup,
+                            1,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            "n / Esc",
+                            ": cancel",
+                        ),
                     ])
                     .style(style),
                     popup,
@@ -3983,16 +6070,35 @@ fn draw_modal(
                     .style(style.add_modifier(Modifier::BOLD)),
                 regions[1],
             );
+            mouse.scroll(popup, target_lines, regions[1].height);
+            draw_dialog_scrollbar(
+                frame,
+                popup,
+                regions[1],
+                usize::from(*scroll),
+                target_lines,
+                accent,
+            );
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("↑↓ / PgUp / PgDown: scroll")
+                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
                         .style(Style::default().fg(Color::DarkGray)),
-                    if confirmed.is_some() {
-                        controls("y / Enter", ": delete")
-                    } else {
-                        Line::from("Checking target…").style(Style::default().fg(Color::DarkGray))
-                    },
-                    controls("n / Esc", ": cancel"),
+                    dialog_option(
+                        mouse,
+                        regions[2],
+                        1,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        "y / Enter",
+                        ": delete",
+                    ),
+                    dialog_option(
+                        mouse,
+                        regions[2],
+                        2,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        "n / Esc",
+                        ": cancel",
+                    ),
                 ])
                 .style(style),
                 regions[2],
@@ -4011,11 +6117,8 @@ fn draw_modal(
                             line,
                             "Normal mode" | "Visual mode" | "Common keys" | "Deletion queue"
                         ) {
-                            return Line::from(line.to_owned()).style(
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            );
+                            return Line::from(line.to_owned())
+                                .style(Style::default().fg(accent).add_modifier(Modifier::BOLD));
                         }
                         if let Some((keys, action)) = line.split_once("    ") {
                             return Line::from(vec![
@@ -4037,29 +6140,31 @@ fn draw_modal(
             let height = area.height.min(22).min(
                 u16::try_from(line_count)
                     .unwrap_or(u16::MAX)
-                    .saturating_add(4),
+                    .saturating_add(3),
             );
             let popup = centered(area, width, height);
+            *close_area = dialog_close_area(popup);
             let block = border(title);
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let [_, content, footer] = split_edges(inner, Direction::Vertical, 0, 2);
+            let [_, content, footer] = split_edges(inner, Direction::Vertical, 0, 1);
             let regions = [content, footer];
             clamp_scroll(scroll, line_count, regions[0].height);
             frame.render_widget(paragraph.scroll((*scroll, 0)).style(style), regions[0]);
+            mouse.scroll(popup, line_count, regions[0].height);
+            draw_dialog_scrollbar(
+                frame,
+                popup,
+                regions[0],
+                usize::from(*scroll),
+                line_count,
+                accent,
+            );
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from("↑↓ / PgUp / PgDown: scroll")
+                    Line::from("↑↓ / wheel / PgUp / PgDown: scroll")
                         .style(Style::default().fg(Color::DarkGray)),
-                    if matches!(
-                        *title,
-                        "Selecting entries" | "Preparing selection" | "Stopping selection"
-                    ) {
-                        controls("n / Esc", ": cancel")
-                    } else {
-                        controls("Enter / Esc", ": close")
-                    },
                 ])
                 .style(style),
                 regions[1],
@@ -4080,7 +6185,8 @@ Shift+↑/↓          Extend selection
 Shift+Home/End     Select to first/last entry
 Shift+PgUp/PgDown  Extend by one page
 Enter              Select/deselect current entry
-Click / drag       Toggle / add range; hold edge to scroll
+Click / drag       Toggle / add range (marked start removes)
+Hold list edge    Scroll while dragging
 Shift-click/drag   Extend / invert range
 Ctrl-click/drag    Deselect entry / range
 d / D / Delete     Confirm selected deletions
@@ -4118,7 +6224,7 @@ Near-size groups retain their previous order.
 Graph shows the share of known directory size.
 Preview (96+ columns): folder contents, text, or file details.
 Symlinks show their destination path without following it.
-Archive listings and PDF text use available system utilities.
+Archive listings use available system utilities.
 Hardlinks are counted once.";
 
 struct DeleteRequest {
@@ -4187,10 +6293,14 @@ fn prepare_batch(
             epoch: app.model.node(app.directory).child_epoch,
             anchor,
         });
-        app.modal = Some(Modal::notice(
-            "Selecting entries",
-            "Finishing selection. Esc cancels.".to_owned(),
-        ));
+        app.modal = Some(Modal::Batch {
+            target: printable(app.model.path(app.directory).as_os_str()),
+            count: 0,
+            ready: false,
+            reviewable: false,
+            confirm_requested: false,
+            scroll: 0,
+        });
         return;
     }
     if app.visual.is_empty() {
@@ -4215,31 +6325,24 @@ fn prepare_batch(
         show_hidden: app.config.show_hidden,
     };
     if batch.is_some() || !retired.is_empty() {
+        let (confirm_requested, reviewable) = app.batch_confirmation_state();
         app.cancel_deferred_batch();
         app.deferred_batch = Some(request);
-        app.modal = Some(Modal::notice(
-            if batch.is_some() {
-                "Preparing selection"
-            } else {
-                "Stopping selection"
-            },
-            "Waiting for the previous selection preparation to finish.".to_owned(),
-        ));
+        app.modal = Some(Modal::Batch {
+            target: printable(path.as_os_str()),
+            count: 0,
+            ready: false,
+            reviewable,
+            confirm_requested,
+            scroll: 0,
+        });
         return;
     }
     start_batch_request(app, request, batch);
 }
 
 fn start_batch_request(app: &mut App, request: BatchRequest, batch: &mut Option<BatchPreparation>) {
-    if matches!(
-        app.modal,
-        Some(Modal::Text {
-            title: "Stopping selection" | "Preparing selection",
-            ..
-        })
-    ) {
-        app.modal = None;
-    }
+    let (confirm_requested, reviewable) = app.batch_confirmation_state();
     if !app.model.is_live(request.directory)
         || app.model.node(request.directory).child_epoch != request.epoch
         || !app.visual.active()
@@ -4247,6 +6350,10 @@ fn start_batch_request(app: &mut App, request: BatchRequest, batch: &mut Option<
     {
         app.visual
             .retire_snapshot_and_order(request.selection, request.order);
+        app.modal = Some(Modal::notice(
+            "Selection changed",
+            "Select entries again.".to_owned(),
+        ));
         return;
     }
     match BatchCapture::new(Arc::clone(&request.anchor)) {
@@ -4270,7 +6377,8 @@ fn start_batch_request(app: &mut App, request: BatchRequest, batch: &mut Option<
                 target: request.target,
                 count,
                 ready: false,
-                reviewable: false,
+                reviewable,
+                confirm_requested,
                 scroll: 0,
             });
         }
@@ -4291,13 +6399,8 @@ fn resume_batch(
     retired: &VecDeque<BatchCapture>,
 ) {
     if !(app.modal.is_none()
-        || matches!(
-            app.modal,
-            Some(Modal::Text {
-                title: "Stopping selection" | "Preparing selection" | "Selecting entries",
-                ..
-            })
-        ))
+        || (matches!(app.modal, Some(Modal::Batch { .. }))
+            && (app.waiting_batch.is_some() || app.deferred_batch.is_some())))
     {
         return;
     }
@@ -4319,14 +6422,14 @@ fn resume_batch(
             return;
         }
         let waiting = app.waiting_batch.take().expect("waiting selection exists");
-        app.modal = None;
         prepare_batch(app, Some(waiting.anchor), batch, retired);
         return;
     }
-    if batch.is_none() && retired.is_empty() {
-        if let Some(request) = app.deferred_batch.take() {
-            start_batch_request(app, request, batch);
-        }
+    if batch.is_none()
+        && retired.is_empty()
+        && let Some(request) = app.deferred_batch.take()
+    {
+        start_batch_request(app, request, batch);
     }
 }
 
@@ -4350,7 +6453,9 @@ fn cancel_unconfirmed(
     batch: &mut Option<BatchPreparation>,
     retired: &mut VecDeque<BatchCapture>,
 ) {
-    app.cancel_deferred_batch();
+    // A stopped listing must not replace quit progress with a selection notice.
+    // Discard queued selection requests too, while keeping materialized marks.
+    app.clear_visual_intent();
     app.deferred_delete = None;
     if batch
         .as_ref()
@@ -4363,18 +6468,24 @@ fn cancel_unconfirmed(
     for modal in [&mut app.modal, &mut app.previous_modal] {
         if matches!(modal, Some(Modal::Delete { .. }))
             || (batch.is_none() && matches!(modal, Some(Modal::Batch { .. })))
-            || matches!(
-                modal,
-                Some(Modal::Text {
-                    title: "Selecting entries"
-                        | "Preparing selection"
-                        | "Stopping selection"
-                        | "Stopping target",
-                    ..
-                })
-            )
         {
             *modal = None;
+        }
+    }
+}
+
+fn enqueue_delete(
+    app: &mut App,
+    scanner: &ScanHandle,
+    scopes: &[ScopedScan],
+    queue: &mut DeleteQueue,
+    (id, anchor, relative, target): (NodeId, Arc<RootAnchor>, PathBuf, ConfirmedTarget),
+) {
+    if app.model.is_live(id) && app.model.path(id) == app.root.join(&relative) {
+        let outcome = queue.enqueue_confirmed(id, anchor, relative, target);
+        if outcome.inserted {
+            let entry = queue.entry(outcome.id).expect("inserted deletion exists");
+            exclude_job(app, scanner, scopes, id, &entry.relative);
         }
     }
 }
@@ -4397,11 +6508,7 @@ fn exclude_job(
 }
 
 fn batch_modal(app: &mut App) -> Option<&mut Modal> {
-    if matches!(app.modal, Some(Modal::Quit { .. })) {
-        app.previous_modal.as_mut()
-    } else {
-        app.modal.as_mut()
-    }
+    app.background_modal_slot().as_mut()
 }
 
 #[derive(Default)]
@@ -4513,11 +6620,12 @@ fn pump_batch(
                     let outcome = queue.enqueue_confirmed(
                         node,
                         Arc::clone(&preparation.anchor),
-                        relative.clone(),
+                        relative,
                         target,
                     );
                     if outcome.inserted {
-                        exclude_job(app, scanner, scopes, node, &relative);
+                        let entry = queue.entry(outcome.id).expect("inserted deletion exists");
+                        exclude_job(app, scanner, scopes, node, &entry.relative);
                     }
                 }
             }
@@ -4548,30 +6656,31 @@ fn pump_batch(
         let preparation_directory = preparation.directory;
         let confirmed = preparation.dispatching || preparation.confirm_pending;
         cancel_batch(app, batch, retired);
-        for modal in [&mut app.modal, &mut app.previous_modal] {
+        for slot in [&mut app.modal, &mut app.previous_modal] {
+            let modal = underlying_modal_slot(slot);
             if matches!(modal, Some(Modal::Batch { .. } | Modal::Enqueueing)) {
                 *modal = None;
             }
         }
         if let Some(error) = error {
             let message = printable(OsStr::new(&error));
-            if confirmed && matches!(app.modal, Some(Modal::Quit { .. } | Modal::Stopping)) {
-                // Closing must report an incomplete confirmed batch after the
-                // terminal is restored, or display it once if quitting is dismissed.
+            if confirmed
+                && (app.finishing_deletions()
+                    || app
+                        .modal
+                        .as_ref()
+                        .is_some_and(|modal| matches!(modal.underlying(), Modal::Stopping)))
+            {
                 app.delete_notices.push_back(DeleteReport::single(
                     app.report_path(preparation_directory),
                     message,
                 ));
             } else {
-                let notice = Modal::notice("Cannot delete", message);
-                if matches!(app.modal, Some(Modal::Quit { .. })) {
-                    app.previous_modal = Some(notice);
-                } else {
-                    app.modal = Some(notice);
-                }
+                *app.background_modal_slot() = Some(Modal::notice("Cannot delete", message));
             }
         }
     }
+
     status
 }
 
@@ -4599,17 +6708,6 @@ fn pump_retired_batches(app: &mut App, retired: &mut VecDeque<BatchCapture>) {
     }
     if empty && worker.is_drained() {
         retired.pop_front();
-        if retired.is_empty()
-            && matches!(
-                app.modal,
-                Some(Modal::Text {
-                    title: "Stopping selection",
-                    ..
-                })
-            )
-        {
-            app.modal = None;
-        }
     }
 }
 
@@ -4700,11 +6798,11 @@ fn retire_scopes_with(
             index += 1;
         }
     }
-    if !ready.is_empty() {
-        if let Err(ready) = retire(ready) {
-            // Returned ownership still occupies the same eight admission slots.
-            scopes.extend(ready);
-        }
+    if !ready.is_empty()
+        && let Err(ready) = retire(ready)
+    {
+        // Returned ownership still occupies the same eight admission slots.
+        scopes.extend(ready);
     }
 }
 
@@ -4828,10 +6926,10 @@ fn retire_refresh_requests_with(
     retired: &mut im::Vector<RefreshRequests>,
     retire: impl FnOnce(im::Vector<RefreshRequests>) -> Result<(), im::Vector<RefreshRequests>>,
 ) {
-    if !retired.is_empty() {
-        if let Err(returned) = retire(std::mem::take(retired)) {
-            *retired = returned;
-        }
+    if !retired.is_empty()
+        && let Err(returned) = retire(std::mem::take(retired))
+    {
+        *retired = returned;
     }
 }
 
@@ -4959,7 +7057,7 @@ fn take_interrupt(interrupts: &AtomicUsize) -> bool {
 }
 
 fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: &mut DeleteQueue) {
-    app.cancel_deferred_batch();
+    app.clear_visual_intent();
     app.deferred_delete = None;
     queue.cancel_all();
     stop_scanning(scanner, scopes);
@@ -4970,7 +7068,7 @@ fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: 
 pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::other(
-            "interactive browsing requires a terminal; use -o FILE for non-interactive output",
+            "interactive browsing requires a terminal; use -o FILE to export, or -o - for stdout",
         ));
     }
     let interrupts = Arc::new(AtomicUsize::new(0));
@@ -5025,7 +7123,11 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         );
         app.pump_confirmation();
         let selection_progress = app.pump_visual();
-        if selection_progress && !app.visual.is_pending() {
+        if app.pump_queue_drag(&mut queue) {
+            frame_gate.dirty = true;
+            next_frame = Instant::now();
+        }
+        if selection_progress && !app.visual.is_pending() && !app.parent_selection_work() {
             frame_gate.dirty = true;
             next_frame = Instant::now();
         }
@@ -5088,7 +7190,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         }
                     }
                 };
-                match event {
+                let action = match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         // Keys can replace queue membership without changing its length.
                         refresh_retry.invalidate();
@@ -5098,9 +7200,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                             ) if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) => {
                                 Some(reviewable)
                             }
-                            Some(Modal::Quit { reviewable })
-                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter) =>
-                            {
+                            Some(
+                                Modal::Quit { reviewable } | Modal::ConfirmQuit { reviewable, .. },
+                            ) if matches!(key.code, KeyCode::Char('q' | 'y') | KeyCode::Enter) => {
                                 Some(reviewable)
                             }
                             _ => None,
@@ -5129,123 +7231,160 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                             }
                         }
                         let anchor = scanner.anchor.get().cloned();
-                        match app.key(key, anchor, deletion_busy(&queue, batch.as_ref())) {
-                            Action::QuitWarning => {
-                                cancel_unconfirmed(&mut app, &mut batch, &mut retired_batches);
-                                closing = true;
-                                scans_stopped = true;
-                                stop_scanning(&scanner, &scopes);
-                                clear_refresh_requests_with(
-                                    &mut refresh_requests,
-                                    &mut retired_refresh_requests,
-                                    |retired| refresh_retirer.try_retire(retired),
-                                );
-                            }
-                            Action::Quit => {
-                                if quitting {
-                                    break 'events;
-                                }
-                                quitting = true;
-                                closing = false;
-                                shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
-                                cancel_batch(&mut app, &mut batch, &mut retired_batches);
-                                stop_work(&mut app, &scanner, &scopes, &mut queue);
-                            }
-                            Action::Refresh(id) => request_manual_refresh(
-                                &mut refresh_requests,
-                                &mut scans_stopped,
-                                id,
-                            ),
-                            Action::Delete(id, anchor, relative, target) => {
-                                if app.model.is_live(id)
-                                    && app.model.path(id) == app.root.join(&relative)
-                                {
-                                    let outcome = queue.enqueue_confirmed(
-                                        id,
-                                        anchor,
-                                        relative.clone(),
-                                        target,
-                                    );
-                                    if outcome.inserted {
-                                        exclude_job(&mut app, &scanner, &scopes, id, &relative);
-                                    }
-                                }
-                            }
-                            Action::BatchPrepare => prepare_batch(
-                                &mut app,
-                                scanner.anchor.get().cloned(),
-                                &mut batch,
-                                &retired_batches,
-                            ),
-                            Action::BatchConfirm => {
-                                if let Some(preparation) = batch.as_mut() {
-                                    preparation.confirm_pending = true;
-                                }
-                            }
-                            Action::BatchCancel => {
-                                cancel_batch(&mut app, &mut batch, &mut retired_batches)
-                            }
-                            Action::QueuePause => {
-                                queue.toggle_pause();
-                            }
-                            Action::QueueCancel => {
-                                queue.cancel_active();
-                            }
-                            Action::QueueRemove | Action::QueueDelete => {
-                                if let Some(id) = app.queue_selection() {
-                                    let selected_active =
-                                        queue.active().is_some_and(|entry| entry.id == id);
-                                    if selected_active && matches!(key.code, KeyCode::Char('d')) {
-                                        queue.cancel_active();
-                                    } else if let Some(entry) = queue.remove_pending(id) {
-                                        if !scans_stopped {
-                                            refresh_requests.request(entry.node);
-                                        }
-                                    }
-                                }
-                            }
-                            Action::QueueReorder(direction) => {
-                                if let Some(id) = app.queue_selection() {
-                                    queue.move_pending(id, direction);
-                                }
-                            }
-                            Action::QueueNavigate { end, amount } => {
-                                app.queue_navigate(&queue, end, amount)
-                            }
-                            Action::Continue => {}
-                        }
-                        if closing && !matches!(app.modal, Some(Modal::Quit { .. })) {
-                            closing = false;
-                        }
-                        if !quitting {
-                            queue.start_next();
-                        }
-                        prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
-                        app.pump_visual();
-                        app.show_delete_notice();
-                        prioritize_requested(&mut app, &scanner, &scopes);
-                        // Paint input immediately, before bounded background event work.
-                        if failure.is_none() {
-                            if let Err(error) = terminal.draw(|frame| {
-                                app.sync_queue(&mut queue, frame.area());
-                                frame_gate.painting(&app);
-                                app.draw(
-                                    frame,
-                                    !scopes.is_empty() || !refresh_requests.is_empty(),
-                                    deletion_busy(&queue, batch.as_ref()),
-                                )
-                            }) {
-                                failure = Some(error);
-                            }
-                        }
-                        next_frame = Instant::now() + FRAME_INTERVAL;
+                        Some(app.key(key, anchor, deletion_busy(&queue, batch.as_ref())))
                     }
-                    Event::Mouse(mouse) if !quitting => {
-                        app.mouse(mouse);
-                        app.pump_visual();
-                        app.show_delete_notice();
-                        prioritize_requested(&mut app, &scanner, &scopes);
-                        if let Err(error) = terminal.draw(|frame| {
+                    Event::Mouse(mouse) => {
+                        if matches!(
+                            mouse.kind,
+                            MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+                                | MouseEventKind::Up(MouseButton::Left | MouseButton::Right)
+                        ) {
+                            // Mouse events may precede the terminal's resize event.
+                            // Never apply an old painted hitbox to new dimensions.
+                            #[cfg(unix)]
+                            let live_size = crossterm::terminal::window_size()
+                                .map(|size| (size.columns, size.rows));
+                            #[cfg(not(unix))]
+                            let live_size = terminal.size().map(|size| (size.width, size.height));
+                            match live_size {
+                                Ok(size) if app.reject_stale_mouse_geometry(mouse.kind, size) => {
+                                    frame_gate.dirty = true;
+                                    next_frame = Instant::now();
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    failure = Some(error);
+                                    continue;
+                                }
+                            }
+                        }
+                        let deleting = deletion_busy(&queue, batch.as_ref());
+                        let action = app
+                            .header_right_mouse(mouse)
+                            .or_else(|| app.modal_option_mouse(mouse, deleting))
+                            .or_else(|| app.control_mouse(mouse, deleting))
+                            .or_else(|| {
+                                (!quitting)
+                                    .then(|| app.queue_mouse(mouse, &mut queue))
+                                    .flatten()
+                            });
+                        if action.is_some() {
+                            refresh_retry.invalidate();
+                        }
+                        if action.is_none() && !quitting {
+                            app.mouse(mouse);
+                        }
+                        Some(action.unwrap_or(Action::Continue))
+                    }
+                    Event::Resize(_, _) => {
+                        app.header_right_press = None;
+                        app.dialog_mouse.press = None;
+                        app.cancel_right_press();
+                        app.parent_press = None;
+                        app.parent_area = Rect::default();
+                        app.control_press = None;
+                        app.control_hovered = None;
+                        app.queue_drag = None;
+                        app.cancel_breadcrumb_press();
+                        frame_gate.dirty = true;
+                        next_frame = Instant::now();
+                        None
+                    }
+                    _ => None,
+                };
+                // Keyboard and mouse share admission, cancellation and shutdown.
+                if let Some(action) = action {
+                    match action {
+                        Action::QuitWarning => {
+                            cancel_unconfirmed(&mut app, &mut batch, &mut retired_batches);
+                            closing = true;
+                            scans_stopped = true;
+                            stop_scanning(&scanner, &scopes);
+                            clear_refresh_requests_with(
+                                &mut refresh_requests,
+                                &mut retired_refresh_requests,
+                                |retired| refresh_retirer.try_retire(retired),
+                            );
+                        }
+                        Action::Quit => {
+                            if quitting {
+                                break 'events;
+                            }
+                            quitting = true;
+                            closing = false;
+                            shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
+                            cancel_batch(&mut app, &mut batch, &mut retired_batches);
+                            stop_work(&mut app, &scanner, &scopes, &mut queue);
+                        }
+                        Action::Refresh(id) => {
+                            request_manual_refresh(&mut refresh_requests, &mut scans_stopped, id)
+                        }
+                        Action::Delete(id, anchor, relative, target) => {
+                            enqueue_delete(
+                                &mut app,
+                                &scanner,
+                                &scopes,
+                                &mut queue,
+                                (id, anchor, relative, target),
+                            );
+                        }
+                        Action::BatchPrepare => prepare_batch(
+                            &mut app,
+                            scanner.anchor.get().cloned(),
+                            &mut batch,
+                            &retired_batches,
+                        ),
+                        Action::BatchConfirm => {
+                            if let Some(preparation) = batch.as_mut() {
+                                preparation.confirm_pending = true;
+                            }
+                        }
+                        Action::BatchCancel => {
+                            cancel_batch(&mut app, &mut batch, &mut retired_batches)
+                        }
+                        Action::QueuePause => {
+                            queue.toggle_pause();
+                        }
+                        Action::QueueCancel => {
+                            queue.cancel_active();
+                        }
+                        action @ (Action::QueueRemove | Action::QueueDelete) => {
+                            if let Some(id) = app.queue_selection() {
+                                let selected_active =
+                                    queue.active().is_some_and(|entry| entry.id == id);
+                                if selected_active && matches!(action, Action::QueueDelete) {
+                                    queue.cancel_active();
+                                } else if let Some(entry) = queue.remove_pending(id)
+                                    && !scans_stopped
+                                {
+                                    refresh_requests.request(entry.node);
+                                }
+                            }
+                        }
+                        Action::QueueReorder(direction) => {
+                            if let Some(id) = app.queue_selection() {
+                                queue.move_pending(id, direction);
+                            }
+                        }
+                        Action::QueueNavigate { end, amount } => {
+                            app.queue_navigate(&queue, end, amount)
+                        }
+                        Action::Continue => {}
+                    }
+                    if closing && !app.finishing_deletions() {
+                        closing = false;
+                    }
+                    if !quitting {
+                        queue.start_next();
+                    }
+                    prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
+                    app.pump_visual();
+                    app.show_delete_notice();
+                    prioritize_requested(&mut app, &scanner, &scopes);
+                    // Paint input immediately, before bounded background event work.
+                    if failure.is_none()
+                        && let Err(error) = terminal.draw(|frame| {
                             app.sync_queue(&mut queue, frame.area());
                             frame_gate.painting(&app);
                             app.draw(
@@ -5253,19 +7392,69 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                                 !scopes.is_empty() || !refresh_requests.is_empty(),
                                 deletion_busy(&queue, batch.as_ref()),
                             )
-                        }) {
-                            failure = Some(error);
-                        }
-                        next_frame = Instant::now() + FRAME_INTERVAL;
+                        })
+                    {
+                        failure = Some(error);
                     }
-                    Event::Resize(_, _) => {
-                        frame_gate.dirty = true;
-                        next_frame = Instant::now();
-                    }
-                    _ => {}
+                    next_frame = Instant::now() + FRAME_INTERVAL;
                 }
             }
             Ok(false) => {}
+        }
+        // A confirmation key can precede the asynchronous identity result.
+        // Consume its intent once, after polling input so cancellation stays responsive.
+        if !quitting && app.confirmation_ready() {
+            let drawn = terminal.get_frame().area();
+            #[cfg(unix)]
+            let live_size =
+                crossterm::terminal::window_size().map(|size| (size.columns, size.rows));
+            #[cfg(not(unix))]
+            let live_size = terminal.size().map(|size| (size.width, size.height));
+            match live_size {
+                Ok(size) if size == (drawn.width, drawn.height) => {
+                    match app.take_ready_confirmation() {
+                        Action::Delete(id, anchor, relative, target) => {
+                            enqueue_delete(
+                                &mut app,
+                                &scanner,
+                                &scopes,
+                                &mut queue,
+                                (id, anchor, relative, target),
+                            );
+                            queue.start_next();
+                        }
+                        Action::BatchConfirm => {
+                            if let Some(preparation) = batch.as_mut() {
+                                preparation.confirm_pending = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    frame_gate.dirty = true;
+                    next_frame = Instant::now();
+                }
+                Ok(_) => {
+                    if let Some(
+                        Modal::Delete {
+                            reviewable,
+                            confirm_requested,
+                            ..
+                        }
+                        | Modal::Batch {
+                            reviewable,
+                            confirm_requested,
+                            ..
+                        },
+                    ) = app.modal.as_mut()
+                    {
+                        *reviewable = false;
+                        *confirm_requested = false;
+                    }
+                    frame_gate.dirty = true;
+                    next_frame = Instant::now();
+                }
+                Err(error) => failure = Some(error),
+            }
         }
         let batch_status = if !quitting {
             pump_batch(
@@ -5380,8 +7569,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                 || quitting,
         );
         if Instant::now() >= next_frame {
-            if frame_gate.needs_frame(&app) && failure.is_none() {
-                if let Err(error) = terminal.draw(|frame| {
+            if frame_gate.needs_frame(&app)
+                && failure.is_none()
+                && let Err(error) = terminal.draw(|frame| {
                     app.sync_queue(&mut queue, frame.area());
                     frame_gate.painting(&app);
                     app.draw(
@@ -5389,9 +7579,9 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
                         !scopes.is_empty() || !refresh_requests.is_empty(),
                         deletion_busy(&queue, batch.as_ref()),
                     )
-                }) {
-                    failure = Some(error);
-                }
+                })
+            {
+                failure = Some(error);
             }
             // A skipped frame must still move the deadline beyond the next poll.
             next_frame = Instant::now() + FRAME_INTERVAL;
@@ -5410,7 +7600,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
             || batch_status.productive
             || queue_progress
             || queue.is_updating()
-            || (selection_progress && app.visual.is_pending())
+            || (selection_progress && (app.visual.is_pending() || app.parent_selection_work()))
         {
             Duration::ZERO
         } else {
@@ -5421,7 +7611,7 @@ pub fn run(root: PathBuf, options: ScanOptions, size_mode: SizeMode) -> io::Resu
         // channel still gets the ordinary minimum wait rather than a busy loop.
         input_timeout = if batch_status.productive
             || queue_progress
-            || (selection_progress && app.visual.is_pending())
+            || (selection_progress && (app.visual.is_pending() || app.parent_selection_work()))
         {
             Duration::ZERO
         } else {
@@ -5687,17 +7877,6 @@ fn human_size(bytes: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     }
 }
-fn clipped_path_tail(text: &str, width: usize) -> String {
-    if Line::from(text).width() <= width {
-        return text.to_owned();
-    }
-    if width < 2 {
-        return ".".repeat(width);
-    }
-    let tail = clipped_tail(text, width - 1);
-    format!("..{}", tail.strip_prefix('…').unwrap_or(&tail))
-}
-
 fn clipped_tail(text: &str, width: usize) -> String {
     let line = Line::from(text);
     if line.width() <= width {

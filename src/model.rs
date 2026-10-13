@@ -769,6 +769,17 @@ impl Model {
         changed
     }
 
+    /// Number of live direct children, including hidden names.
+    pub fn child_count(&self, id: NodeId) -> usize {
+        if self.is_live(id) {
+            self.directories
+                .get(&id)
+                .map_or(0, |info| info.children.all as usize)
+        } else {
+            0
+        }
+    }
+
     /// Whether the direct child list contains a row accepted by this view.
     pub fn has_children(&self, id: NodeId, directories_only: bool, show_hidden: bool) -> bool {
         if !self.is_live(id) {

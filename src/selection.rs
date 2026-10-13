@@ -152,6 +152,13 @@ impl VisualSelection {
         true
     }
 
+    /// Add a known live entry without changing a pending gesture or its anchor.
+    pub fn select(&mut self, id: NodeId) {
+        if self.active {
+            self.selected.insert(id);
+        }
+    }
+
     /// Explicit deselection changes one row without treating it as deleted.
     /// Preserve that choice when a later additive range starts at this anchor.
     pub fn deselect(&mut self, id: NodeId) -> bool {

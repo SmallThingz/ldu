@@ -6,6 +6,52 @@ fn test_confirmed_target() -> ConfirmedTarget {
 }
 
 #[test]
+fn fixed_edge_layout_matches_solver_across_terminal_sizes() {
+    use ratatui::layout::{Constraint, Layout};
+
+    let mut edges = vec![(2, 4), (3, 2), (1, 3)];
+    edges.extend((0..=18).map(|height| (height, 3)));
+    edges.extend(
+        ["? help", "d delete  ? help", "d delete  Esc clear  ? help"]
+            .map(|hint| (2, hint.len() as u16 + 2)),
+    );
+    let mut differences = Vec::new();
+    for direction in [Direction::Horizontal, Direction::Vertical] {
+        for &(leading, trailing) in &edges {
+            for available in 0..=100 {
+                let area = match direction {
+                    Direction::Horizontal => Rect::new(7, 9, available, 3),
+                    Direction::Vertical => Rect::new(7, 9, 3, available),
+                };
+                let reference = Layout::default()
+                    .direction(direction)
+                    .constraints([
+                        Constraint::Length(leading),
+                        Constraint::Min(0),
+                        Constraint::Length(trailing),
+                    ])
+                    .split(area);
+                let actual = split_edges(area, direction, leading, trailing);
+                if actual.as_slice() != reference.as_ref() {
+                    differences.push(format!(
+                        "{direction:?} {leading}/{trailing} in {available}: {actual:?} != {reference:?}",
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    for height in 0..=100 {
+        let area = Rect::new(7, 9, 50, height);
+        let reference = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(area);
+        assert_eq!(
+            &split_edges(area, Direction::Vertical, 0, 2)[1..],
+            reference.as_ref(),
+        );
+    }
+}
+
+#[test]
 fn fractional_bars_use_eighth_cells_and_keep_exact_width() {
     assert_eq!(fractional_bar(1, 80, 10), "▏         ");
     assert_eq!(fractional_bar(5, 10, 10), "█████     ");
@@ -24,25 +70,11 @@ fn pending_rows_share_spinner_and_fractional_bar_style_at_both_pane_widths() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                Paragraph::new(app.row(
-                    5,
-                    24,
-                    80,
-                    false,
-                    spinner_frame(0),
-                    DeleteState::default(),
-                )),
+                Paragraph::new(app.row(5, 24, 80, false, spinner_frame(0), DeleteState::default())),
                 Rect::new(0, 0, 80, 1),
             );
             frame.render_widget(
-                Paragraph::new(app.row(
-                    5,
-                    24,
-                    44,
-                    false,
-                    spinner_frame(1),
-                    DeleteState::default(),
-                )),
+                Paragraph::new(app.row(5, 24, 44, false, spinner_frame(1), DeleteState::default())),
                 Rect::new(0, 1, 44, 1),
             );
         })
@@ -120,14 +152,14 @@ fn info_long_spaced_unicode_path_scrolls_without_losing_title_or_close_hint() {
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
     let first = rendered(&terminal);
-    assert!(first.contains("Info") && first.contains("Enter / Esc: close"));
+    assert!(first.contains("Info") && first.contains("[x]"));
     assert!(!first.contains("Complete"));
     app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), None, false);
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
     let last = rendered(&terminal);
-    assert!(last.contains("Info") && last.contains("Enter / Esc: close"));
+    assert!(last.contains("Info") && last.contains("[x]"));
     assert!(last.contains("END-OF-SPACED-PATH") && last.contains("Complete"));
     app.key(
         KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
@@ -152,6 +184,7 @@ fn delete_long_spaced_target_can_scroll_to_last_component_with_pinned_choices() 
         target,
         scroll: 0,
         reviewable: false,
+        confirm_requested: false,
         confirmed: Some(test_confirmed_target()),
         capture: None,
     });
@@ -200,7 +233,7 @@ fn help_scrolls_to_final_explanation_and_zero_width_dialog_remains_safe() {
             && last.contains("system utilities.")
             && last.contains("counted once.")
     );
-    assert!(last.contains("Enter / Esc: close"));
+    assert!(last.contains("[x]") && !last.contains("Enter / Esc: close"));
     app.key(
         KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
         None,
@@ -223,6 +256,136 @@ fn header_clipping_preserves_graphemes_and_column_budget() {
 }
 #[cfg(target_os = "linux")]
 #[test]
+fn immediate_delete_confirmation_waits_for_capture_and_is_consumed_once() {
+    for key in [KeyCode::Enter, KeyCode::Char('y')] {
+        for outcome in 0..5 {
+            let mut app = browser_fixture();
+            let (sender, receiver) = bounded(1);
+            app.modal = Some(Modal::Delete {
+                id: 2,
+                anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
+                relative: PathBuf::from("root-file"),
+                target: "/fixture/root-file".to_owned(),
+                scroll: 0,
+                reviewable: false,
+                confirm_requested: false,
+                confirmed: None,
+                capture: Some(receiver),
+            });
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let screen = rendered(&terminal);
+            assert!(screen.contains("/fixture/root-file") && screen.contains("y / Enter: delete"));
+            assert!(!screen.contains("Checking target"));
+            for _ in 0..2 {
+                assert!(matches!(
+                    app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false),
+                    Action::Continue
+                ));
+                assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            }
+            assert!(matches!(
+                app.modal,
+                Some(Modal::Delete {
+                    confirm_requested: true,
+                    ..
+                })
+            ));
+            match outcome {
+                1 | 2 => {
+                    let cancel = if outcome == 1 {
+                        KeyCode::Esc
+                    } else {
+                        KeyCode::Char('n')
+                    };
+                    app.key(KeyEvent::new(cancel, KeyModifiers::NONE), None, false);
+                }
+                3 => {
+                    terminal.backend_mut().resize(20, 4);
+                    terminal
+                        .draw(|frame| app.draw(frame, false, false))
+                        .unwrap();
+                    assert!(matches!(
+                        app.modal,
+                        Some(Modal::Delete {
+                            confirm_requested: false,
+                            ..
+                        })
+                    ));
+                }
+                _ => {}
+            }
+            let result = if outcome == 4 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "identity unavailable",
+                ))
+            } else {
+                Ok(test_confirmed_target())
+            };
+            let _ = sender.try_send(result);
+            app.pump_confirmation();
+            if outcome == 0 {
+                assert!(matches!(
+                    app.take_ready_confirmation(),
+                    Action::Delete(2, _, _, _)
+                ));
+            } else {
+                assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            }
+            assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            if outcome == 4 {
+                assert!(matches!(
+                    app.modal,
+                    Some(Modal::Text {
+                        title: "Cannot delete",
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_batch_confirmation_advances_once_after_identity_checks() {
+    for key in [KeyCode::Enter, KeyCode::Char('y')] {
+        let mut app = browser_fixture();
+        app.visual.enter(ROOT, Some(1));
+        app.modal = Some(Modal::Batch {
+            target: "/fixture".to_owned(),
+            count: 1,
+            ready: false,
+            reviewable: false,
+            confirm_requested: false,
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert!(matches!(
+            app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false),
+            Action::Continue
+        ));
+        assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+        let Some(Modal::Batch { ready, .. }) = app.modal.as_mut() else {
+            panic!("batch lost");
+        };
+        *ready = true;
+        assert!(matches!(
+            app.take_ready_confirmation(),
+            Action::BatchConfirm
+        ));
+        assert!(!app.visual.active() && matches!(app.modal, Some(Modal::Enqueueing)));
+        assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
     for (width, height) in [(80, 4), (38, 6)] {
         let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
@@ -233,6 +396,7 @@ fn delete_confirmation_waits_for_a_visible_target_and_recovers_after_resize() {
             target: "/fixture/unmodified-test-target".into(),
             scroll: 0,
             reviewable: false,
+            confirm_requested: false,
             confirmed: Some(test_confirmed_target()),
             capture: None,
         });
@@ -304,6 +468,880 @@ fn wait_cache(app: &mut App, directory: NodeId, ids: &[NodeId]) {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+fn right_event(kind: MouseEventKind, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: 2,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn right_click_enters_visual_and_adds_the_clicked_entry_without_navigating() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    for id in [2, 2, 1] {
+        let row =
+            app.list_area.y + app.painted_rows.iter().position(|&row| row == id).unwrap() as u16;
+        let before = app.visual.len();
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        assert_eq!(app.visual.len(), before, "press alone must not select");
+        app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
+        finish_visual(&mut app);
+        assert!(app.visual.active() && app.visual.contains(id));
+        assert_eq!(app.selected, Some(id));
+        assert_eq!(app.directory, ROOT);
+    }
+    assert_eq!(app.visual.len(), 2);
+    assert!(app.right_press.is_none());
+}
+
+#[test]
+fn right_click_parent_enters_visual_and_selects_all_without_navigating() {
+    for directory in [ROOT, 1] {
+        let mut app = browser_fixture();
+        if directory != ROOT {
+            app.navigate_directory(directory);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: directory,
+                error: None,
+            },
+        );
+        let row = app.parent_area.y;
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        assert!(!app.visual.active());
+        app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
+        finish_visual(&mut app);
+        assert_eq!(app.directory, directory);
+        assert!(app.parent_selected && app.visual.active());
+        assert_eq!(app.visual.len(), app.model.child_count(directory));
+        assert!(!app.visual.contains(directory));
+    }
+}
+
+#[test]
+fn right_click_rejects_drag_stale_rows_keys_resize_and_modal_interruption() {
+    for interruption in 0..7 {
+        let mut app = browser_fixture();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let row = app.list_area.y;
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        assert!(app.right_press.is_some());
+        let mut release_row = row;
+        match interruption {
+            0 => app.mouse(right_event(MouseEventKind::Drag(MouseButton::Right), 0)),
+            1 => release_row = row + 1,
+            2 => {
+                app.key(
+                    KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+            }
+            3 => {
+                terminal.backend_mut().resize(60, 8);
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+            }
+            4 => app.removed(1),
+            5 => app.begin_model_refresh(ROOT, 1),
+            _ => {
+                app.modal = Some(Modal::help(false));
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                app.modal = None;
+            }
+        }
+        app.mouse(right_event(
+            MouseEventKind::Up(MouseButton::Right),
+            release_row,
+        ));
+        assert!(
+            !app.visual.active() && app.visual.is_empty(),
+            "interruption={interruption}"
+        );
+        assert!(app.right_press.is_none());
+        assert_eq!(app.directory, ROOT);
+    }
+}
+
+#[test]
+fn right_click_retains_its_painted_order_and_queues_before_dependent_enter() {
+    for pending in [false, true] {
+        let mut app = browser_fixture();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        if pending {
+            app.visual.enter(ROOT, Some(1));
+            app.visual
+                .begin_range(Arc::clone(&app.view), 2, RangeMode::Add);
+        }
+        let original = app.painted_rows.clone();
+        let row = app.list_area.y + 1;
+        app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
+        let reversed = original.iter().copied().rev().collect::<Vec<_>>();
+        app.view = Arc::new(CachedSnapshot {
+            generation: app.view.generation,
+            child_epoch: app.view.child_epoch,
+            positions: reversed
+                .iter()
+                .enumerate()
+                .map(|(position, &id)| (id, position as u32))
+                .collect(),
+            ids: reversed,
+        });
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        assert_eq!(app.painted_rows, original);
+        app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row));
+        if pending {
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false,
+            );
+        }
+        finish_visual(&mut app);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.visual.contains(2), !pending);
+        assert_eq!(app.visual.contains(1), pending);
+        assert_eq!(app.visual.len(), 1);
+    }
+}
+
+#[test]
+fn parent_row_is_pinned_and_never_becomes_a_delete_target() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(app.selected, Some(1));
+    assert!(!app.parent_selected);
+    assert_eq!(
+        (app.parent_area.y, app.list_area.y, app.page_size),
+        (1, 2, 6)
+    );
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == ".")
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(app.parent_selected && app.selected.is_none());
+    app.sync_order(true);
+    assert!(app.parent_selected && app.selected.is_none());
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert_eq!(app.directory, ROOT);
+    assert!(app.parent_selected);
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            None,
+            false
+        ),
+        Action::Continue
+    ));
+    assert!(!matches!(app.modal, Some(Modal::Delete { .. })));
+    app.modal = None;
+    app.key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert_eq!(app.selected, Some(1));
+    assert!(!app.parent_selected);
+    app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), None, false);
+    assert!(app.parent_selected && app.selected.is_none());
+    app.key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert_eq!(app.directory, 1);
+    app.key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert_eq!((app.directory, app.selected), (ROOT, Some(1)));
+    assert!(!app.parent_selected);
+}
+
+#[test]
+fn parent_mouse_activates_only_on_valid_release_and_ctrl_clears_all() {
+    let mut app = browser_fixture();
+    app.navigate_directory(1);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let event = |kind, modifiers| MouseEvent {
+        kind,
+        column: 2,
+        row: 1,
+        modifiers,
+    };
+    app.mouse(event(
+        MouseEventKind::Down(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    assert_eq!(app.directory, 1);
+    app.mouse(event(
+        MouseEventKind::Drag(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    app.mouse(event(
+        MouseEventKind::Up(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    assert_eq!(app.directory, 1);
+    app.mouse(event(
+        MouseEventKind::Down(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    app.mouse(event(
+        MouseEventKind::Up(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    assert_eq!(app.directory, ROOT);
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.visual.enter(ROOT, None);
+    app.mouse(event(
+        MouseEventKind::Down(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    app.mouse(event(
+        MouseEventKind::Up(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 2);
+    assert!(!app.visual.contains(ROOT));
+    app.mouse(event(
+        MouseEventKind::Down(MouseButton::Left),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    app.mouse(event(
+        MouseEventKind::Up(MouseButton::Left),
+        KeyModifiers::NONE,
+    ));
+    finish_visual(&mut app);
+    assert!(app.visual.active() && app.visual.is_empty());
+    assert_eq!(app.directory, ROOT);
+}
+
+#[test]
+fn parent_select_all_retries_same_count_replacements_before_and_during_its_walk() {
+    for during in [false, true] {
+        let mut app = navigation_fixture(1024, 1025..=1025);
+        app.focus_parent(true);
+        app.visual.enter(ROOT, None);
+        if during {
+            app.select_parent_contents(false);
+            app.pump_visual();
+            assert_eq!(app.visual.len(), 256);
+        }
+        // Remove an already visited child, the next cursor, and the old tail.
+        // A same-length stale sorted view must not release confirmation.
+        for id in [1, 257, 1024] {
+            app.removed(id);
+        }
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: (1025..=1027)
+                    .map(|id| {
+                        entry(
+                            id,
+                            &format!("replacement-{id}"),
+                            NodeKind::File,
+                            100000 + u64::from(id),
+                        )
+                    })
+                    .collect(),
+            },
+        );
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+        );
+        if !during {
+            app.select_parent_contents(false);
+        }
+        while app.parent_selection_work() {
+            app.pump_visual();
+        }
+        assert!(app.parent_select_pending);
+        assert_eq!(app.visual.len(), app.model.child_count(ROOT));
+        assert!(
+            [1, 257, 1024]
+                .into_iter()
+                .all(|id| !app.visual.contains(id))
+        );
+        assert!((1025..=1027).all(|id| app.visual.contains(id)));
+        for _ in 0..4 {
+            assert!(
+                !app.pump_visual(),
+                "unchanged rejected order must stay idle"
+            );
+            assert!(app.parent_select_pending);
+        }
+        let mut expected = vec![1027, 1026, 1025];
+        expected.extend((2..1024).filter(|&id| id != 257));
+        wait_cache(&mut app, ROOT, &expected);
+        finish_visual(&mut app);
+        assert_eq!(app.view.ids, expected);
+        assert_eq!(app.visual.len(), app.model.child_count(ROOT));
+        assert!(app.parent_select_view.is_none());
+    }
+}
+
+#[test]
+fn parent_select_all_waits_for_direct_listing_and_includes_late_children() {
+    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+    app.focus_parent(true);
+    app.visual.enter(ROOT, None);
+    app.select_parent_contents(false);
+    assert!(app.parent_select_pending && app.visual.is_empty());
+    assert!(!app.pump_visual());
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1, "first", NodeKind::File, 4)],
+        },
+    );
+    wait_cache(&mut app, ROOT, &[1]);
+    app.pump_visual();
+    assert!(app.visual.contains(1) && app.parent_select_pending);
+    assert!(
+        !app.pump_visual(),
+        "a completed prefix still waits for enumeration"
+    );
+    let attempted = app.order.snapshot(ROOT).unwrap();
+    let checks = app.parent_select_checks;
+    app.order.configure(app.config);
+    wait_cache(&mut app, ROOT, &[1]);
+    assert!(!Arc::ptr_eq(&attempted, &app.order.snapshot(ROOT).unwrap()));
+    assert!(
+        !app.pump_visual(),
+        "same-membership publication must not repeat the walk"
+    );
+    assert_eq!(app.parent_select_checks, checks);
+    assert!(app.parent_select_view.is_none());
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(2, "late", NodeKind::Directory, 7)],
+        },
+    );
+    // DirectoryDone only closes the direct listing. The late directory's
+    // descendants may still be scanning while its own mark becomes usable.
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    wait_cache(&mut app, ROOT, &[2, 1]);
+    finish_visual(&mut app);
+    assert!(app.visual.contains(1) && app.visual.contains(2));
+    assert_eq!(app.visual.len(), 2);
+    assert!(!app.model.node(ROOT).complete);
+    assert!(app.parent_select_view.is_none());
+}
+
+#[test]
+fn parent_select_all_visits_initial_children_and_spaced_late_arrivals_once() {
+    let mut app = navigation_fixture(4096, 4097..=4097);
+    app.select_parent_contents(false);
+    assert!(app.visual.is_empty());
+    app.pump_visual();
+    assert_eq!(app.visual.len(), 256);
+    assert!(app.parent_selection_work() && app.frame_work());
+    while app.parent_selection_work() {
+        app.pump_visual();
+    }
+    assert_eq!(app.visual.len(), 4096);
+    assert_eq!(app.parent_select_checks, 4096);
+    let mut expected: Vec<_> = (1..=4096).collect();
+    for id in 4097..=4112 {
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(id, &format!(".late-{id}"), NodeKind::File, 0)],
+            },
+        );
+        expected.push(id);
+        assert!(app.visual.contains(id), "admission must mark the new child");
+        wait_cache(&mut app, ROOT, &expected);
+        assert!(
+            !app.pump_visual(),
+            "growth must not restart the initial walk"
+        );
+        assert!(!app.parent_selection_work());
+        assert_eq!(app.parent_select_checks, id as usize);
+    }
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 4112);
+    assert_eq!(app.parent_select_checks, 4112 * 2);
+    assert_eq!(app.view.ids, expected);
+}
+
+#[test]
+fn parent_selection_validation_waits_after_membership_and_sort_changes() {
+    let mut app = navigation_fixture(1024, 1025..=1025);
+    app.select_parent_contents(false);
+    while app.parent_selection_work() {
+        app.pump_visual();
+    }
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.pump_visual();
+    assert!(app.parent_selection_work());
+    let checks = app.parent_select_checks;
+    app.removed(257);
+    assert_eq!(app.parent_select_checks, checks);
+    assert!(!app.parent_selection_work());
+    assert!(!app.pump_visual());
+    let expected: Vec<_> = (1..=1024).filter(|&id| id != 257).collect();
+    wait_cache(&mut app, ROOT, &expected);
+    app.pump_visual();
+    assert!(app.parent_selection_work());
+    let attempted = Arc::clone(app.parent_select_view.as_ref().unwrap());
+    let checks = app.parent_select_checks;
+    app.sort(SortMode::Size);
+    assert_ne!(attempted.generation, app.order.generation());
+    // A held validator is no longer runnable during configuration handoff.
+    assert!(!app.parent_selection_work());
+    assert_eq!(app.parent_select_checks, checks);
+    let expected: Vec<_> = (1..=1024).rev().filter(|&id| id != 257).collect();
+    wait_cache(&mut app, ROOT, &expected);
+    finish_visual(&mut app);
+    assert_eq!(app.view.generation, app.order.generation());
+    assert_eq!(app.view.ids, expected);
+    assert_eq!(app.visual.len(), 1023);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_selection_retains_confirmation_until_late_marks_have_a_sorted_order() {
+    let mut app = navigation_fixture(1024, 1025..=1025);
+    app.select_parent_contents(false);
+    app.pump_visual();
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    let mut batch = None;
+    let mut retired = VecDeque::new();
+    prepare_batch(&mut app, Some(anchor), &mut batch, &retired);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(1025, ".late-hidden", NodeKind::File, 0)],
+        },
+    );
+    assert!(app.visual.contains(1025));
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    while app.parent_selection_work() {
+        app.pump_visual();
+    }
+    assert_eq!(app.visual.len(), 1025);
+    for _ in 0..3 {
+        assert!(!app.pump_visual());
+        resume_batch(&mut app, &mut batch, &retired);
+        assert!(app.waiting_batch.is_some() && batch.is_none());
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Batch {
+                confirm_requested: true,
+                ..
+            })
+        ));
+    }
+    let expected: Vec<_> = (1..=1025).collect();
+    wait_cache(&mut app, ROOT, &expected);
+    finish_visual(&mut app);
+    resume_batch(&mut app, &mut batch, &retired);
+    let preparation = batch.as_ref().expect("complete ordered selection resumes");
+    assert_eq!(preparation.remaining.len(), 1025);
+    assert!(preparation.remaining.contains(&1025));
+    assert_eq!(preparation.order.ids, expected);
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Batch {
+            confirm_requested: true,
+            ..
+        })
+    ));
+    cancel_batch(&mut app, &mut batch, &mut retired);
+}
+
+#[test]
+fn parent_select_all_finishes_empty_leaf_and_failed_roots_without_pending_work() {
+    for kind in [
+        NodeKind::Directory,
+        NodeKind::File,
+        NodeKind::Symlink,
+        NodeKind::Unknown,
+    ] {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        app.focus_parent(true);
+        app.visual.enter(ROOT, None);
+        app.select_parent_contents(false);
+        apply(
+            &mut app,
+            ScanEvent::RootInfo {
+                file_identity: None,
+                kind,
+                sizes: Default::default(),
+                error: (kind == NodeKind::Unknown).then(|| "missing root".to_owned()),
+            },
+        );
+        if kind == NodeKind::Directory {
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: ROOT,
+                    error: None,
+                },
+            );
+        }
+        finish_visual(&mut app);
+        assert!(app.visual.is_empty() && app.parent_select_view.is_none());
+        assert!(app.modal.is_none());
+    }
+    let mut app = navigation_fixture(1024, 1025..=1025);
+    app.focus_parent(true);
+    app.visual.enter(ROOT, None);
+    app.select_parent_contents(false);
+    app.pump_visual();
+    assert!(app.parent_selection_work());
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+    assert!(app.parent_select_view.is_none() && !app.parent_select_pending);
+    assert!(!app.visual.active() && !app.visual_busy());
+}
+
+#[test]
+fn stopped_incomplete_parent_listing_preserves_known_marks_and_cancels_confirmation() {
+    let mut app = browser_fixture();
+    app.focus_parent(true);
+    app.visual.enter(ROOT, None);
+    app.select_parent_contents(false);
+    app.enqueue_visual(VisualIntent::ToggleParent);
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    let mut batch = None;
+    prepare_batch(&mut app, Some(anchor), &mut batch, &VecDeque::new());
+    assert!(app.waiting_batch.is_some() && batch.is_none());
+    let Some(Modal::Batch {
+        confirm_requested, ..
+    }) = app.modal.as_mut()
+    else {
+        panic!("waiting confirmation missing")
+    };
+    *confirm_requested = true;
+    apply(&mut app, ScanEvent::Finished { cancelled: true });
+    finish_visual(&mut app);
+    assert!(!app.model.listing_complete(ROOT));
+    assert!(app.visual.active() && app.visual.contains(1) && app.visual.contains(2));
+    assert!(app.parent_select_view.is_none() && !app.parent_select_pending);
+    assert!(
+        app.visual_intents.is_empty()
+            && app.waiting_batch.is_none()
+            && app.deferred_batch.is_none()
+    );
+    assert!(
+        matches!(app.modal.as_ref(), Some(Modal::Text { title: "Selection incomplete", text, .. })
+        if text == "Folder listing incomplete. Refresh to select all entries.")
+    );
+}
+
+#[test]
+fn incomplete_parent_selection_preserves_header_quit_question_and_restores_notice() {
+    for stopped_before_question in [false, true] {
+        for choice in 0..4 {
+            let mut app = navigation_fixture(1024, 1025..=1025);
+            app.select_parent_contents(false);
+            app.pump_visual();
+            assert_eq!(app.visual.len(), 256);
+            assert!(app.parent_selection_work());
+            app.modal = Some(Modal::help(true));
+            app.delete_notices.push_back(DeleteReport::single(
+                PathBuf::from("retained-error"),
+                "denied".to_owned(),
+            ));
+            if stopped_before_question {
+                apply(&mut app, ScanEvent::Finished { cancelled: true });
+            }
+            app.request_quit_confirmation();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            if !stopped_before_question {
+                apply(&mut app, ScanEvent::Finished { cancelled: true });
+            }
+            for _ in 0..8 {
+                app.pump_visual();
+            }
+            assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+            assert!(!app.parent_select_pending && app.visual.len() == 1024);
+            assert!(matches!(
+                app.background_modal_slot(),
+                Some(Modal::Text {
+                    title: "Selection incomplete",
+                    ..
+                })
+            ));
+            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            let action = match choice {
+                0 => click_dialog_option(&mut app, KeyCode::Esc, true),
+                1 => {
+                    let area = app.dialog_close_area;
+                    click_control(&mut app, area, true)
+                }
+                _ => click_dialog_option(&mut app, KeyCode::Enter, choice == 2),
+            };
+            if choice == 2 {
+                assert!(matches!(action, Some(Action::QuitWarning)));
+                cancel_unconfirmed(&mut app, &mut None, &mut VecDeque::new());
+                assert!(app.finishing_deletions());
+                app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, true);
+            } else if choice == 3 {
+                assert!(matches!(action, Some(Action::Quit)));
+            } else {
+                assert!(matches!(action, Some(Action::Continue)));
+            }
+            assert!(matches!(
+                app.modal,
+                Some(Modal::Text {
+                    title: "Selection incomplete",
+                    ..
+                })
+            ));
+            assert!(app.visual.active() && app.visual.len() == 1024);
+            assert_eq!(app.delete_notices.len(), 1);
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+            assert!(app.show_delete_notice());
+            assert!(matches!(app.modal, Some(Modal::DeleteErrors { .. })));
+            assert_eq!(app.delete_notices.front().unwrap().target, "retained-error");
+        }
+    }
+}
+
+#[test]
+fn parent_select_all_reveals_filter_and_hidden_entries_with_bounded_work() {
+    let mut app = navigation_fixture(4096, 3000..=4096);
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.config.show_hidden = false;
+    app.reset_order(true);
+    app.filter = "item-00001".to_owned();
+    app.update_filter();
+    app.key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(app.parent_selected);
+    assert!(app.config.show_hidden && app.filter.is_empty());
+    assert!(app.visual_busy());
+    assert!(app.visual.len() <= 1);
+    app.pump_visual();
+    assert!(app.visual.len() <= 256);
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), 4096);
+    assert!((1..=4096).all(|id| app.visual.contains(id)));
+    assert!(!app.visual.contains(ROOT));
+    assert_eq!(app.view.ids.len(), 4096);
+}
+
+#[test]
+fn visual_shift_selection_onto_parent_selects_every_child() {
+    for key in [KeyCode::Home, KeyCode::Up] {
+        let mut app = browser_fixture();
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+        );
+        app.visual.enter(ROOT, Some(1));
+        app.key(KeyEvent::new(key, KeyModifiers::SHIFT), None, false);
+        finish_visual(&mut app);
+        assert!(app.parent_selected && app.selected.is_none());
+        assert!(app.visual.contains(1) && app.visual.contains(2));
+        assert_eq!(app.visual.len(), 2);
+    }
+}
+
+#[test]
+fn queued_parent_navigation_and_enter_keep_their_input_order() {
+    let mut app = navigation_fixture(1024, 1025..=1025);
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.visual.enter(ROOT, Some(1));
+    app.visual
+        .begin_range(Arc::clone(&app.view), 1024, RangeMode::Add);
+    app.key(
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    finish_visual(&mut app);
+    assert_eq!(app.selected, Some(1));
+    assert!(!app.parent_selected);
+    assert_eq!(app.visual.len(), 1023);
+    assert!(!app.visual.contains(1));
+    assert!((2..=1024).all(|id| app.visual.contains(id)));
+}
+
+#[test]
+fn empty_folder_keeps_a_parent_row_and_root_activation_is_harmless() {
+    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 4)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert_eq!(app.parent_area.height, 1);
+    assert!(!app.parent_selected && app.selected.is_none());
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.browser_edge_selection(false);
+    app.browser_move_selection(1);
+    assert!(app.parent_selected);
+    app.key(
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert!(app.visual.active() && app.visual.is_empty() && !app.visual_busy());
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    assert_eq!(app.directory, ROOT);
+    assert!(app.visual.is_empty());
 }
 
 fn browser_fixture() -> App {
@@ -388,7 +1426,7 @@ fn finished_frame_fixture(root: PathBuf) -> App {
 #[test]
 fn settled_frames_stop_after_scan_and_static_visual_input() {
     let mut app = finished_frame_fixture(PathBuf::from("fixture"));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     let mut gate = FrameGate::new(&app);
     gate.painting(&app);
     terminal
@@ -416,7 +1454,7 @@ fn settled_frames_stop_after_scan_and_static_visual_input() {
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 1,
@@ -691,15 +1729,15 @@ fn quit_key_keeps_reviewability_and_warning_shows_live_delete_progress() {
         ),
         Action::Continue
     ));
-    app.queue_view.status = "Deleting · 12 removed · 3 queued".to_owned();
+    app.queue_view.status = "12 removed · 3 queued".to_owned();
     terminal.backend_mut().resize(80, 12);
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     let text = rendered(&terminal);
-    assert!(text.contains("Deletions in progress"));
-    assert!(text.contains("Finishing deletions. Scanning stopped."));
+    assert!(text.contains("Exit after deletion?"));
+    assert!(text.contains("Finishing deletions before exit."));
     assert!(text.contains("12 removed · 3 queued"));
-    assert!(text.contains("Ctrl-C") && text.contains("cancel all and quit"));
-    app.queue_view.status = "Deleting · 23 removed · 2 queued".to_owned();
+    assert!(text.contains("Enter / q: cancel and exit"));
+    app.queue_view.status = "23 removed · 2 queued".to_owned();
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     assert!(rendered(&terminal).contains("23 removed · 2 queued"));
     assert!(matches!(app.key(quit, None, true), Action::Quit));
@@ -750,6 +1788,401 @@ fn ctrl_c_remains_available_while_stopping() {
 }
 
 #[cfg(target_os = "linux")]
+fn queue_mouse_fixture(count: u32, area: Rect) -> (App, DeleteQueue, Vec<QueueId>) {
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    let mut queue = DeleteQueue::new().unwrap();
+    queue.toggle_pause();
+    let ids = (1..=count)
+        .map(|id| {
+            queue
+                .enqueue(
+                    id,
+                    Arc::clone(&anchor),
+                    format!("unmodified-drag-{id}").into(),
+                )
+                .id
+        })
+        .collect();
+    let mut app = finished_frame_fixture(PathBuf::from("fixture"));
+    app.modal = Some(Modal::Queue {
+        selected: None,
+        offset: None,
+    });
+    app.sync_queue(&mut queue, area);
+    (app, queue, ids)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_mouse_reorders_painted_waiting_jobs_in_both_directions() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(6, area);
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: queue_layout(area).2[1].x + 1,
+        row: queue_layout(area).2[1].y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(
+        app.queue_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1),
+            &mut queue
+        )
+        .is_some()
+    );
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 4),
+        &mut queue,
+    );
+    assert_eq!(
+        queue
+            .pending()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [ids[0], ids[2], ids[3], ids[4], ids[1], ids[5]]
+    );
+    assert_eq!(app.queue_selection(), Some(ids[1]));
+    app.sync_queue(&mut queue, area);
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 0),
+        &mut queue,
+    );
+    assert_eq!(
+        queue
+            .pending()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [ids[1], ids[0], ids[2], ids[3], ids[4], ids[5]]
+    );
+    app.sync_queue(&mut queue, area);
+    app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0), &mut queue);
+    assert!(app.queue_drag.is_none());
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 4),
+        &mut queue,
+    );
+    assert_eq!(queue.pending().front().unwrap().id, ids[1]);
+    // A release at another row also works when a terminal omits the final drag.
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2), &mut queue);
+    assert_eq!(
+        queue
+            .pending()
+            .iter()
+            .map(|entry| entry.id)
+            .take(3)
+            .collect::<Vec<_>>(),
+        [ids[0], ids[2], ids[1]]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_edge_drag_is_bounded_throttled_and_stops_when_job_disappears() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(100, area);
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: queue_layout(area).2[1].x + 1,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), app.queue_area.y),
+        &mut queue,
+    );
+    app.queue_mouse(
+        mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            app.queue_area.bottom(),
+        ),
+        &mut queue,
+    );
+    assert_eq!(queue.previous_id(ids[0]), Some(ids[12]));
+    assert!(
+        !app.pump_queue_drag(&mut queue),
+        "edge entry must not immediately move another row"
+    );
+    app.sync_queue(&mut queue, area);
+    app.queue_drag.as_mut().unwrap().next_step = Instant::now() - FRAME_INTERVAL;
+    assert!(app.pump_queue_drag(&mut queue));
+    assert_eq!(queue.previous_id(ids[0]), Some(ids[13]));
+    assert!(
+        !app.pump_queue_drag(&mut queue),
+        "repeated pumping must respect the deadline"
+    );
+    app.sync_queue(&mut queue, area);
+    app.queue_drag.as_mut().unwrap().next_step = Instant::now() - FRAME_INTERVAL;
+    assert!(app.pump_queue_drag(&mut queue));
+    assert_eq!(queue.previous_id(ids[0]), Some(ids[14]));
+    app.sync_queue(&mut queue, area);
+    assert_eq!(app.queue_view.rows.last().unwrap().0, ids[0]);
+    assert_eq!(app.queue_view.rows.len(), 15);
+    queue.remove_pending(ids[0]).unwrap();
+    assert!(!app.pump_queue_drag(&mut queue));
+    assert!(app.queue_drag.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_mouse_rejects_stale_rows_and_cancels_on_keys_resize_and_close() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(6, area);
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: queue_layout(area).2[1].x + 1,
+        row: queue_layout(area).2[1].y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    queue.remove_pending(ids[2]).unwrap();
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 2),
+        &mut queue,
+    );
+    assert_eq!(queue.pending().front().unwrap().id, ids[0]);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), None, true);
+    assert!(app.queue_drag.is_none());
+    app.mouse_press_view = Some(Arc::clone(&app.painted_view));
+    app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0), &mut queue);
+    assert!(app.mouse_press_view.is_none());
+    app.sync_queue(&mut queue, area);
+    // A painted active row may be selected, but cannot acquire a drag.
+    app.queue_view.rows[0].1 = true;
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    assert!(app.queue_drag.is_none());
+    assert_eq!(app.queue_selection(), Some(ids[0]));
+    app.sync_queue(&mut queue, area);
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    app.sync_queue(&mut queue, Rect::new(0, 0, 60, 12));
+    assert!(app.queue_drag.is_none());
+    app.sync_queue(&mut queue, area);
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    app.modal = None;
+    assert!(!app.pump_queue_drag(&mut queue));
+    assert!(app.queue_drag.is_none());
+    app.modal = Some(Modal::Queue {
+        selected: None,
+        offset: None,
+    });
+    app.sync_queue(&mut queue, Rect::new(0, 0, 0, 0));
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    assert!(app.queue_drag.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_mouse_hover_click_and_right_click_follow_painted_jobs() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(6, area);
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: queue_layout(area).2[1].x + 1,
+        row: queue_layout(area).2[1].y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.queue_mouse(mouse(MouseEventKind::Moved, 3), &mut queue);
+    assert_eq!(app.queue_selection(), Some(ids[3]));
+    assert!(queue.is_paused());
+    assert!(matches!(
+        app.queue_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2),
+            &mut queue
+        ),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2), &mut queue),
+        Some(Action::QueuePause)
+    ));
+    assert_eq!(app.queue_selection(), Some(ids[2]));
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2), &mut queue),
+        Some(Action::Continue)
+    ));
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 4),
+        &mut queue,
+    );
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 4), &mut queue),
+        Some(Action::QueueDelete)
+    ));
+    assert_eq!(app.queue_selection(), Some(ids[4]));
+    queue
+        .remove_pending(app.queue_selection().unwrap())
+        .unwrap();
+    app.sync_queue(&mut queue, area);
+    assert_eq!(queue.pending().len(), 5);
+    assert!(queue.pending().get(ids[4]).is_none());
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 4), &mut queue),
+        Some(Action::Continue)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_click_actions_require_matching_unchanged_release_and_never_follow_drag() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(6, area);
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: queue_layout(area).2[1].x + 1,
+        row: queue_layout(area).2[1].y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 1),
+        &mut queue,
+    );
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 3),
+        &mut queue,
+    );
+    app.sync_queue(&mut queue, area);
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3), &mut queue),
+        Some(Action::Continue)
+    ));
+    assert!(queue.is_paused());
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 0),
+        &mut queue,
+    );
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 1), &mut queue),
+        Some(Action::Continue)
+    ));
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 0),
+        &mut queue,
+    );
+    app.queue_mouse(
+        mouse(MouseEventKind::Drag(MouseButton::Right), 1),
+        &mut queue,
+    );
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 0), &mut queue),
+        Some(Action::Continue)
+    ));
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 0),
+        &mut queue,
+    );
+    queue.remove_pending(ids[0]).unwrap();
+    app.sync_queue(&mut queue, area);
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 0), &mut queue),
+        Some(Action::Continue)
+    ));
+    // A key or resize invalidates right-clicks, just as it invalidates drags.
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 0),
+        &mut queue,
+    );
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), None, true);
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 0), &mut queue),
+        Some(Action::Continue)
+    ));
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Right), 0),
+        &mut queue,
+    );
+    app.sync_queue(&mut queue, Rect::new(0, 0, 60, 12));
+    assert!(app.queue_drag.is_none());
+    app.sync_queue(&mut queue, area);
+    app.queue_mouse(
+        mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        &mut queue,
+    );
+    assert!(matches!(
+        app.queue_mouse(mouse(MouseEventKind::Up(MouseButton::Right), 0), &mut queue),
+        Some(Action::Continue)
+    ));
+    assert!(queue.is_paused());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_wheel_scrolls_over_summary_and_footer_but_not_outside_popup() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, ids) = queue_mouse_fixture(30, area);
+    app.control_frame = area;
+    let (popup, inner, regions) = queue_layout(area);
+    let wheel = |kind, row| MouseEvent {
+        kind,
+        column: inner.x + 1,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.queue_mouse(wheel(MouseEventKind::ScrollDown, regions[0].y), &mut queue);
+    assert_eq!(app.queue_selection(), Some(ids[3]));
+    app.queue_mouse(wheel(MouseEventKind::ScrollDown, regions[2].y), &mut queue);
+    assert_eq!(app.queue_selection(), Some(ids[6]));
+    app.queue_mouse(wheel(MouseEventKind::ScrollUp, regions[2].y), &mut queue);
+    assert_eq!(app.queue_selection(), Some(ids[3]));
+    app.queue_mouse(
+        wheel(MouseEventKind::ScrollDown, popup.bottom()),
+        &mut queue,
+    );
+    assert_eq!(app.queue_selection(), Some(ids[3]));
+    // The expanded wheel surface must not turn summary clicks into actions.
+    app.queue_mouse(
+        wheel(MouseEventKind::Down(MouseButton::Left), regions[0].y),
+        &mut queue,
+    );
+    assert!(matches!(
+        app.queue_mouse(
+            wheel(MouseEventKind::Up(MouseButton::Left), regions[0].y),
+            &mut queue
+        ),
+        Some(Action::Continue)
+    ));
+    assert!(queue.is_paused());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn queue_scroll_indicator_preserves_endpoints_without_walking_the_queue() {
+    let area = Rect::new(0, 0, 100, 24);
+    let (mut app, mut queue, _) = queue_mouse_fixture(100, area);
+    assert_eq!(app.queue_view.scroll_position, 0);
+    app.queue_navigate(&queue, None, 15);
+    app.sync_queue(&mut queue, area);
+    let last = queue.pending().len() - app.queue_view.rows.len();
+    assert!(app.queue_view.scroll_position > 0);
+    assert!(app.queue_view.scroll_position < last);
+    app.queue_navigate(&queue, Some(true), 0);
+    app.sync_queue(&mut queue, area);
+    assert_eq!(app.queue_view.scroll_position, queue.pending().len() - 1);
+    app.queue_navigate(&queue, Some(false), 0);
+    app.sync_queue(&mut queue, area);
+    assert_eq!(app.queue_view.scroll_position, 0);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn queue_selection_follows_job_identity_after_reorder_and_neighbor_removal() {
     let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
@@ -784,8 +2217,14 @@ fn queue_selection_follows_job_identity_after_reorder_and_neighbor_removal() {
             app.draw(frame, false, true);
         })
         .unwrap();
-    assert!(rendered(&terminal).contains("Deletion queue"));
-    assert!(rendered(&terminal).contains("unmodified-selected"));
+    let screen = rendered(&terminal);
+    assert!(screen.contains("Deletion queue"));
+    assert!(screen.contains("unmodified-selected"));
+    assert!(screen.contains("Click / Space: resume waiting"));
+    assert!(screen.contains("Right-click / d: remove/cancel"));
+    assert!(!screen.contains("Pending paused"));
+    assert!(!screen.contains("Pending running"));
+    assert!(!screen.contains("Esc: close"));
 }
 
 #[cfg(target_os = "linux")]
@@ -851,7 +2290,7 @@ fn paused_queue_resize_paints_current_capacity_without_an_idle_correction() {
     let mut gate = FrameGate::new(&app);
     // The cold frame must already contain every row that fits.
     paint(&mut app, &mut queue, &mut gate, &mut terminal, 3);
-    for height in [9, 20] {
+    for height in [6, 20] {
         terminal.backend_mut().resize(80, height);
         gate.dirty = true; // The event loop's Resize branch.
         paint(
@@ -859,7 +2298,7 @@ fn paused_queue_resize_paints_current_capacity_without_an_idle_correction() {
             &mut queue,
             &mut gate,
             &mut terminal,
-            if height == 9 { 1 } else { 3 },
+            if height == 6 { 1 } else { 3 },
         );
     }
     let Action::QueueNavigate { end, amount } =
@@ -871,7 +2310,7 @@ fn paused_queue_resize_paints_current_capacity_without_an_idle_correction() {
     gate.dirty = true; // Key input paints immediately.
     paint(&mut app, &mut queue, &mut gate, &mut terminal, 3);
     assert_eq!(app.queue_selection(), queue.last_id());
-    for height in [9, 20] {
+    for height in [6, 20] {
         terminal.backend_mut().resize(80, height);
         gate.dirty = true;
         paint(
@@ -879,7 +2318,7 @@ fn paused_queue_resize_paints_current_capacity_without_an_idle_correction() {
             &mut queue,
             &mut gate,
             &mut terminal,
-            if height == 9 { 1 } else { 3 },
+            if height == 6 { 1 } else { 3 },
         );
         assert_eq!(app.queue_selection(), queue.last_id());
     }
@@ -936,8 +2375,9 @@ fn single_target_capture_admission_survives_confirmation_cancellation() {
         );
         assert!(matches!(
             app.modal,
-            Some(Modal::Text {
-                title: "Stopping target",
+            Some(Modal::Delete {
+                confirmed: None,
+                capture: None,
                 ..
             })
         ));
@@ -999,10 +2439,36 @@ fn deferred_single_target_retry_keeps_its_target_and_respects_cancellation() {
         Some(anchor),
         false,
     );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false
+        ),
+        Action::Continue
+    ));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            confirm_requested: true,
+            ..
+        })
+    ));
     app.selected = Some(1);
     blocked.store(true, Ordering::Release);
     app.pump_confirmation();
-    assert!(matches!(app.modal, Some(Modal::Delete { id: 2, .. })));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            id: 2,
+            confirm_requested: true,
+            ..
+        })
+    ));
     assert!(app.deferred_delete.is_none());
     app.key(
         KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
@@ -1111,13 +2577,7 @@ fn cancelled_batch_must_retire_before_another_capture_worker_is_admitted() {
     ));
     prepare_batch(&mut app, Some(Arc::clone(&anchor)), &mut batch, &retired);
     assert!(batch.is_none());
-    assert!(matches!(
-        app.modal,
-        Some(Modal::Text {
-            title: "Stopping selection",
-            ..
-        })
-    ));
+    assert!(matches!(app.modal, Some(Modal::Batch { ready: false, .. })));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !retired.is_empty() {
         pump_retired_batches(&mut app, &mut retired);
@@ -1263,6 +2723,160 @@ fn background_delete_failure_preserves_batch_cancellation_and_retry() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn approved_quit_cancels_direct_and_queued_parent_requests_before_scan_completion() {
+    for direct in [false, true] {
+        for header in [false, true] {
+            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            std::fs::write(fixture.path().join("retained"), b"paused").unwrap();
+            let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+            let mut queue = DeleteQueue::new().unwrap();
+            queue.toggle_pause();
+            assert!(queue.enqueue(2000, anchor, "retained".into()).inserted);
+            let mut app = navigation_fixture(1024, 1025..=1025);
+            app.visual.enter(ROOT, Some(1));
+            if direct {
+                app.select_parent_contents(false);
+                app.pump_visual();
+                assert!(app.parent_select_pending && app.parent_selection_work());
+            }
+            let known = app.visual.snapshot();
+            assert!(!known.is_empty());
+            app.enqueue_visual(VisualIntent::Parent(Some(false)));
+            app.enqueue_visual(VisualIntent::ToggleParent);
+            app.enqueue_visual(VisualIntent::Navigate(
+                Navigation::new(Some(false), 0),
+                true,
+            ));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            let action = if header {
+                app.request_quit_confirmation();
+                terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+                click_dialog_option(&mut app, KeyCode::Enter, true).unwrap()
+            } else {
+                app.key(
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                    None,
+                    true,
+                )
+            };
+            assert!(matches!(action, Action::QuitWarning));
+            cancel_unconfirmed(&mut app, &mut None, &mut VecDeque::new());
+            // Closing still drains terminal scan events. They must not publish
+            // a selection notice over the approved wait-for-deletion dialog.
+            apply(&mut app, ScanEvent::Finished { cancelled: true });
+            assert!(app.model.finished && !app.model.listing_complete(ROOT));
+            for _ in 0..8 {
+                app.pump_visual();
+            }
+            assert!(app.finishing_deletions());
+            assert!(!app.parent_select_pending && app.visual_intents.is_empty());
+            assert_eq!(app.visual.snapshot(), known);
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 35,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.key(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                None,
+                true,
+            );
+            assert!(
+                app.finishing_deletions(),
+                "incidental input must not cancel closing"
+            );
+            assert!(queue.is_paused() && queue.pending().len() == 1);
+            assert!(!queue.start_next() && queue.active().is_none());
+            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            click_dialog_option(&mut app, KeyCode::Esc, true);
+            assert!(app.modal.is_none() && !app.finishing_deletions());
+            assert!(app.visual.active());
+            assert_eq!(app.visual.snapshot(), known);
+            assert!(fixture.path().join("retained").is_file());
+            queue.cancel_all();
+        }
+    }
+}
+
+#[test]
+fn immediate_shutdown_cancels_parent_work_on_an_already_stopped_listing() {
+    let fixture = tempfile::tempdir_in(".tmp").unwrap();
+    let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
+    let mut queue = DeleteQueue::new().unwrap();
+    let mut app = navigation_fixture(1024, 1025..=1025);
+    app.select_parent_contents(false);
+    app.pump_visual();
+    assert_eq!(app.visual.len(), 256);
+    let known = app.visual.snapshot();
+    apply(&mut app, ScanEvent::Finished { cancelled: true });
+    assert!(app.model.finished && app.parent_selection_work());
+    app.enqueue_visual(VisualIntent::Parent(Some(false)));
+    app.enqueue_visual(VisualIntent::ToggleParent);
+    app.enqueue_visual(VisualIntent::Navigate(
+        Navigation::new(Some(false), 0),
+        true,
+    ));
+    stop_work(&mut app, &scanner, &[], &mut queue);
+    for _ in 0..8 {
+        app.pump_visual();
+    }
+    assert!(scanner.cancel.load(Ordering::Acquire));
+    assert!(matches!(app.modal, Some(Modal::Stopping)));
+    assert!(!app.parent_select_pending && app.visual_intents.is_empty());
+    assert_eq!(app.visual.snapshot(), known);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let close = app.dialog_close_area;
+    assert!(matches!(
+        click_control(&mut app, close, true),
+        Some(Action::Quit)
+    ));
+}
+
+#[test]
+fn declined_header_quit_keeps_pending_parent_selection_and_late_children() {
+    for close in [false, true] {
+        let mut app = browser_fixture();
+        app.select_parent_contents(false);
+        app.pump_visual();
+        let known = app.visual.snapshot();
+        assert!(app.parent_select_pending && !known.is_empty());
+        app.request_quit_confirmation();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        let action = if close {
+            let area = app.dialog_close_area;
+            click_control(&mut app, area, true)
+        } else {
+            click_dialog_option(&mut app, KeyCode::Esc, true)
+        };
+        assert!(matches!(action, Some(Action::Continue)));
+        assert!(app.modal.is_none() && app.parent_select_pending);
+        assert_eq!(app.visual.snapshot(), known);
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(6, "late", NodeKind::File, 0)],
+            },
+        );
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+        );
+        wait_cache(&mut app, ROOT, &[1, 2, 6]);
+        finish_visual(&mut app);
+        assert!(!app.parent_select_pending && app.modal.is_none());
+        assert!(app.visual.contains(1) && app.visual.contains(2) && app.visual.contains(6));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn quit_warning_retires_unconfirmed_batch_while_confirmed_queue_finishes() {
     let fixture = tempfile::tempdir_in(".tmp").unwrap();
     std::fs::create_dir(fixture.path().join("folder")).unwrap();
@@ -1348,6 +2962,8 @@ fn quit_warning_preserves_confirmed_admission_and_clears_later_requests() {
             relative: "root-file".into(),
             target: "root-file".to_owned(),
         });
+        app.enqueue_visual(VisualIntent::Parent(Some(false)));
+        let known = app.visual.snapshot();
         assert!(matches!(
             app.key(
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1357,6 +2973,8 @@ fn quit_warning_preserves_confirmed_admission_and_clears_later_requests() {
             Action::QuitWarning
         ));
         cancel_unconfirmed(&mut app, &mut batch, &mut retired);
+        assert!(app.visual_intents.is_empty() && !app.parent_select_pending);
+        assert_eq!(app.visual.snapshot(), known);
         let preparation = batch.as_ref().expect("confirmed admission was cancelled");
         assert_eq!(preparation.dispatching, dispatching);
         assert_eq!(preparation.confirm_pending, !dispatching);
@@ -1384,6 +3002,7 @@ fn confirmed_batch_admission_blocks_bypass_keys_and_guards_quit_immediately() {
             count: 1,
             ready: true,
             reviewable: true,
+            confirm_requested: false,
             scroll: 0,
         });
         assert!(matches!(
@@ -1422,7 +3041,7 @@ fn confirmed_batch_admission_blocks_bypass_keys_and_guards_quit_immediately() {
         terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
         let text = rendered(&terminal);
         assert!(text.contains("Enqueueing selection"));
-        assert!(text.contains("Queued deletions continue."));
+        assert!(text.contains("Adding selection to the queue."));
         assert!(text.contains("stop adding"));
         app.key(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -1582,10 +3201,8 @@ fn cancelled_batch_retires_large_published_failures_without_dropping_them() {
         })
         .collect();
     let allocation = errors.as_ptr();
-    let worker = BatchCapture::finishing_after_empty(vec![
-        BatchEvent::Failures(errors),
-        BatchEvent::Done,
-    ]);
+    let worker =
+        BatchCapture::finishing_after_empty(vec![BatchEvent::Failures(errors), BatchEvent::Done]);
     // Publish the owned payload deterministically before admission is cancelled.
     assert!(worker.event().is_none());
     assert!(worker.is_finished() && !worker.is_drained());
@@ -1630,7 +3247,9 @@ fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
     let fixture = tempfile::tempdir_in(".tmp").unwrap();
     let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
     let scanner = scan::spawn(fixture.path().to_owned(), ScanOptions::default());
-    for stopping in [false, true] {
+    for state in 0..4 {
+        let stopping = state % 2 != 0;
+        let wrapped = state >= 2;
         for disconnected in [false, true] {
             for confirm_pending in [false, true] {
                 let mut app = App::new(fixture.path().to_owned(), SizeMode::Allocated).unwrap();
@@ -1640,6 +3259,9 @@ fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
                     Modal::Quit { reviewable: false }
                 });
                 app.previous_modal = Some(Modal::Enqueueing);
+                if wrapped {
+                    app.request_quit_confirmation();
+                }
                 let message = if disconnected {
                     "Could not finish preparing selected deletions."
                 } else {
@@ -1685,6 +3307,10 @@ fn confirmed_batch_failure_survives_quit_and_is_shown_only_once_if_dismissed() {
                 );
                 assert!(app.previous_modal.is_none());
                 assert!(!app.show_delete_notice());
+                if wrapped {
+                    assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+                    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+                }
                 if stopping {
                     assert!(matches!(app.modal, Some(Modal::Stopping)));
                 } else {
@@ -1950,12 +3576,16 @@ fn deletion_report_virtualizes_a_hundred_thousand_errors_and_scrolls_past_u16() 
             })
             .collect(),
     };
-    let lines = report.visible_lines(199_994, 4, 0, 120);
+    let lines = report.visible_lines(199_994, 4, 0, 120, Color::Cyan);
     assert_eq!(lines.len(), 4);
     assert!(lines[0].to_string().ends_with("file-099997"));
     assert_eq!(lines[1].to_string(), "denied-099997");
     assert_eq!(lines[3].to_string(), "denied-099998");
-    assert!(report.visible_lines(200_000, 50, 0, 120).is_empty());
+    assert!(
+        report
+            .visible_lines(200_000, 50, 0, 120, Color::Cyan)
+            .is_empty()
+    );
     app.delete_notices.push_back(report);
     assert!(app.show_delete_notice());
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 15)).unwrap();
@@ -2007,7 +3637,7 @@ fn deletion_reports_keep_full_escaped_paths_and_mouse_horizontal_scrolling() {
     assert!(app.delete_notices[0].target.starts_with('/'));
     assert_eq!(app.delete_notices[0].errors[0].path, path);
     assert_eq!(
-        app.delete_notices[0].visible_lines(1, 1, 0, 50)[0].to_string(),
+        app.delete_notices[0].visible_lines(1, 1, 0, 50, Color::Cyan)[0].to_string(),
         "denied\\nagain"
     );
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
@@ -2155,6 +3785,68 @@ fn visual_aliases_mark_and_batch_without_affecting_normal_queue_keys() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn directory_removal_cancels_retained_batch_inside_header_quit_question() {
+    for deferred in [false, true] {
+        for close in [false, true] {
+            let fixture = tempfile::tempdir_in(".tmp").unwrap();
+            std::fs::create_dir(fixture.path().join("folder")).unwrap();
+            let anchor = Arc::new(RootAnchor::open(fixture.path()).unwrap());
+            let mut app = browser_fixture_at(fixture.path().to_owned());
+            app.navigate_directory(1);
+            app.visual.enter(1, Some(3));
+            let mut batch = None;
+            let mut retired = VecDeque::new();
+            if deferred {
+                prepare_batch(&mut app, Some(Arc::clone(&anchor)), &mut batch, &retired);
+                assert!(batch.is_some());
+                cancel_batch(&mut app, &mut batch, &mut retired);
+                assert!(!retired.is_empty());
+            } else {
+                app.enqueue_visual(VisualIntent::ToggleStable(4));
+            }
+            prepare_batch(&mut app, Some(anchor), &mut batch, &retired);
+            assert!(batch.is_none());
+            assert_eq!(app.deferred_batch.is_some(), deferred);
+            assert_eq!(app.waiting_batch.is_some(), !deferred);
+            app.request_quit_confirmation();
+            // Confirmed deletion can remove a directory while its unconfirmed
+            // selection is retained under the unrelated header question.
+            app.removed(1);
+            app.repair_directory();
+            assert_eq!(app.directory, ROOT);
+            assert!(app.waiting_batch.is_none() && app.deferred_batch.is_none());
+            assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+            assert!(app.background_modal_slot().is_none());
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+            let action = if close {
+                let area = app.dialog_close_area;
+                click_control(&mut app, area, true)
+            } else {
+                click_dialog_option(&mut app, KeyCode::Esc, true)
+            };
+            assert!(matches!(action, Some(Action::Continue)));
+            assert!(
+                app.modal.is_none(),
+                "No must not restore an orphaned batch dialog"
+            );
+            resume_batch(&mut app, &mut batch, &retired);
+            assert!(batch.is_none() && app.modal.is_none());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !retired.is_empty() {
+                pump_retired_batches(&mut app, &mut retired);
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled capture did not retire"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn pending_batch_waits_for_prior_input_and_supports_cancel_epoch_and_quit() {
     for delete in [KeyCode::Char('d'), KeyCode::Char('D'), KeyCode::Delete] {
         for outcome in 0..5 {
@@ -2173,20 +3865,25 @@ fn pending_batch_waits_for_prior_input_and_supports_cancel_epoch_and_quit() {
             let mut retired = VecDeque::new();
             prepare_batch(&mut app, Some(anchor), &mut batch, &retired);
             assert!(app.waiting_batch.is_some() && batch.is_none());
-            assert!(matches!(
-                app.modal,
-                Some(Modal::Text {
-                    title: "Selecting entries",
-                    ..
-                })
-            ));
-            // A premature confirmation key must not cancel or authorize a batch.
+            assert!(matches!(app.modal, Some(Modal::Batch { ready: false, .. })));
+            // Input is retained while the earlier range finishes, after its target is shown.
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
             app.key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 None,
                 false,
             );
             assert!(app.waiting_batch.is_some() && batch.is_none());
+            assert!(matches!(
+                app.modal,
+                Some(Modal::Batch {
+                    confirm_requested: true,
+                    ..
+                })
+            ));
             match outcome {
                 1 | 2 => {
                     let key = if outcome == 1 {
@@ -2234,6 +3931,13 @@ fn pending_batch_waits_for_prior_input_and_supports_cancel_epoch_and_quit() {
                 assert_eq!(preparation.remaining.len(), 1);
                 assert!(preparation.remaining.contains(&3));
                 assert!(!preparation.confirm_pending);
+                assert!(matches!(
+                    app.modal,
+                    Some(Modal::Batch {
+                        confirm_requested: true,
+                        ..
+                    })
+                ));
                 cancel_batch(&mut app, &mut batch, &mut retired);
             }
         }
@@ -2243,10 +3947,17 @@ fn pending_batch_waits_for_prior_input_and_supports_cancel_epoch_and_quit() {
 #[test]
 fn queued_opposite_navigation_keeps_boundary_clamping_order() {
     for (start, first, second, expected) in [
-        (1, KeyCode::Up, KeyCode::Down, 2),
+        (1, KeyCode::Up, KeyCode::Down, 1),
         (2, KeyCode::Down, KeyCode::Up, 1),
     ] {
         let mut app = browser_fixture();
+        apply(
+            &mut app,
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+        );
         app.selected = Some(start);
         app.visual.enter(ROOT, Some(start));
         app.visual
@@ -2337,8 +4048,11 @@ fn newly_discovered_rows_preserve_an_explicit_keyboard_deselection() {
     );
     wait_cache(&mut app, ROOT, &[3, 1, 2]);
     app.sync_order(true);
+    // Jump across the explicitly deselected entry to the new first real
+    // row without an intermediate range reversal. Shift+Home selects ../.
+    app.page_size = 2;
     app.key(
-        KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
         None,
         false,
     );
@@ -2446,6 +4160,35 @@ fn finish_visual(app: &mut App) {
     }
 }
 
+impl App {
+    // These gesture fixtures use one-based real-entry rows, with row zero
+    // reserved for header hits. Keep their entry identities and viewport
+    // sizes independent of the pinned parent row above the real list.
+    fn mouse_entry(&mut self, mut mouse: MouseEvent) {
+        if mouse.row > 0 {
+            mouse.row = mouse.row.saturating_add(self.list_area.y.saturating_sub(1));
+        }
+        self.mouse(mouse);
+    }
+
+    fn entry_pointer_position(&self, position: Option<(u16, u16)>) -> Option<(u16, u16)> {
+        position.map(|(column, row)| {
+            (
+                column,
+                row.saturating_sub(self.list_area.y.saturating_sub(1)),
+            )
+        })
+    }
+
+    fn entry_hover_position(&self) -> Option<(u16, u16)> {
+        self.entry_pointer_position(self.hover_position)
+    }
+
+    fn entry_mouse_position(&self) -> Option<(u16, u16)> {
+        self.entry_pointer_position(self.mouse_position)
+    }
+}
+
 fn hover_intent(app: &App, id: NodeId) -> VisualIntent {
     let row = app.screen_rows().position(|(_, row)| row == id).unwrap();
     VisualIntent::Hover(PendingHover {
@@ -2490,7 +4233,7 @@ fn pending_visual_inputs_preserve_toggle_navigation_and_click_order() {
         assert!(app.visual.contains(3) && !app.visual.contains(4) && !app.visual.contains(5));
     }
     let mut app = pending_folder_selection();
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -2499,7 +4242,7 @@ fn pending_visual_inputs_preserve_toggle_navigation_and_click_order() {
         None,
         false,
     );
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 1,
@@ -2535,6 +4278,7 @@ fn queued_visual_cursor_changes_block_target_actions_but_stable_toggles_do_not()
                     lead: 3,
                     dragged: false,
                     released: true,
+                    origin_selected: app.visual.contains(3),
                     mode: RangeMode::Add,
                     edge: 0,
                     view: Arc::clone(&app.view),
@@ -2546,6 +4290,7 @@ fn queued_visual_cursor_changes_block_target_actions_but_stable_toggles_do_not()
                     lead: 4,
                     dragged: false,
                     released: true,
+                    origin_selected: app.visual.contains(3),
                     mode: RangeMode::Invert,
                     edge: 0,
                     view: Arc::clone(&app.view),
@@ -2562,7 +4307,11 @@ fn queued_visual_cursor_changes_block_target_actions_but_stable_toggles_do_not()
             assert!(app.modal.is_none());
             assert!(app.cursor_pending());
             finish_visual(&mut app);
-            assert_eq!(app.selected, Some(if kind == 3 { 4 } else { 3 }));
+            assert_eq!(
+                app.selected,
+                (kind != 0).then_some(if kind == 3 { 4 } else { 3 })
+            );
+            assert_eq!(app.parent_selected, kind == 0);
         }
     }
     let mut app = pending_folder_selection();
@@ -2579,7 +4328,7 @@ fn queued_visual_cursor_changes_block_target_actions_but_stable_toggles_do_not()
 #[test]
 fn pending_edge_and_relative_navigation_toggle_the_final_destination() {
     for (edge, movement, selected, marked) in [
-        (KeyCode::Home, KeyCode::Down, 4, false),
+        (KeyCode::Home, KeyCode::Down, 3, false),
         (KeyCode::End, KeyCode::Up, 4, false),
     ] {
         let mut app = pending_folder_selection();
@@ -2604,12 +4353,11 @@ fn deferred_toggles_never_retarget_a_removed_cursor() {
     for clicked in [false, true] {
         let mut app = pending_folder_selection();
         if clicked {
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 35,
                 row: 2,
@@ -2656,7 +4404,7 @@ fn rejected_deferred_mouse_clicks_discard_only_dependent_toggles() {
             for later in 0..3 {
                 let mut app = pending_folder_selection();
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -2670,7 +4418,7 @@ fn rejected_deferred_mouse_clicks_discard_only_dependent_toggles() {
                     MouseEventKind::Down(MouseButton::Left),
                     MouseEventKind::Up(MouseButton::Left),
                 ] {
-                    app.mouse(mouse(kind, 3));
+                    app.mouse_entry(mouse(kind, 3));
                 }
                 for _ in 0..enters {
                     app.key(
@@ -2688,17 +4436,17 @@ fn rejected_deferred_mouse_clicks_discard_only_dependent_toggles() {
                     Some(VisualIntent::ToggleCurrent)
                 ));
                 if later == 1 {
-                    app.key(
-                        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-                        None,
-                        false,
-                    );
+                    // Home now focuses ../; continue to the first real
+                    // entry before the independent later toggle.
+                    for code in [KeyCode::Home, KeyCode::Down] {
+                        app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+                    }
                 } else if later == 2 {
                     for kind in [
                         MouseEventKind::Down(MouseButton::Left),
                         MouseEventKind::Up(MouseButton::Left),
                     ] {
-                        app.mouse(mouse(kind, 1));
+                        app.mouse_entry(mouse(kind, 1));
                     }
                 }
                 if later != 0 {
@@ -2709,8 +4457,7 @@ fn rejected_deferred_mouse_clicks_discard_only_dependent_toggles() {
                     );
                 }
                 if stale_epoch {
-                    let Some(VisualIntent::Mouse(gesture)) = app.visual_intents.front_mut()
-                    else {
+                    let Some(VisualIntent::Mouse(gesture)) = app.visual_intents.front_mut() else {
                         panic!("the rejected click must precede its dependent toggles");
                     };
                     gesture.view = Arc::new(CachedSnapshot {
@@ -2741,7 +4488,7 @@ fn exhausted_deferred_mouse_intervals_do_not_toggle_repair_cursor() {
             for later_navigation in [false, true] {
                 let mut app = pending_folder_selection();
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -2755,16 +4502,18 @@ fn exhausted_deferred_mouse_intervals_do_not_toggle_repair_cursor() {
                         KeyModifiers::NONE
                     },
                 };
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2));
-                app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
-                app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 2));
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+                app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
                 app.key(
                     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     None,
                     false,
                 );
                 if later_navigation {
-                    for code in [KeyCode::Home, KeyCode::Enter] {
+                    // The later navigation must target a surviving entry,
+                    // not the new parent-row select-all action.
+                    for code in [KeyCode::Home, KeyCode::Down, KeyCode::Enter] {
                         app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
                     }
                 }
@@ -2799,8 +4548,7 @@ fn deferred_mouse_surviving_intervals_bind_dependent_enter() {
     for shift in [false, true] {
         for survivor in 3..=5 {
             let mut app = pending_folder_selection();
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -2814,9 +4562,9 @@ fn deferred_mouse_surviving_intervals_bind_dependent_enter() {
                     KeyModifiers::NONE
                 },
             };
-            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-            app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
-            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+            app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+            app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
             app.key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 None,
@@ -2828,7 +4576,7 @@ fn deferred_mouse_surviving_intervals_bind_dependent_enter() {
                 }
             }
             finish_visual(&mut app);
-            let marked = shift && survivor != 5;
+            let marked = !shift || survivor != 5;
             assert_eq!(app.selected, Some(survivor));
             assert_eq!(app.visual.contains(survivor), marked);
             assert_eq!(app.visual.len(), usize::from(marked));
@@ -2850,6 +4598,7 @@ fn distant_surviving_mouse_interval_cursor_keeps_dependent_enter() {
             lead: 600,
             dragged: true,
             released: true,
+            origin_selected: app.visual.contains(1),
             mode,
             edge: 0,
             view: Arc::clone(&app.view),
@@ -2883,7 +4632,7 @@ fn deferred_mouse_focus_requests_priority_for_click_and_drag() {
         app.visual
             .begin_range(Arc::clone(&app.view), 2, RangeMode::Add);
         app.prioritize_requested = false;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -2893,14 +4642,14 @@ fn deferred_mouse_focus_requests_priority_for_click_and_drag() {
             row,
             modifiers: KeyModifiers::SHIFT,
         };
-        app.mouse(mouse(
+        app.mouse_entry(mouse(
             MouseEventKind::Down(MouseButton::Left),
             if dragged { 2 } else { 1 },
         ));
         if dragged {
-            app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 1));
+            app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 1));
         }
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 1));
         assert!(!app.prioritize_requested);
         finish_visual(&mut app);
         assert_eq!(app.selected, Some(1));
@@ -2912,7 +4661,7 @@ fn deferred_mouse_focus_requests_priority_for_click_and_drag() {
 #[test]
 fn completed_mouse_gestures_keep_their_order_and_held_drag_waits_under_help() {
     let mut app = pending_folder_selection();
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -2922,11 +4671,11 @@ fn completed_mouse_gestures_keep_their_order_and_held_drag_waits_under_help() {
         row,
         modifiers: KeyModifiers::SHIFT,
     };
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3));
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+    app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
     finish_visual(&mut app);
     assert_eq!(app.visual.len(), 1);
     assert!(app.visual.contains(5));
@@ -2934,8 +4683,8 @@ fn completed_mouse_gestures_keep_their_order_and_held_drag_waits_under_help() {
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+    app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
     app.key(
         KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
         None,
@@ -2944,7 +4693,7 @@ fn completed_mouse_gestures_keep_their_order_and_held_drag_waits_under_help() {
     app.pump_visual();
     assert!(app.visual.contains(3) && app.visual.contains(4));
     assert!(app.has_held_mouse());
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
     assert!(!app.has_held_mouse());
     assert!(app.visual.contains(3) && app.visual.contains(4));
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
@@ -2965,11 +4714,11 @@ fn visual_admission_is_bounded_and_keyboard_finishes_a_held_gesture() {
     finish_visual(&mut app);
     assert!(app.visual_input_available() && app.visual.contains(3) && app.visual.contains(4));
     let mut app = pending_folder_selection();
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 3,
@@ -3033,7 +4782,11 @@ fn full_visual_queue_rejects_overflow_and_preserves_coalescing() {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(rendered(&terminal).contains("Input full"));
+        let screen = rendered(&terminal);
+        let header = screen.lines().next().unwrap();
+        assert!(header.contains(&format!("{} selected", app.visual.len())));
+        assert!(header.contains("[D] delete") && header.contains("? help"));
+        assert!(!header.contains("Input full") && !header.contains("Selecting"));
     }
 }
 
@@ -3041,23 +4794,23 @@ fn full_visual_queue_rejects_overflow_and_preserves_coalescing() {
 fn rejected_cursor_input_preserves_the_last_admitted_hover() {
     for input in 0..3 {
         let mut app = pending_folder_selection();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 35,
             row: 2,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.hover_position, Some((35, 2)));
+        assert_eq!(app.entry_hover_position(), Some((35, 2)));
         while app.visual_intents.len() < VISUAL_INTENT_LIMIT {
             app.enqueue_visual(VisualIntent::ToggleStable(3));
         }
         assert!(!app.visual_input_available());
         match input {
-            0 | 1 => app.mouse(MouseEvent {
+            0 | 1 => app.mouse_entry(MouseEvent {
                 kind: if input == 0 {
                     MouseEventKind::Moved
                 } else {
@@ -3076,9 +4829,9 @@ fn rejected_cursor_input_preserves_the_last_admitted_hover() {
             }
         }
         assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
-        assert_eq!(app.hover_position, Some((35, 2)), "input={input}");
+        assert_eq!(app.entry_hover_position(), Some((35, 2)), "input={input}");
         finish_visual(&mut app);
-        assert_eq!(app.hover_position, Some((35, 2)), "input={input}");
+        assert_eq!(app.entry_hover_position(), Some((35, 2)), "input={input}");
     }
 }
 
@@ -3087,8 +4840,7 @@ fn rejected_visual_presses_preserve_hover_without_acquiring_capture() {
     for shift in [false, true] {
         for followup in 0..8 {
             let mut app = pending_folder_selection();
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -3098,11 +4850,11 @@ fn rejected_visual_presses_preserve_hover_without_acquiring_capture() {
                 row,
                 modifiers,
             };
-            app.mouse(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
+            app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
             while app.visual_intents.len() < VISUAL_INTENT_LIMIT {
                 app.enqueue_visual(VisualIntent::ToggleStable(3));
             }
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 35,
                 1,
@@ -3112,53 +4864,50 @@ fn rejected_visual_presses_preserve_hover_without_acquiring_capture() {
                     KeyModifiers::NONE
                 },
             ));
-            assert_eq!(app.hover_position, Some((35, 2)));
-            assert!(app.mouse_position.is_none() && !app.has_held_mouse());
+            assert_eq!(app.entry_hover_position(), Some((35, 2)));
+            assert!(app.entry_mouse_position().is_none() && !app.has_held_mouse());
             let (column, row) = match followup {
                 0 => (35, 1),
                 1 => (35, 3),
                 2 | 3 => (1, 0),
                 4 => (90, 2),
                 5 => {
-                    app.mouse(mouse(MouseEventKind::Moved, 90, 2, KeyModifiers::NONE));
+                    app.mouse_entry(mouse(MouseEventKind::Moved, 90, 2, KeyModifiers::NONE));
                     (35, 2)
                 }
                 6 => (35, 0),
                 _ => (35, 12),
             };
             if matches!(followup, 1 | 3 | 7) {
-                app.mouse(mouse(
+                app.mouse_entry(mouse(
                     MouseEventKind::Drag(MouseButton::Left),
                     column,
                     row,
                     KeyModifiers::NONE,
                 ));
             }
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Up(MouseButton::Left),
                 column,
                 row,
                 KeyModifiers::NONE,
             ));
             let expected_hover = (followup < 2).then_some((35, 2));
-            assert_eq!(app.hover_position, expected_hover);
-            assert_eq!(app.back_hovered, matches!(followup, 2 | 3));
+            assert_eq!(app.entry_hover_position(), expected_hover);
+            assert_eq!(app.breadcrumbs.hovered.is_some(), matches!(followup, 2 | 3));
             assert_eq!(app.visual_intents.len(), VISUAL_INTENT_LIMIT);
-            assert!(app.mouse_position.is_none() && app.mouse_press_view.is_none());
+            assert!(app.entry_mouse_position().is_none() && app.mouse_press_view.is_none());
             assert!(app.mouse_baseline.is_none() && app.drag_anchor.is_none());
             assert!(app.drag_scroll.is_none() && !app.mouse_dragging && !app.has_held_mouse());
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(4));
-            assert_eq!(app.hover_position, expected_hover);
+            assert_eq!(app.entry_hover_position(), expected_hover);
         }
     }
 }
 
-fn ignored_mouse_kinds() -> [MouseEventKind; 8] {
+fn ignored_mouse_kinds() -> [MouseEventKind; 5] {
     [
-        MouseEventKind::Down(MouseButton::Right),
-        MouseEventKind::Up(MouseButton::Right),
-        MouseEventKind::Drag(MouseButton::Right),
         MouseEventKind::Down(MouseButton::Middle),
         MouseEventKind::Up(MouseButton::Middle),
         MouseEventKind::Drag(MouseButton::Middle),
@@ -3179,7 +4928,7 @@ fn ignored_mouse_input_keeps_hovered_rows_through_live_publications() {
                     app.visual.enter(ROOT, Some(11));
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(100, 11)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -3189,7 +4938,7 @@ fn ignored_mouse_input_keeps_hovered_rows_through_live_publications() {
                     row,
                     modifiers: KeyModifiers::NONE,
                 };
-                app.mouse(mouse(MouseEventKind::Moved));
+                app.mouse_entry(mouse(MouseEventKind::Moved));
                 if mode == 2 {
                     app.visual
                         .begin_range(Arc::clone(&app.view), 40, RangeMode::Add);
@@ -3203,8 +4952,8 @@ fn ignored_mouse_input_keeps_hovered_rows_through_live_publications() {
                 let intents = app.visual_intents.len();
                 for resort in [false, true] {
                     let previous = Arc::clone(&app.view);
-                    app.mouse(mouse(kind));
-                    assert_eq!(app.hover_position, Some((35, row)), "{kind:?}");
+                    app.mouse_entry(mouse(kind));
+                    assert_eq!(app.entry_hover_position(), Some((35, row)), "{kind:?}");
                     apply(
                         &mut app,
                         ScanEvent::Entries {
@@ -3237,7 +4986,7 @@ fn ignored_mouse_input_keeps_hovered_rows_through_live_publications() {
                         "kind={kind:?}, row={row}, mode={mode}, resort={resort}"
                     );
                     assert_eq!(app.painted_rows, painted_rows);
-                    assert_eq!(app.hover_position, Some((35, row)));
+                    assert_eq!(app.entry_hover_position(), Some((35, row)));
                     assert_eq!(app.visual.snapshot(), marks);
                     assert_eq!(app.visual_intents.len(), intents);
                 }
@@ -3253,8 +5002,7 @@ fn ignored_mouse_input_preserves_only_in_list_hover() {
             let mut app = browser_fixture();
             app.directory = directory;
             app.reset_order(false);
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -3266,39 +5014,39 @@ fn ignored_mouse_input_preserves_only_in_list_hover() {
                 (90, 2, false, false),
                 (35, 12, false, false),
             ] {
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind: MouseEventKind::Moved,
                     column: 35,
                     row: 1,
                     modifiers: KeyModifiers::NONE,
                 });
                 let selected = app.selected;
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind,
                     column,
                     row,
                     modifiers: KeyModifiers::NONE,
                 });
-                assert_eq!(app.hover_position, keep_hover.then_some((35, 1)));
-                assert_eq!(app.back_hovered, back);
+                assert_eq!(app.entry_hover_position(), keep_hover.then_some((35, 1)));
+                assert_eq!(app.breadcrumbs.hovered.is_some(), back);
                 assert_eq!(app.directory, directory);
                 assert_eq!(app.selected, selected);
                 assert!(app.mouse_press_view.is_none() && !app.has_held_mouse());
             }
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 35,
                 row: 1,
                 modifiers: KeyModifiers::NONE,
             });
             app.modal = Some(Modal::help(false));
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind,
                 column: 35,
                 row: 1,
                 modifiers: KeyModifiers::NONE,
             });
-            assert!(app.hover_position.is_none() && !app.back_hovered);
+            assert!(app.entry_hover_position().is_none() && app.breadcrumbs.hovered.is_none());
         }
     }
 }
@@ -3310,15 +5058,22 @@ fn ignored_mouse_input_does_not_interrupt_captured_gestures() {
             let mut app = browser_fixture();
             app.directory = 1;
             app.reset_order(false);
-            app.visual.enter(1, Some(3));
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            app.visual.enter(1, shift.then_some(3));
+            app.visual.reanchor(3);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
             if deferred {
-                app.visual
-                    .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
+                app.visual.begin_range(
+                    Arc::clone(&app.view),
+                    3,
+                    if shift {
+                        RangeMode::Add
+                    } else {
+                        RangeMode::Remove
+                    },
+                );
             }
             let mouse = |kind, column, row| MouseEvent {
                 kind,
@@ -3330,8 +5085,8 @@ fn ignored_mouse_input_does_not_interrupt_captured_gestures() {
                     KeyModifiers::NONE
                 },
             };
-            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
-            app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 11));
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
+            app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 11));
             let view = app.mouse_press_view.clone();
             let selected = app.selected;
             let marks = app.visual.snapshot();
@@ -3341,9 +5096,9 @@ fn ignored_mouse_input_does_not_interrupt_captured_gestures() {
             let scroll = app.drag_scroll;
             for kind in ignored_mouse_kinds() {
                 for (column, row) in [(35, 2), (35, 9), (1, 0), (90, 2), (35, 12)] {
-                    app.mouse(mouse(kind, column, row));
-                    assert!(app.hover_position.is_none());
-                    assert_eq!(app.mouse_position, Some((35, 11)));
+                    app.mouse_entry(mouse(kind, column, row));
+                    assert!(app.entry_hover_position().is_none());
+                    assert_eq!(app.entry_mouse_position(), Some((35, 11)));
                     assert_eq!(app.selected, selected);
                     assert_eq!(app.visual.snapshot(), marks);
                     assert_eq!(app.visual_intents.len(), intents);
@@ -3361,13 +5116,13 @@ fn ignored_mouse_input_does_not_interrupt_captured_gestures() {
                     }
                 }
             }
-            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 35, 11));
+            app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 35, 11));
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(5));
             assert_eq!(app.visual.contains(3), !shift);
             assert!(app.visual.contains(4) && app.visual.contains(5));
             assert!(app.mouse_press_view.is_none() && !app.has_held_mouse());
-            assert!(app.drag_scroll.is_none() && app.mouse_position.is_none());
+            assert!(app.drag_scroll.is_none() && app.entry_mouse_position().is_none());
         }
     }
 }
@@ -3387,21 +5142,21 @@ fn ignored_keys_and_display_changes_preserve_hover_mode() {
         (false, KeyCode::Char('t'), KeyModifiers::NONE),
     ] {
         let mut app = browser_fixture();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         app.filter_editing = filter_editing;
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 35,
             row: 1,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.hover_position, Some((35, 1)));
+        assert_eq!(app.entry_hover_position(), Some((35, 1)));
         app.key(KeyEvent::new(code, modifiers), None, false);
         assert_eq!(
-            app.hover_position,
+            app.entry_hover_position(),
             Some((35, 1)),
             "key={code:?}, filter={filter_editing}"
         );
@@ -3409,7 +5164,7 @@ fn ignored_keys_and_display_changes_preserve_hover_mode() {
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         assert_eq!(
-            app.hover_position,
+            app.entry_hover_position(),
             Some((35, 1)),
             "key={code:?}, filter={filter_editing}"
         );
@@ -3439,6 +5194,7 @@ fn full_visual_queue_keeps_interrupt_escape_and_release_reachable() {
         lead: 4,
         dragged: false,
         released: false,
+        origin_selected: app.visual.contains(3),
         mode: RangeMode::Invert,
         edge: 0,
         view: Arc::clone(&app.view),
@@ -3448,7 +5204,7 @@ fn full_visual_queue_keeps_interrupt_escape_and_release_reachable() {
         app.enqueue_visual(VisualIntent::ToggleCurrent);
     }
     assert!(!app.visual_input_available() && app.has_held_mouse());
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Up(MouseButton::Left),
         column: 35,
         row: 2,
@@ -3863,9 +5619,7 @@ fn manual_refresh_after_cancelled_quit_restores_survivor_reconciliation() {
                           generation: &mut u64| {
                 let mut retry = RefreshRetry::default();
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !requests.is_empty()
-                    || !scopes.is_empty()
-                    || app.model.has_pending_removals()
+                while !requests.is_empty() || !scopes.is_empty() || app.model.has_pending_removals()
                 {
                     let dependencies =
                         RefreshDependencies::capture(app, &scanner, scopes, None, requests);
@@ -4154,8 +5908,7 @@ fn mouse_ranges_preserve_click_drag_modifiers_and_release_endpoints() {
                 app.visual
                     .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
             }
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -4165,7 +5918,7 @@ fn mouse_ranges_preserve_click_drag_modifiers_and_release_endpoints() {
                 column: 35,
                 modifiers,
             };
-            app.mouse(event(
+            app.mouse_entry(event(
                 MouseEventKind::Down(MouseButton::Left),
                 start,
                 if shift {
@@ -4175,13 +5928,13 @@ fn mouse_ranges_preserve_click_drag_modifiers_and_release_endpoints() {
                 },
             ));
             if let Some(row) = middle {
-                app.mouse(event(
+                app.mouse_entry(event(
                     MouseEventKind::Drag(MouseButton::Left),
                     row,
                     KeyModifiers::NONE,
                 ));
             }
-            app.mouse(event(
+            app.mouse_entry(event(
                 MouseEventKind::Up(MouseButton::Left),
                 end,
                 KeyModifiers::NONE,
@@ -4217,11 +5970,11 @@ fn control_click_deselects_without_adding_and_wins_over_shift() {
                         .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: 35,
                     row: 2,
@@ -4232,7 +5985,7 @@ fn control_click_deselects_without_adding_and_wins_over_shift() {
                             KeyModifiers::NONE
                         },
                 });
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind: MouseEventKind::Up(MouseButton::Left),
                     column: 35,
                     row: 2,
@@ -4255,20 +6008,29 @@ fn control_click_deselects_without_adding_and_wins_over_shift() {
 fn visual_drag_modes_survive_separate_event_pumps_and_reversal() {
     for deferred in [false, true] {
         for pump_press in [false, true] {
-            for subtract in [false, true] {
+            for (modifiers, selected_origin, subtract) in [
+                (KeyModifiers::NONE, false, false),
+                (KeyModifiers::NONE, true, true),
+                (KeyModifiers::CONTROL, false, true),
+                (KeyModifiers::CONTROL, true, true),
+                (KeyModifiers::CONTROL | KeyModifiers::SHIFT, true, true),
+            ] {
                 let mut app = browser_fixture();
                 app.directory = 1;
                 app.selected = Some(3);
                 app.reset_order(false);
                 app.visual.enter(1, Some(3));
                 app.visual.toggle(5);
-                app.visual.reanchor(3);
+                if !selected_origin {
+                    app.visual.toggle(3);
+                }
+                app.visual.reanchor(5);
                 if deferred {
                     app.visual
-                        .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
+                        .begin_range(Arc::clone(&app.view), 5, RangeMode::Add);
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -4278,15 +6040,7 @@ fn visual_drag_modes_survive_separate_event_pumps_and_reversal() {
                     column: 35,
                     modifiers,
                 };
-                app.mouse(event(
-                    MouseEventKind::Down(MouseButton::Left),
-                    1,
-                    if subtract {
-                        KeyModifiers::CONTROL
-                    } else {
-                        KeyModifiers::NONE
-                    },
-                ));
+                app.mouse_entry(event(MouseEventKind::Down(MouseButton::Left), 1, modifiers));
                 if pump_press {
                     app.pump_visual();
                     terminal
@@ -4300,7 +6054,7 @@ fn visual_drag_modes_survive_separate_event_pumps_and_reversal() {
                 } else {
                     KeyModifiers::CONTROL
                 };
-                app.mouse(event(MouseEventKind::Drag(MouseButton::Left), 3, later));
+                app.mouse_entry(event(MouseEventKind::Drag(MouseButton::Left), 3, later));
                 app.pump_visual();
                 app.pump_visual();
                 terminal
@@ -4308,7 +6062,7 @@ fn visual_drag_modes_survive_separate_event_pumps_and_reversal() {
                     .unwrap();
                 assert_eq!(app.visual.len(), if subtract { 0 } else { 3 });
                 assert!(app.mouse_dragging && app.drag_started);
-                app.mouse(event(MouseEventKind::Drag(MouseButton::Left), 2, later));
+                app.mouse_entry(event(MouseEventKind::Drag(MouseButton::Left), 2, later));
                 app.pump_visual();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
@@ -4319,9 +6073,177 @@ fn visual_drag_modes_survive_separate_event_pumps_and_reversal() {
                     app.visual.contains(5),
                     "reversal restores baseline membership"
                 );
-                app.mouse(event(MouseEventKind::Up(MouseButton::Left), 2, later));
+                app.mouse_entry(event(MouseEventKind::Up(MouseButton::Left), 2, later));
                 finish_visual(&mut app);
                 assert_eq!(app.visual.len(), if subtract { 1 } else { 3 });
+                assert!(app.mouse_press_view.is_none() && app.drag_scroll.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_mouse_direction_waits_for_prior_selection_and_clicks_still_toggle() {
+    for selected_after_prior in [false, true] {
+        for pump_press in [false, true] {
+            for drag in [false, true] {
+                let mut app = browser_fixture();
+                app.directory = 1;
+                app.selected = Some(3);
+                app.reset_order(false);
+                app.visual.enter(1, (!selected_after_prior).then_some(3));
+                app.visual.reanchor(3);
+                app.visual.begin_range(
+                    Arc::clone(&app.view),
+                    3,
+                    if selected_after_prior {
+                        RangeMode::Add
+                    } else {
+                        RangeMode::Remove
+                    },
+                );
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                let event = |kind, row| MouseEvent {
+                    kind,
+                    row,
+                    column: 35,
+                    modifiers: KeyModifiers::NONE,
+                };
+                app.mouse_entry(event(MouseEventKind::Down(MouseButton::Left), 1));
+                assert!(app.has_held_mouse());
+                if pump_press {
+                    app.pump_visual();
+                    assert!(app.mouse_press_view.is_some() && !app.has_held_mouse());
+                }
+                if drag {
+                    app.mouse_entry(event(MouseEventKind::Drag(MouseButton::Left), 3));
+                }
+                app.mouse_entry(event(
+                    MouseEventKind::Up(MouseButton::Left),
+                    if drag { 3 } else { 1 },
+                ));
+                finish_visual(&mut app);
+                for id in 3..=5 {
+                    assert_eq!(
+                        app.visual.contains(id),
+                        !selected_after_prior && (drag || id == 3),
+                        "selected_after_prior={selected_after_prior}, pump_press={pump_press}, drag={drag}, id={id}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_plain_drag_keeps_direction_when_origin_is_removed_before_replay() {
+    for selected_origin in [false, true] {
+        for released in [false, true] {
+            let mut app = browser_fixture();
+            app.directory = 1;
+            app.selected = Some(3);
+            app.reset_order(false);
+            app.visual.enter(1, None);
+            if selected_origin {
+                for id in 3..=5 {
+                    app.visual.toggle(id);
+                }
+            }
+            app.visual.reanchor(3);
+            app.visual.begin_range(
+                Arc::clone(&app.view),
+                3,
+                if selected_origin {
+                    RangeMode::Add
+                } else {
+                    RangeMode::Remove
+                },
+            );
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let event = |kind, row| MouseEvent {
+                kind,
+                row,
+                column: 35,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.mouse_entry(event(MouseEventKind::Down(MouseButton::Left), 1));
+            app.mouse_entry(event(MouseEventKind::Drag(MouseButton::Left), 3));
+            if released {
+                app.mouse_entry(event(MouseEventKind::Up(MouseButton::Left), 3));
+            }
+            assert_eq!(app.visual_intents.len(), 1);
+            assert!(app.mouse_press_view.is_none());
+            // Removing the origin must preserve both erasure and addition when
+            // older work has delayed the gesture's first replay.
+            app.removed(3);
+            app.pump_visual();
+            if !released {
+                app.mouse_entry(event(MouseEventKind::Up(MouseButton::Left), 3));
+            }
+            finish_visual(&mut app);
+            assert!(!app.visual.contains(3));
+            for id in 4..=5 {
+                assert_eq!(
+                    app.visual.contains(id),
+                    !selected_origin,
+                    "selected_origin={selected_origin}, released={released}, id={id}"
+                );
+            }
+            assert!(app.mouse_press_view.is_none() && app.drag_scroll.is_none());
+        }
+    }
+}
+
+#[test]
+fn captured_plain_erasure_survives_removed_endpoints_and_release_only_motion() {
+    for deferred in [false, true] {
+        for release_only in [false, true] {
+            for removed in [3, 5] {
+                let mut app = browser_fixture();
+                app.directory = 1;
+                app.selected = Some(3);
+                app.reset_order(false);
+                app.visual.enter(1, None);
+                for id in 3..=5 {
+                    app.visual.toggle(id);
+                }
+                app.visual.reanchor(3);
+                if deferred {
+                    app.visual
+                        .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
+                }
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+                let event = |kind, row| MouseEvent {
+                    kind,
+                    row,
+                    column: 35,
+                    modifiers: KeyModifiers::NONE,
+                };
+                app.mouse_entry(event(MouseEventKind::Down(MouseButton::Left), 1));
+                app.pump_visual();
+                assert_eq!(app.drag_mode, RangeMode::Remove);
+                app.removed(removed);
+                let lead_row = if removed == 5 { 2 } else { 3 };
+                if !release_only {
+                    app.mouse_entry(event(MouseEventKind::Drag(MouseButton::Left), lead_row));
+                }
+                app.mouse_entry(event(MouseEventKind::Up(MouseButton::Left), lead_row));
+                finish_visual(&mut app);
+                assert!(
+                    app.visual.is_empty(),
+                    "deferred={deferred}, release_only={release_only}, removed={removed}"
+                );
                 assert!(app.mouse_press_view.is_none() && app.drag_scroll.is_none());
             }
         }
@@ -4345,7 +6267,7 @@ fn control_release_movement_and_deleted_endpoints_keep_the_subtractive_range() {
                         .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -4355,19 +6277,19 @@ fn control_release_movement_and_deleted_endpoints_keep_the_subtractive_range() {
                     column: 35,
                     modifiers,
                 };
-                app.mouse(event(
+                app.mouse_entry(event(
                     MouseEventKind::Down(MouseButton::Left),
                     1,
                     KeyModifiers::CONTROL,
                 ));
                 if release_only {
-                    app.mouse(event(
+                    app.mouse_entry(event(
                         MouseEventKind::Up(MouseButton::Left),
                         3,
                         KeyModifiers::NONE,
                     ));
                 } else {
-                    app.mouse(event(
+                    app.mouse_entry(event(
                         MouseEventKind::Drag(MouseButton::Left),
                         3,
                         KeyModifiers::NONE,
@@ -4383,12 +6305,12 @@ fn control_release_movement_and_deleted_endpoints_keep_the_subtractive_range() {
                     "deferred={deferred}, release_only={release_only}, removed={removed:?}"
                 );
                 if !release_only {
-                    app.mouse(event(
+                    app.mouse_entry(event(
                         MouseEventKind::Drag(MouseButton::Left),
                         2,
                         KeyModifiers::NONE,
                     ));
-                    app.mouse(event(
+                    app.mouse_entry(event(
                         MouseEventKind::Up(MouseButton::Left),
                         2,
                         KeyModifiers::NONE,
@@ -4416,8 +6338,7 @@ fn mouse_press_baselines_discard_deleted_ids_before_first_drag() {
                 app.visual
                     .begin_range(Arc::clone(&app.view), 5, RangeMode::Add);
             }
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -4431,14 +6352,14 @@ fn mouse_press_baselines_discard_deleted_ids_before_first_drag() {
                     KeyModifiers::NONE
                 },
             };
-            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
             app.pump_visual();
             if let Some(baseline) = &app.mouse_baseline {
                 assert!(baseline.contains(&5));
             }
             app.removed(5);
-            app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
-            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+            app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+            app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
             finish_visual(&mut app);
             assert_eq!(app.selected, Some(4));
             assert_eq!(app.visual.len(), 2, "deferred={deferred}, shift={shift}");
@@ -4464,10 +6385,17 @@ fn deferred_drags_keep_surviving_rows_when_either_endpoint_is_deleted() {
                     }
                 }
                 app.visual.reanchor(3);
-                app.visual
-                    .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
+                app.visual.begin_range(
+                    Arc::clone(&app.view),
+                    3,
+                    if shift {
+                        RangeMode::Add
+                    } else {
+                        RangeMode::Remove
+                    },
+                );
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -4481,17 +6409,17 @@ fn deferred_drags_keep_surviving_rows_when_either_endpoint_is_deleted() {
                         KeyModifiers::NONE
                     },
                 };
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-                app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
                 if released {
-                    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+                    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
                 }
                 assert_eq!(app.visual_intents.len(), 1);
                 app.removed(removed);
                 app.pump_visual();
                 if !released {
                     assert!(app.drag_started && app.mouse_dragging);
-                    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+                    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
                 }
                 finish_visual(&mut app);
                 for id in 3..=5 {
@@ -4525,16 +6453,13 @@ fn shift_click_keeps_surviving_interval_without_a_preexisting_range() {
                             app.visual.toggle(anchor);
                         }
                         if prior_range {
-                            app.visual.begin_range(
-                                Arc::clone(&app.view),
-                                anchor,
-                                RangeMode::Add,
-                            );
+                            app.visual
+                                .begin_range(Arc::clone(&app.view), anchor, RangeMode::Add);
                             finish_visual(&mut app);
                         }
                         assert!(!app.visual.is_pending());
                         let mut terminal =
-                            Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                            Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                         terminal
                             .draw(|frame| app.draw(frame, false, false))
                             .unwrap();
@@ -4547,11 +6472,11 @@ fn shift_click_keeps_surviving_interval_without_a_preexisting_range() {
                             column: 35,
                             modifiers: KeyModifiers::SHIFT,
                         };
-                        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+                        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
                         app.pump_visual();
                         let removed = if remove_anchor { anchor } else { lead };
                         app.removed(removed);
-                        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+                        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
                         finish_visual(&mut app);
                         for id in 3..=5 {
                             assert_eq!(
@@ -4603,8 +6528,7 @@ fn shift_click_extends_a_drag_whose_pressed_anchor_was_deleted() {
             // This fixture starts with an already scrolled four-row viewport.
             app.page_size = 4;
             app.visual.enter(1, None);
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 5)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 6)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -4618,7 +6542,7 @@ fn shift_click_extends_a_drag_whose_pressed_anchor_was_deleted() {
                 column: 35,
                 modifiers,
             };
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 1,
                 if shift {
@@ -4630,12 +6554,12 @@ fn shift_click_extends_a_drag_whose_pressed_anchor_was_deleted() {
             if !deferred {
                 app.removed(4);
             }
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Drag(MouseButton::Left),
                 3,
                 KeyModifiers::NONE,
             ));
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Up(MouseButton::Left),
                 3,
                 KeyModifiers::NONE,
@@ -4656,7 +6580,7 @@ fn shift_click_extends_a_drag_whose_pressed_anchor_was_deleted() {
                 MouseEventKind::Down(MouseButton::Left),
                 MouseEventKind::Up(MouseButton::Left),
             ] {
-                app.mouse(mouse(kind, 4, KeyModifiers::SHIFT));
+                app.mouse_entry(mouse(kind, 4, KeyModifiers::SHIFT));
             }
             finish_visual(&mut app);
             for id in 3..=8 {
@@ -4680,7 +6604,7 @@ fn deferred_shift_click_keeps_its_range_after_either_endpoint_is_deleted() {
         app.visual.enter(1, Some(3));
         app.visual
             .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -4688,7 +6612,7 @@ fn deferred_shift_click_keeps_its_range_after_either_endpoint_is_deleted() {
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind,
                 row: 3,
                 column: 35,
@@ -4712,7 +6636,7 @@ fn normal_directory_click_navigates_on_release_and_visual_click_selects() {
         if visual {
             app.visual.enter(ROOT, None);
         }
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -4726,10 +6650,10 @@ fn normal_directory_click_navigates_on_release_and_visual_click_selects() {
                 KeyModifiers::NONE
             },
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(app.directory, ROOT);
         assert_eq!(app.selected, Some(1));
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
         finish_visual(&mut app);
         if visual || shift {
             assert_eq!(app.directory, ROOT);
@@ -4742,9 +6666,9 @@ fn normal_directory_click_navigates_on_release_and_visual_click_selects() {
                 .unwrap();
             assert_eq!(app.painted_directory, 1);
             assert_eq!(app.painted_rows, vec![3, 4, 5]);
-            assert!(app.hover_position.is_none());
+            assert!(app.entry_hover_position().is_none());
             // A duplicate release cannot activate an entry on the new page.
-            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+            app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
             assert_eq!(app.directory, 1);
         }
         assert!(app.mouse_press_view.is_none() && app.normal_click.is_none());
@@ -4755,7 +6679,7 @@ fn normal_directory_click_navigates_on_release_and_visual_click_selects() {
 fn normal_directory_click_uses_captured_identity_across_live_resorts() {
     for repaint in [false, true] {
         let mut app = browser_fixture();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -4773,7 +6697,7 @@ fn normal_directory_click_uses_captured_identity_across_live_resorts() {
             row: 1,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(app.normal_click, Some(1));
         // Publish through the real worker; directly overwriting app.view
         // would bypass sync_order's held-capture admission guard.
@@ -4793,7 +6717,7 @@ fn normal_directory_click_uses_captured_identity_across_live_resorts() {
             assert_eq!(app.painted_rows, vec![1, 2]);
             assert!(Arc::ptr_eq(&app.painted_view, &original));
         }
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
         assert_eq!(app.directory, 1);
         assert!(app.mouse_press_view.is_none() && app.normal_click.is_none());
     }
@@ -4803,7 +6727,7 @@ fn normal_directory_click_uses_captured_identity_across_live_resorts() {
 fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() {
     for interruption in 0..18 {
         let mut app = browser_fixture();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -4813,13 +6737,13 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
             row,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 35, 1));
         let mut release = (35, 1);
         match interruption {
             0..=2 => {
                 let (column, row) = [(35, 2), (35, 1), (90, 1)][interruption];
-                app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), column, row));
-                app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 1));
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), column, row));
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 1));
             }
             3..=5 => release = [(35, 2), (1, 0), (90, 1)][interruption - 3],
             6 => {
@@ -4873,8 +6797,8 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
                 );
             }
             13 => {
-                app.mouse(mouse(MouseEventKind::Moved, 35, 2));
-                app.mouse(mouse(MouseEventKind::Moved, 35, 1));
+                app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2));
+                app.mouse_entry(mouse(MouseEventKind::Moved, 35, 1));
             }
             14 => {
                 app.key(
@@ -4889,7 +6813,7 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
                 );
             }
             15 => {
-                terminal.backend_mut().resize(40, 12);
+                terminal.backend_mut().resize(40, 13);
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -4901,10 +6825,10 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
             }
             _ => {
                 // A new rejected press cannot reuse an older click target.
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 90, 1));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 90, 1));
             }
         }
-        app.mouse(mouse(
+        app.mouse_entry(mouse(
             MouseEventKind::Up(MouseButton::Left),
             release.0,
             release.1,
@@ -4919,11 +6843,11 @@ fn normal_directory_click_rejects_drags_stale_targets_and_interrupted_presses() 
 fn normal_file_click_stays_in_place_and_release_modifiers_do_not_change_mode() {
     for row in [1, 2] {
         let mut app = browser_fixture();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 35,
             row,
@@ -4935,7 +6859,7 @@ fn normal_file_click_stays_in_place_and_release_modifiers_do_not_change_mode() {
             None,
             false,
         );
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
             column: 35,
             row,
@@ -4946,7 +6870,7 @@ fn normal_file_click_stays_in_place_and_release_modifiers_do_not_change_mode() {
             assert_eq!(app.directory, 1);
         } else {
             assert_eq!((app.directory, app.selected), (ROOT, Some(2)));
-            assert_eq!(app.hover_position, Some((35, 2)));
+            assert_eq!(app.entry_hover_position(), Some((35, 2)));
         }
     }
 }
@@ -4957,7 +6881,7 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(11);
         app.offset = 10;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -4980,7 +6904,7 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         let selected = Some(10 + u32::from(row));
         assert_eq!(app.selected, selected);
         for resort in [false, true] {
@@ -5018,9 +6942,9 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
             .unwrap();
         assert_eq!(app.painted_offset, 10);
         assert_eq!(app.selection_screen_row(), Some(usize::from(row - 1)));
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
-        assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
-        assert_eq!(app.hover_position, Some((35, row)));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
+        assert_eq!(app.entry_hover_position(), Some((35, row)));
         app.sync_order(true);
         terminal
             .draw(|frame| app.draw(frame, false, false))
@@ -5053,9 +6977,9 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
             assert_eq!(app.painted_offset, 11 + usize::from(resort));
             assert_eq!(app.selected, selected);
             assert_eq!(app.selection_screen_row(), Some(usize::from(row - 1)));
-            assert_eq!(app.hover_position, Some((35, row)));
+            assert_eq!(app.entry_hover_position(), Some((35, row)));
         }
-        terminal.backend_mut().resize(100, 11);
+        terminal.backend_mut().resize(100, 12);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5073,8 +6997,7 @@ fn normal_captured_motion_and_release_never_create_visual_gestures() {
             let mut app = browser_fixture();
             app.directory = directory;
             app.reset_order(false);
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -5085,23 +7008,23 @@ fn normal_captured_motion_and_release_never_create_visual_gestures() {
                 row,
                 modifiers,
             };
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 35,
                 1,
                 KeyModifiers::NONE,
             ));
             for kind in ignored_mouse_kinds() {
-                app.mouse(mouse(kind, column, row, KeyModifiers::SHIFT));
+                app.mouse_entry(mouse(kind, column, row, KeyModifiers::SHIFT));
             }
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Drag(MouseButton::Left),
                 column,
                 row,
                 KeyModifiers::SHIFT,
             ));
-            assert!(!app.back_hovered);
-            app.mouse(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
+            assert!(app.breadcrumbs.hovered.is_none());
+            app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
             assert!(!app.pump_mouse_scroll(Instant::now() + Duration::from_secs(1)));
             terminal
                 .draw(|frame| app.draw(frame, false, false))
@@ -5110,7 +7033,7 @@ fn normal_captured_motion_and_release_never_create_visual_gestures() {
             assert_eq!(app.selected, rows.first().copied());
             assert_eq!(app.directory, directory);
             assert!(!app.visual.active() && app.visual.is_empty());
-            app.mouse(mouse(
+            app.mouse_entry(mouse(
                 MouseEventKind::Up(MouseButton::Left),
                 column,
                 row,
@@ -5119,14 +7042,14 @@ fn normal_captured_motion_and_release_never_create_visual_gestures() {
             assert_eq!(app.selected, rows.first().copied());
             assert_eq!(app.directory, directory);
             assert_eq!(
-                app.hover_position,
+                app.entry_hover_position(),
                 ((column, row) == (35, 1)).then_some((35, 1))
             );
-            assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+            assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
             assert!(app.mouse_baseline.is_none() && app.drag_anchor.is_none());
             assert!(!app.mouse_dragging && !app.drag_started && app.drag_scroll.is_none());
             assert!(!app.visual.active() && app.visual.is_empty());
-            app.mouse(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
+            app.mouse_entry(mouse(MouseEventKind::Moved, 35, 2, KeyModifiers::NONE));
             assert_eq!(app.selected, rows.get(1).copied());
         }
     }
@@ -5156,7 +7079,7 @@ fn normal_keyboard_navigation_ends_capture_without_selecting_a_range() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(11);
         app.offset = 10;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5166,13 +7089,15 @@ fn normal_keyboard_navigation_ends_capture_without_selecting_a_range() {
             row: 5,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         app.key(KeyEvent::new(code, modifiers), None, false);
-        assert_eq!(app.selected, Some(selected), "{code:?} {modifiers:?}");
-        assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
-        assert_eq!(app.selected, Some(selected));
-        assert!(app.hover_position.is_none());
+        let selected = (code != KeyCode::Home).then_some(selected);
+        assert_eq!(app.parent_selected, code == KeyCode::Home);
+        assert_eq!(app.selected, selected, "{code:?} {modifiers:?}");
+        assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.selected, selected);
+        assert!(app.entry_hover_position().is_none());
         assert!(!app.visual.active() && app.visual.is_empty());
         assert!(app.drag_scroll.is_none());
     }
@@ -5184,7 +7109,7 @@ fn normal_capture_survives_display_keys_and_help_closed_before_release() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(11);
         app.offset = 10;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5195,7 +7120,7 @@ fn normal_capture_survives_display_keys_and_help_closed_before_release() {
             row: 1,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         app.key(
             KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
             None,
@@ -5214,8 +7139,8 @@ fn normal_capture_survives_display_keys_and_help_closed_before_release() {
             .unwrap();
         assert!(app.mouse_press_view.is_some(), "{code}");
         assert_eq!(app.painted_rows, rows, "{code}");
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
-        assert_eq!(app.hover_position, Some((35, 1)), "{code}");
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.entry_hover_position(), Some((35, 1)), "{code}");
         assert!(!app.visual.active() && app.visual.is_empty());
     }
 }
@@ -5227,7 +7152,7 @@ fn normal_capture_clears_on_modal_release_filter_navigation_and_refresh() {
         app.directory = 1;
         app.selected = Some(3);
         app.reset_order(false);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5244,7 +7169,7 @@ fn normal_capture_clears_on_modal_release_filter_navigation_and_refresh() {
                 false,
             );
         }
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         assert!(app.mouse_press_view.is_some());
         match transition {
             0..=2 => {
@@ -5292,7 +7217,7 @@ fn normal_capture_clears_on_modal_release_filter_navigation_and_refresh() {
                     None,
                     false,
                 );
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
                 app.key(
                     KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
                     None,
@@ -5300,10 +7225,10 @@ fn normal_capture_clears_on_modal_release_filter_navigation_and_refresh() {
                 );
             }
         }
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
-        assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
         assert!(app.mouse_baseline.is_none() && app.drag_anchor.is_none());
-        assert!(app.hover_position.is_none());
+        assert!(app.entry_hover_position().is_none());
         assert!(!app.visual.active() && app.visual.is_empty());
         assert!(app.drag_scroll.is_none());
     }
@@ -5315,7 +7240,7 @@ fn normal_release_does_not_restore_invalid_pressed_rows_or_geometry() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(11);
         app.offset = 10;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(95, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(95, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5327,10 +7252,10 @@ fn normal_release_does_not_restore_invalid_pressed_rows_or_geometry() {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         match invalidation {
-            0 => terminal.backend_mut().resize(96, 11),
-            1 => terminal.backend_mut().resize(95, 7),
+            0 => terminal.backend_mut().resize(96, 12),
+            1 => terminal.backend_mut().resize(95, 8),
             2 => app.removed(12),
             3 => app.removed(11),
             _ => {
@@ -5343,9 +7268,12 @@ fn normal_release_does_not_restore_invalid_pressed_rows_or_geometry() {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
-        assert!(app.hover_position.is_none(), "invalidation={invalidation}");
-        assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert!(
+            app.entry_hover_position().is_none(),
+            "invalidation={invalidation}"
+        );
+        assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
         assert!(!app.visual.active() && app.visual.is_empty());
     }
 }
@@ -5392,13 +7320,21 @@ fn mouse_presses_freeze_painted_order_and_scrolled_viewport() {
                 // Preserve the prepared viewport before freezing its physical rows.
                 app.page_size = 3;
                 app.selected = Some(anchor);
-                app.visual.enter(1, Some(anchor));
+                app.visual.enter(1, shift.then_some(anchor));
+                app.visual.reanchor(anchor);
                 if deferred {
-                    app.visual
-                        .begin_range(Arc::clone(&original), anchor, RangeMode::Add);
+                    app.visual.begin_range(
+                        Arc::clone(&original),
+                        anchor,
+                        if shift {
+                            RangeMode::Add
+                        } else {
+                            RangeMode::Remove
+                        },
+                    );
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 5)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -5415,7 +7351,7 @@ fn mouse_presses_freeze_painted_order_and_scrolled_viewport() {
                         KeyModifiers::NONE
                     },
                 };
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
                 for _ in 0..2 {
                     terminal
                         .draw(|frame| app.draw(frame, false, false))
@@ -5425,9 +7361,9 @@ fn mouse_presses_freeze_painted_order_and_scrolled_viewport() {
                     assert_eq!(app.painted_rows, painted_rows);
                     app.pump_visual();
                 }
-                app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
                 app.pump_visual();
-                app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+                app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
                 finish_visual(&mut app);
                 assert_eq!(app.visual.contains(anchor), !shift);
                 assert!(app.visual.contains(lead));
@@ -5446,7 +7382,7 @@ fn queued_press_freezes_presentation_without_retargeting_earlier_navigation() {
     app.reset_order(false);
     app.visual.enter(1, Some(3));
     let original = Arc::clone(&app.view);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -5473,7 +7409,7 @@ fn queued_press_freezes_presentation_without_retargeting_earlier_navigation() {
         column: 35,
         modifiers: KeyModifiers::NONE,
     };
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -5485,7 +7421,7 @@ fn queued_press_freezes_presentation_without_retargeting_earlier_navigation() {
     app.pump_visual();
     assert_eq!(app.selected, Some(4));
     assert!(Arc::ptr_eq(&app.view, &original));
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
     finish_visual(&mut app);
     assert!(app.visual.contains(3) && app.visual.contains(4));
     assert!(!app.visual.contains(5));
@@ -5507,7 +7443,7 @@ fn blank_rows_ignore_clicks_and_hover_but_support_drags_and_wheel() {
                     app.visual.enter(1, Some(3));
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -5516,13 +7452,13 @@ fn blank_rows_ignore_clicks_and_hover_but_support_drags_and_wheel() {
                 } else {
                     KeyModifiers::NONE
                 };
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind,
                     row: 10,
                     column: 35,
                     modifiers,
                 });
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind: MouseEventKind::Up(MouseButton::Left),
                     row: 10,
                     column: 35,
@@ -5534,7 +7470,7 @@ fn blank_rows_ignore_clicks_and_hover_but_support_drags_and_wheel() {
                 assert_eq!(app.visual.len(), usize::from(visual));
                 assert!(!app.visual.contains(5));
                 app.selected = Some(5);
-                app.mouse(MouseEvent {
+                app.mouse_entry(MouseEvent {
                     kind: MouseEventKind::ScrollUp,
                     row: 10,
                     column: 35,
@@ -5550,19 +7486,19 @@ fn blank_rows_ignore_clicks_and_hover_but_support_drags_and_wheel() {
         app.directory = 1;
         app.selected = Some(3);
         app.reset_order(false);
-        app.visual.enter(1, Some(3));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        app.visual.enter(1, shift.then_some(3));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        let edge = app.list_area.bottom() - 1;
+        let edge = app.list_area.height;
         let mouse = |kind, row, modifiers| MouseEvent {
             kind,
             row,
             column: 35,
             modifiers,
         };
-        app.mouse(mouse(
+        app.mouse_entry(mouse(
             MouseEventKind::Down(MouseButton::Left),
             1,
             if shift {
@@ -5571,14 +7507,14 @@ fn blank_rows_ignore_clicks_and_hover_but_support_drags_and_wheel() {
                 KeyModifiers::NONE
             },
         ));
-        app.mouse(mouse(
+        app.mouse_entry(mouse(
             MouseEventKind::Drag(MouseButton::Left),
             edge,
             KeyModifiers::NONE,
         ));
         app.pump_visual();
         assert!(app.drag_scroll.is_some());
-        app.mouse(mouse(
+        app.mouse_entry(mouse(
             MouseEventKind::Up(MouseButton::Left),
             edge,
             KeyModifiers::NONE,
@@ -5597,8 +7533,7 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
         for deferred in [false, true] {
             for shift in [false, true] {
                 for direct_release in [false, true] {
-                    let mut app =
-                        App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+                    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
                     let directory = if nested {
                         apply(
                             &mut app,
@@ -5636,13 +7571,21 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
                     app.selected = Some(ids[12]);
                     app.offset = 10;
                     app.page_size = 5;
-                    app.visual.enter(directory, Some(ids[12]));
+                    app.visual.enter(directory, shift.then_some(ids[12]));
+                    app.visual.reanchor(ids[12]);
                     if deferred {
-                        app.visual
-                            .begin_range(Arc::clone(&app.view), ids[12], RangeMode::Add);
+                        app.visual.begin_range(
+                            Arc::clone(&app.view),
+                            ids[12],
+                            if shift {
+                                RangeMode::Add
+                            } else {
+                                RangeMode::Remove
+                            },
+                        );
                     }
                     let mut terminal =
-                        Terminal::new(ratatui::backend::TestBackend::new(80, 6)).unwrap();
+                        Terminal::new(ratatui::backend::TestBackend::new(80, 7)).unwrap();
                     terminal
                         .draw(|frame| app.draw(frame, false, false))
                         .unwrap();
@@ -5653,7 +7596,7 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
                         row,
                         modifiers,
                     };
-                    app.mouse(mouse(
+                    app.mouse_entry(mouse(
                         MouseEventKind::Down(MouseButton::Left),
                         35,
                         3,
@@ -5663,7 +7606,7 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
                             KeyModifiers::NONE
                         },
                     ));
-                    app.mouse(mouse(
+                    app.mouse_entry(mouse(
                         MouseEventKind::Drag(MouseButton::Left),
                         35,
                         5,
@@ -5676,13 +7619,13 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
                         assert_eq!(app.drag_scroll.unwrap().0, 1);
                     }
                     if !direct_release {
-                        app.mouse(mouse(
+                        app.mouse_entry(mouse(
                             MouseEventKind::Drag(MouseButton::Left),
                             1,
                             0,
                             KeyModifiers::NONE,
                         ));
-                        assert!(!app.back_hovered);
+                        assert!(app.breadcrumbs.hovered.is_none());
                         if deferred {
                             let gesture = app.held_mouse().unwrap();
                             assert_eq!((gesture.lead, gesture.edge), (ids[10], -1));
@@ -5691,15 +7634,15 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
                             assert_eq!(app.drag_scroll.unwrap().0, -1);
                         }
                     }
-                    app.mouse(mouse(
+                    app.mouse_entry(mouse(
                         MouseEventKind::Up(MouseButton::Left),
                         1,
                         0,
                         KeyModifiers::NONE,
                     ));
                     assert_eq!(app.directory, directory);
-                    assert!(!app.back_hovered);
-                    assert!(app.mouse_position.is_none() && app.mouse_press_view.is_none());
+                    assert!(app.breadcrumbs.hovered.is_none());
+                    assert!(app.entry_mouse_position().is_none() && app.mouse_press_view.is_none());
                     assert!(app.drag_scroll.is_none() && !app.has_held_mouse());
                     finish_visual(&mut app);
                     assert_eq!(app.selected, Some(ids[10]));
@@ -5714,77 +7657,94 @@ fn captured_drags_and_releases_take_precedence_over_the_back_control() {
 
 #[test]
 fn held_mouse_edge_scroll_is_bounded_keeps_progress_and_stops_on_release() {
-    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
-    apply(
-        &mut app,
-        ScanEvent::Entries {
-            parent: ROOT,
-            entries: (1..=300)
-                .map(|id| {
-                    entry(
-                        id,
-                        &format!("item-{id}"),
-                        NodeKind::File,
-                        u64::from(301 - id),
-                    )
-                })
-                .collect(),
-        },
-    );
-    let ids: Vec<_> = (1..=300).collect();
-    wait_cache(&mut app, ROOT, &ids);
-    app.sync_order(true);
-    app.visual.enter(ROOT, Some(1));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 6)).unwrap();
-    terminal
-        .draw(|frame| app.draw(frame, false, false))
-        .unwrap();
-    let mouse = |kind, row| MouseEvent {
-        kind,
-        row,
-        column: 35,
-        modifiers: KeyModifiers::NONE,
-    };
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
-    app.pump_visual();
-    let deadline = app.drag_scroll.unwrap().2;
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
-    assert_eq!(
-        app.drag_scroll.unwrap().2,
-        deadline,
-        "edge motion postpones timer"
-    );
-    assert!(app.pump_mouse_scroll(deadline));
-    app.pump_visual();
-    assert_eq!(app.selected, Some(8));
-    assert_eq!(app.visual.len(), 8);
-    assert!(app.offset > 0);
-    terminal
-        .draw(|frame| app.draw(frame, false, false))
-        .unwrap();
-    for id in 9..=280 {
-        app.removed(id);
+    for remove in [false, true] {
+        let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+        apply(
+            &mut app,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: (1..=300)
+                    .map(|id| {
+                        entry(
+                            id,
+                            &format!("item-{id}"),
+                            NodeKind::File,
+                            u64::from(301 - id),
+                        )
+                    })
+                    .collect(),
+            },
+        );
+        let ids: Vec<_> = (1..=300).collect();
+        wait_cache(&mut app, ROOT, &ids);
+        app.sync_order(true);
+        app.visual.enter(ROOT, None);
+        if remove {
+            for id in 1..=300 {
+                app.visual.toggle(id);
+            }
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 7)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            row,
+            column: 35,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+        app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+        app.pump_visual();
+        let deadline = app.drag_scroll.unwrap().2;
+        app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+        assert_eq!(
+            app.drag_scroll.unwrap().2,
+            deadline,
+            "edge motion postpones timer"
+        );
+        assert!(app.pump_mouse_scroll(deadline));
+        app.pump_visual();
+        assert_eq!(app.selected, Some(8));
+        assert_eq!(app.visual.len(), if remove { 292 } else { 8 });
+        assert_eq!(app.visual.contains(1), !remove);
+        assert_eq!(app.visual.contains(8), !remove);
+        assert_eq!(app.visual.contains(9), remove);
+        assert!(app.offset > 0);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        for id in 9..=280 {
+            app.removed(id);
+        }
+        let deadline = app.drag_scroll.unwrap().2;
+        assert!(!app.pump_mouse_scroll(deadline));
+        assert_eq!(app.drag_scroll.unwrap().1, 263);
+        app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+        assert_eq!(
+            app.drag_scroll.unwrap().1,
+            263,
+            "repeated edge motion restarts tombstone traversal"
+        );
+        let deadline = app.drag_scroll.unwrap().2;
+        assert!(app.pump_mouse_scroll(deadline));
+        app.pump_visual();
+        assert_eq!(app.selected, Some(283));
+        // The cursor skips tombstones separately from the 256-slot selection
+        // budget. Materializing this range takes one more bounded slice.
+        assert!(app.visual.is_pending());
+        app.pump_visual();
+        assert!(!app.visual.is_pending());
+        assert_eq!(app.visual.contains(283), !remove);
+        assert_eq!(app.visual.contains(284), remove);
+        app.modal = Some(Modal::help(app.visual.active()));
+        assert!(!app.pump_mouse_scroll(deadline + Duration::from_secs(1)));
+        app.modal = None;
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 5));
+        assert!(app.drag_scroll.is_none());
+        assert!(!app.pump_mouse_scroll(deadline + Duration::from_secs(2)));
     }
-    let deadline = app.drag_scroll.unwrap().2;
-    assert!(!app.pump_mouse_scroll(deadline));
-    assert_eq!(app.drag_scroll.unwrap().1, 263);
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
-    assert_eq!(
-        app.drag_scroll.unwrap().1,
-        263,
-        "repeated edge motion restarts tombstone traversal"
-    );
-    let deadline = app.drag_scroll.unwrap().2;
-    assert!(app.pump_mouse_scroll(deadline));
-    app.pump_visual();
-    assert_eq!(app.selected, Some(283));
-    app.modal = Some(Modal::help(app.visual.active()));
-    assert!(!app.pump_mouse_scroll(deadline + Duration::from_secs(1)));
-    app.modal = None;
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5));
-    assert!(app.drag_scroll.is_none());
-    assert!(!app.pump_mouse_scroll(deadline + Duration::from_secs(2)));
 }
 
 #[test]
@@ -5800,7 +7760,7 @@ fn a_held_press_freezes_discovered_rows_until_release() {
                 .begin_range(Arc::clone(&app.view), 3, RangeMode::Add);
         }
         let old = Arc::clone(&app.view);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -5810,7 +7770,7 @@ fn a_held_press_freezes_discovered_rows_until_release() {
             column: 35,
             modifiers: KeyModifiers::SHIFT,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
         apply(
             &mut app,
             ScanEvent::Entries {
@@ -5821,7 +7781,7 @@ fn a_held_press_freezes_discovered_rows_until_release() {
         wait_cache(&mut app, 1, &[6, 3, 4, 5]);
         app.sync_order(true);
         assert!(Arc::ptr_eq(&old, &app.view));
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
         finish_visual(&mut app);
         app.sync_order(true);
         assert!(app.view.positions.contains_key(&6));
@@ -5868,7 +7828,8 @@ fn visual_entry_and_normal_shift_page_keep_distinct_pending_navigation() {
         assert_eq!(app.visual.active(), !shifted);
         assert_eq!(app.visual.contains(5), !shifted);
         assert!(!app.visual.contains(3) && !app.visual.contains(4));
-        assert_eq!(app.selected, Some(if shifted { 3 } else { 5 }));
+        assert_eq!(app.selected, (!shifted).then_some(5));
+        assert_eq!(app.parent_selected, shifted);
     }
 }
 
@@ -5975,8 +7936,7 @@ fn entering_visual_with_shift_mouse_waits_for_normal_navigation() {
                         Action::BatchCancel
                     ));
                     cancel_batch(&mut app, &mut batch, &mut retired);
-                    let preserved: Vec<_> =
-                        (3..=5).filter(|&id| app.visual.contains(id)).collect();
+                    let preserved: Vec<_> = (3..=5).filter(|&id| app.visual.contains(id)).collect();
                     assert_eq!(preserved, marked);
                 }
             }
@@ -5985,28 +7945,44 @@ fn entering_visual_with_shift_mouse_waits_for_normal_navigation() {
 }
 
 #[test]
-fn selection_preparation_enter_waits_and_cancel_remains_available() {
-    for title in [
-        "Selecting entries",
-        "Preparing selection",
-        "Stopping selection",
-    ] {
-        let mut app = browser_fixture();
-        app.modal = Some(Modal::notice(title, "Wait".to_owned()));
-        app.key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            None,
-            false,
-        );
-        assert!(
-            matches!(app.modal, Some(Modal::Text { title: actual, .. }) if actual == title)
-        );
-        app.key(
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            None,
-            false,
-        );
-        assert!(app.modal.is_none());
+fn pending_batch_confirmation_keeps_input_and_cancel_remains_available() {
+    for key in [KeyCode::Enter, KeyCode::Char('y')] {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = browser_fixture();
+            app.visual.enter(ROOT, Some(1));
+            app.modal = Some(Modal::Batch {
+                target: "/fixture".to_owned(),
+                count: 1,
+                ready: false,
+                reviewable: false,
+                confirm_requested: false,
+                scroll: 0,
+            });
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(rendered(&terminal).contains("y / Enter: enqueue selected"));
+            assert!(!rendered(&terminal).contains("Checking targets"));
+            assert!(matches!(
+                app.key(KeyEvent::new(key, KeyModifiers::NONE), None, false),
+                Action::Continue
+            ));
+            assert!(matches!(
+                app.modal,
+                Some(Modal::Batch {
+                    confirm_requested: true,
+                    ..
+                })
+            ));
+            assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            assert!(matches!(
+                app.key(KeyEvent::new(cancel, KeyModifiers::NONE), None, false),
+                Action::BatchCancel
+            ));
+            assert!(app.modal.is_none() && app.visual.contains(1));
+            assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+        }
     }
 }
 
@@ -6030,7 +8006,7 @@ fn visual_cursor_markers_and_count_remain_clear_at_narrow_widths() {
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    assert!(rendered(&terminal).contains("Visual 2"));
+    assert!(rendered(&terminal).contains("2 selected"));
     app.visual.toggle(2);
     assert_eq!(
         app.row(2, 30, 80, true, " ", DeleteState::default())
@@ -6048,11 +8024,11 @@ fn shift_press_keeps_displayed_order_until_release_or_first_drag() {
         app.selected = Some(3);
         app.reset_order(false);
         app.visual.enter(1, Some(3));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 35,
             row: if drag { 1 } else { 3 },
@@ -6067,7 +8043,7 @@ fn shift_press_keeps_displayed_order_until_release_or_first_drag() {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: if drag {
                 MouseEventKind::Drag(MouseButton::Left)
             } else {
@@ -6081,9 +8057,7 @@ fn shift_press_keeps_displayed_order_until_release_or_first_drag() {
             app.pump_visual();
         }
         if drag {
-            assert!(
-                !app.visual.contains(3) && app.visual.contains(4) && !app.visual.contains(5)
-            );
+            assert!(!app.visual.contains(3) && app.visual.contains(4) && !app.visual.contains(5));
         } else {
             assert!(app.visual.contains(3) && app.visual.contains(4) && app.visual.contains(5));
         }
@@ -6097,7 +8071,7 @@ fn shift_drag_inverts_the_pre_press_selection_and_shift_click_adds() {
     app.selected = Some(3);
     app.reset_order(false);
     app.visual.enter(1, Some(3));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -6107,31 +8081,31 @@ fn shift_drag_inverts_the_pre_press_selection_and_shift_click_adds() {
         row,
         modifiers: KeyModifiers::SHIFT,
     };
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 2));
     assert_eq!(
         app.visual.len(),
         1,
         "a press waits to distinguish click from drag"
     );
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
     while app.visual.is_pending() {
         app.pump_visual();
     }
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
     assert!(app.visual.contains(3) && app.visual.contains(4) && app.visual.contains(5));
     app.clear_visual_intent();
     app.visual.enter(1, Some(3));
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
-    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+    app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
     while app.visual.is_pending() {
         app.pump_visual();
     }
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
     assert!(!app.visual.contains(3) && app.visual.contains(4) && app.visual.len() == 1);
     app.clear_visual_intent();
     app.visual.enter(1, Some(3));
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3));
-    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 3));
+    app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 3));
     while app.visual.is_pending() {
         app.pump_visual();
     }
@@ -6145,11 +8119,11 @@ fn mouse_release_in_a_modal_clears_the_interrupted_drag_without_selecting() {
     app.selected = Some(3);
     app.reset_order(false);
     app.visual.enter(1, Some(3));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 2,
@@ -6161,7 +8135,7 @@ fn mouse_release_in_a_modal_clears_the_interrupted_drag_without_selecting() {
         None,
         false,
     );
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Up(MouseButton::Left),
         column: 35,
         row: 2,
@@ -6170,7 +8144,7 @@ fn mouse_release_in_a_modal_clears_the_interrupted_drag_without_selecting() {
     assert!(!app.mouse_dragging && !app.has_held_mouse() && app.mouse_baseline.is_none());
     assert_eq!(app.visual.len(), 1);
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Moved,
         column: 35,
         row: 3,
@@ -6182,7 +8156,7 @@ fn mouse_release_in_a_modal_clears_the_interrupted_drag_without_selecting() {
 #[test]
 fn mouse_uses_painted_ids_after_an_unpainted_resort() {
     let mut app = browser_fixture();
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -6192,7 +8166,7 @@ fn mouse_uses_painted_ids_after_an_unpainted_resort() {
         ids: vec![2, 1],
         positions: HashMap::from([(2, 0), (1, 1)]),
     });
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 2,
@@ -6270,6 +8244,7 @@ fn batch_confirmation_scrolls_long_targets_with_pinned_choices_and_resize_guard(
         count: 2,
         ready: true,
         reviewable: false,
+        confirm_requested: false,
         scroll: 0,
     });
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
@@ -6471,47 +8446,57 @@ fn incremental_delete_preserves_folder_neighbor_and_live_scan_without_success_di
 #[test]
 fn removal_invalidates_visible_and_suspended_target_dialogs_only() {
     for suspended in [false, true] {
-        for kind in 0..4 {
-            let mut app = browser_fixture();
-            app.modal = Some(match kind {
-                0 => Modal::Delete {
-                    id: 1,
-                    anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
-                    relative: "folder".into(),
-                    target: "fixture/folder".into(),
-                    scroll: 0,
-                    reviewable: true,
-                    confirmed: Some(test_confirmed_target()),
-                    capture: None,
-                },
-                1 => Modal::info("old target".into()),
-                2 => Modal::help(app.visual.active()),
-                _ => Modal::notice("Delete failed", "unrelated failure".into()),
-            });
-            if suspended {
-                app.key(
-                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                    None,
-                    true,
-                );
-                assert!(matches!(app.modal, Some(Modal::Quit { .. })));
-            }
-            app.removed(1);
-            if suspended {
-                assert!(matches!(app.modal, Some(Modal::Quit { .. })));
-                app.key(
-                    KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-                    None,
-                    false,
-                );
-            }
-            if kind < 2 {
-                assert!(app.modal.is_none());
-            } else {
-                let expected = if kind == 2 { "Help" } else { "Delete failed" };
-                assert!(
-                    matches!(app.modal, Some(Modal::Text { title, .. }) if title == expected)
-                );
+        for question in [false, true] {
+            for kind in 0..4 {
+                let mut app = browser_fixture();
+                app.modal = Some(match kind {
+                    0 => Modal::Delete {
+                        id: 1,
+                        anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
+                        relative: "folder".into(),
+                        target: "fixture/folder".into(),
+                        scroll: 0,
+                        reviewable: true,
+                        confirm_requested: false,
+                        confirmed: Some(test_confirmed_target()),
+                        capture: None,
+                    },
+                    1 => Modal::info("old target".into()),
+                    2 => Modal::help(app.visual.active()),
+                    _ => Modal::notice("Delete failed", "unrelated failure".into()),
+                });
+                if suspended {
+                    app.key(
+                        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                        None,
+                        true,
+                    );
+                    assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+                }
+                if question {
+                    app.request_quit_confirmation();
+                }
+                app.removed(1);
+                if question {
+                    assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+                    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, true);
+                }
+                if suspended {
+                    assert!(matches!(app.modal, Some(Modal::Quit { .. })));
+                    app.key(
+                        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                        None,
+                        false,
+                    );
+                }
+                if kind < 2 {
+                    assert!(app.modal.is_none());
+                } else {
+                    let expected = if kind == 2 { "Help" } else { "Delete failed" };
+                    assert!(
+                        matches!(app.modal, Some(Modal::Text { title, .. }) if title == expected)
+                    );
+                }
             }
         }
     }
@@ -7580,7 +9565,7 @@ fn navigation_fixture(count: NodeId, hidden: std::ops::RangeInclusive<NodeId>) -
 fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins() {
     let mut app = navigation_fixture(40, 41..=41);
     app.selected = Some(1);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7590,7 +9575,7 @@ fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins()
         column: 35,
         modifiers: KeyModifiers::NONE,
     };
-    app.mouse(mouse(MouseEventKind::ScrollDown));
+    app.mouse_entry(mouse(MouseEventKind::ScrollDown));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7598,12 +9583,12 @@ fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins()
         (app.offset, app.selected, app.selection_screen_row()),
         (3, Some(10), Some(6))
     );
-    app.mouse(mouse(MouseEventKind::Moved));
+    app.mouse_entry(mouse(MouseEventKind::Moved));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
     assert_eq!((app.offset, app.selected), (3, Some(10)));
-    app.mouse(mouse(MouseEventKind::ScrollUp));
+    app.mouse_entry(mouse(MouseEventKind::ScrollUp));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7612,7 +9597,7 @@ fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins()
         (0, Some(7), Some(6))
     );
     for _ in 0..15 {
-        app.mouse(mouse(MouseEventKind::ScrollDown));
+        app.mouse_entry(mouse(MouseEventKind::ScrollDown));
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -7621,7 +9606,7 @@ fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins()
         (app.offset, app.selected, app.selection_screen_row()),
         (30, Some(37), Some(6))
     );
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         row: 10,
         ..mouse(MouseEventKind::ScrollDown)
     });
@@ -7634,7 +9619,7 @@ fn mouse_wheel_scrolls_the_viewport_under_the_pointer_without_keyboard_margins()
     );
     // Keyboard input resumes its normal context-margin behavior.
     app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), None, false);
-    assert!(app.hover_position.is_none());
+    assert!(app.entry_hover_position().is_none());
 }
 
 #[test]
@@ -7642,7 +9627,7 @@ fn mouse_wheel_uses_painted_order_and_counts_only_eligible_rows() {
     let mut app = navigation_fixture(40, 5..=8);
     app.config.show_hidden = false;
     app.selected = Some(1);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7658,7 +9643,7 @@ fn mouse_wheel_uses_painted_order_and_counts_only_eligible_rows() {
             .collect(),
         ids,
     });
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::ScrollDown,
         row: 2,
         column: 35,
@@ -7676,7 +9661,7 @@ fn mouse_wheel_uses_painted_order_and_counts_only_eligible_rows() {
         ),
         (4, Some(9), Some(1))
     );
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::ScrollDown,
         row: 2,
         column: 35,
@@ -7694,7 +9679,7 @@ fn deferred_visual_wheel_preserves_pointer_row_and_selected_marks() {
     let mut app = navigation_fixture(40, 41..=41);
     app.selected = Some(1);
     app.visual.enter(ROOT, Some(1));
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7706,8 +9691,8 @@ fn deferred_visual_wheel_preserves_pointer_row_and_selected_marks() {
         column: 35,
         modifiers: KeyModifiers::NONE,
     };
-    app.mouse(mouse);
-    app.mouse(mouse);
+    app.mouse_entry(mouse);
+    app.mouse_entry(mouse);
     assert!(matches!(
         app.visual_intents.back(),
         Some(VisualIntent::ScrollViewport(_))
@@ -7741,7 +9726,7 @@ fn ordinary_hover_matches_immediate_input_after_pending_navigation_and_wheels() 
                     finish_visual(&mut app);
                 }
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -7752,7 +9737,7 @@ fn ordinary_hover_matches_immediate_input_after_pending_navigation_and_wheels() 
                     modifiers: KeyModifiers::NONE,
                 };
                 if wheel {
-                    app.mouse(mouse(MouseEventKind::ScrollDown));
+                    app.mouse_entry(mouse(MouseEventKind::ScrollDown));
                 } else {
                     app.key(
                         KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
@@ -7765,7 +9750,7 @@ fn ordinary_hover_matches_immediate_input_after_pending_navigation_and_wheels() 
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
                 assert_eq!(app.visual.is_pending(), deferred);
-                app.mouse(mouse(MouseEventKind::Moved));
+                app.mouse_entry(mouse(MouseEventKind::Moved));
                 finish_visual(&mut app);
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
@@ -7780,7 +9765,7 @@ fn ordinary_hover_matches_immediate_input_after_pending_navigation_and_wheels() 
                         Some(usize::from(row - 1))
                     )
                 );
-                assert_eq!(app.hover_position, Some((35, row)));
+                assert_eq!(app.entry_hover_position(), Some((35, row)));
                 let old_view = Arc::clone(&app.view);
                 apply(
                     &mut app,
@@ -7806,7 +9791,7 @@ fn ordinary_hover_matches_immediate_input_after_pending_navigation_and_wheels() 
                 );
                 assert_eq!(app.visual.len(), 2048);
                 assert!(!app.visual.contains(2049));
-                outcomes.push((app.offset, app.selected, app.hover_position));
+                outcomes.push((app.offset, app.selected, app.entry_hover_position()));
             }
             assert_eq!(outcomes[0], outcomes[1]);
         }
@@ -7823,7 +9808,7 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
             .begin_range(Arc::clone(&app.view), 2048, RangeMode::Add);
         app.pump_visual();
         assert!(app.visual.is_pending());
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -7833,9 +9818,9 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::ScrollDown, 60, 10));
-        app.mouse(mouse(MouseEventKind::Moved, 60, 10));
-        assert_eq!(app.hover_position, Some((60, 10)));
+        app.mouse_entry(mouse(MouseEventKind::ScrollDown, 60, 10));
+        app.mouse_entry(mouse(MouseEventKind::Moved, 60, 10));
+        assert_eq!(app.entry_hover_position(), Some((60, 10)));
         match later {
             0 => {
                 app.key(
@@ -7851,9 +9836,9 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
                     false,
                 );
             }
-            2 => app.mouse(mouse(MouseEventKind::Moved, 35, 0)),
-            3 => app.mouse(mouse(MouseEventKind::Moved, 1, 0)),
-            4 => app.mouse(mouse(MouseEventKind::Moved, 90, 10)),
+            2 => app.mouse_entry(mouse(MouseEventKind::Moved, 35, 0)),
+            3 => app.mouse_entry(mouse(MouseEventKind::Moved, 1, 0)),
+            4 => app.mouse_entry(mouse(MouseEventKind::Moved, 90, 10)),
             5 => app.modal = Some(Modal::help(true)),
             6 | 7 => {
                 // An invalidated hover must not bind Enter to the old cursor.
@@ -7863,9 +9848,9 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
                     false,
                 );
                 if later == 6 {
-                    terminal.backend_mut().resize(120, 5);
+                    terminal.backend_mut().resize(120, 6);
                 } else {
-                    terminal.backend_mut().resize(96, 11);
+                    terminal.backend_mut().resize(96, 12);
                 }
             }
             _ => {
@@ -7884,12 +9869,12 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(app.hover_position.is_none(), "later={later}");
+        assert!(app.entry_hover_position().is_none(), "later={later}");
         finish_visual(&mut app);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(app.hover_position.is_none(), "later={later}");
+        assert!(app.entry_hover_position().is_none(), "later={later}");
         if later == 8 {
             assert!(app.visual.is_empty() && app.visual_intents.is_empty());
         } else {
@@ -7914,11 +9899,11 @@ fn later_input_and_resize_do_not_reactivate_deferred_hover() {
 fn vanished_hover_rows_and_stale_epochs_do_not_toggle_the_previous_cursor() {
     for stale_epoch in [false, true] {
         let mut app = pending_folder_selection();
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 13)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 35,
             row: 3,
@@ -7941,7 +9926,7 @@ fn vanished_hover_rows_and_stale_epochs_do_not_toggle_the_previous_cursor() {
         assert_eq!(app.selected, Some(4));
         assert!(app.visual.contains(3) && app.visual.contains(4));
         assert_eq!(app.visual.len(), 2);
-        assert!(app.hover_position.is_none());
+        assert!(app.entry_hover_position().is_none());
     }
 }
 
@@ -7949,7 +9934,7 @@ fn vanished_hover_rows_and_stale_epochs_do_not_toggle_the_previous_cursor() {
 fn immediate_hover_keeps_the_painted_view_when_a_resort_is_not_painted() {
     let mut app = navigation_fixture(40, 41..=41);
     app.selected = Some(1);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -7965,7 +9950,7 @@ fn immediate_hover_keeps_the_painted_view_when_a_resort_is_not_painted() {
             .collect(),
         ids,
     });
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Moved,
         column: 35,
         row: 10,
@@ -8001,14 +9986,14 @@ fn deferred_wheel_reversals_compose_and_clamp_each_direction() {
         app.selected = Some(initial);
         app.offset = offset;
         app.visual.enter(ROOT, Some(initial));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         app.visual
             .begin_range(Arc::clone(&app.view), 40, RangeMode::Add);
         for kind in directions {
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind,
                 row: 7,
                 column: 35,
@@ -8033,7 +10018,7 @@ fn deferred_wheel_composes_with_interleaved_toggles_navigation_and_hover() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(7);
         app.visual.enter(ROOT, Some(7));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8045,13 +10030,13 @@ fn deferred_wheel_composes_with_interleaved_toggles_navigation_and_hover() {
             column: 35,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::ScrollDown));
+        app.mouse_entry(mouse(MouseEventKind::ScrollDown));
         if let Some(code) = middle {
             app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
         } else {
-            app.mouse(mouse(MouseEventKind::Moved));
+            app.mouse_entry(mouse(MouseEventKind::Moved));
         }
-        app.mouse(mouse(MouseEventKind::ScrollDown));
+        app.mouse_entry(mouse(MouseEventKind::ScrollDown));
         assert_eq!(app.visual_intents.len(), 3);
         finish_visual(&mut app);
         terminal
@@ -8093,7 +10078,7 @@ fn deferred_wheels_compose_across_live_appends_and_clamp_each_direction() {
         app.selected = Some(initial);
         app.offset = offset;
         app.visual.enter(ROOT, Some(initial));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8108,7 +10093,7 @@ fn deferred_wheels_compose_across_live_appends_and_clamp_each_direction() {
             column: 35,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(first));
+        app.mouse_entry(mouse(first));
         apply(
             &mut app,
             ScanEvent::Entries {
@@ -8127,7 +10112,7 @@ fn deferred_wheels_compose_across_live_appends_and_clamp_each_direction() {
         assert_eq!(previous.generation, app.painted_view.generation);
         assert_eq!(app.offset, offset);
         assert!(app.visual.is_pending());
-        app.mouse(mouse(second));
+        app.mouse_entry(mouse(second));
         assert_eq!(app.visual_intents.len(), 2);
         finish_visual(&mut app);
         terminal
@@ -8179,7 +10164,7 @@ fn deferred_wheels_keep_live_resorts_and_interleaved_cursor_intents() {
         app.cursor_mode = CursorMode::Tracked;
         app.selected = Some(7);
         app.visual.enter(ROOT, Some(7));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8194,7 +10179,7 @@ fn deferred_wheels_keep_live_resorts_and_interleaved_cursor_intents() {
             column: 35,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::ScrollDown));
+        app.mouse_entry(mouse(MouseEventKind::ScrollDown));
         apply(
             &mut app,
             ScanEvent::Entries {
@@ -8221,10 +10206,10 @@ fn deferred_wheels_keep_live_resorts_and_interleaved_cursor_intents() {
         if let Some(code) = middle {
             app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
         } else {
-            app.mouse(mouse(MouseEventKind::Moved));
+            app.mouse_entry(mouse(MouseEventKind::Moved));
         }
         if final_wheel {
-            app.mouse(mouse(MouseEventKind::ScrollDown));
+            app.mouse_entry(mouse(MouseEventKind::ScrollDown));
         }
         assert_eq!(app.visual_intents.len(), if final_wheel { 3 } else { 2 });
         finish_visual(&mut app);
@@ -8255,39 +10240,178 @@ fn deferred_wheels_keep_live_resorts_and_interleaved_cursor_intents() {
 }
 
 #[test]
-fn back_control_highlights_on_hover_and_navigates_only_on_click() {
-    let mut app = browser_fixture();
-    app.directory = 1;
-    app.selected = Some(3);
+fn breadcrumbs_highlight_and_navigate_only_on_matching_release() {
+    let mut app = browser_fixture_at(PathBuf::from("/outside/fixture"));
+    app.directory = 5;
+    app.selected = None;
     app.reset_order(false);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    assert_eq!(app.back_area.width, 2);
-    let mouse = |kind| MouseEvent {
+    let root = app
+        .breadcrumbs
+        .hits
+        .iter()
+        .find(|(_, id)| *id == ROOT)
+        .unwrap()
+        .0;
+    let folder = app
+        .breadcrumbs
+        .hits
+        .iter()
+        .find(|(_, id)| *id == 1)
+        .unwrap()
+        .0;
+    let mouse = |kind, column| MouseEvent {
         kind,
         row: 0,
-        column: 1,
+        column,
         modifiers: KeyModifiers::NONE,
     };
-    app.mouse(mouse(MouseEventKind::Moved));
+    assert!(rendered(&terminal).starts_with("/outside/fixture/folder/child-folder"));
+    assert!(
+        terminal.backend().buffer()[(1, 0)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        !terminal.backend().buffer()[(root.x, 0)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
+    app.mouse(mouse(MouseEventKind::Moved, root.x));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
-    assert_eq!(app.directory, 1);
-    assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Cyan);
-    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "←");
-    assert_eq!(terminal.backend().buffer()[(1, 0)].symbol(), "─");
-    assert_eq!(terminal.backend().buffer()[(1, 0)].bg, Color::Cyan);
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+    assert_eq!(terminal.backend().buffer()[(root.x, 0)].bg, Color::Cyan);
+    assert_eq!(app.directory, 5);
+    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), root.x));
+    assert_eq!(app.directory, 5);
+    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), folder.x));
+    assert_eq!(app.directory, 5);
+    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1));
+    assert_eq!(app.directory, 5);
+    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), root.x));
+    app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), root.x));
     assert_eq!((app.directory, app.selected), (ROOT, Some(1)));
-    terminal
-        .draw(|frame| app.draw(frame, false, false))
-        .unwrap();
-    assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::DarkGray);
-    app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
-    assert_eq!(app.directory, ROOT);
+}
+
+#[test]
+fn keyboard_input_cancels_breadcrumb_presses() {
+    for keys in [
+        vec![KeyCode::Char('g')],
+        vec![KeyCode::Char('?'), KeyCode::Esc],
+        vec![KeyCode::F(12)],
+    ] {
+        let mut app = browser_fixture_at(PathBuf::from("/outside/fixture"));
+        app.directory = 5;
+        app.selected = None;
+        app.reset_order(false);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let root = app
+            .breadcrumbs
+            .hits
+            .iter()
+            .find(|(_, id)| *id == ROOT)
+            .unwrap()
+            .0;
+        let mouse = |kind| MouseEvent {
+            kind,
+            row: 0,
+            column: root.x,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.breadcrumbs.pressed.is_some());
+        for code in keys {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(app.breadcrumbs.pressed.is_none());
+        }
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.directory, 5);
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.directory, ROOT);
+    }
+}
+
+#[test]
+fn breadcrumbs_clip_components_and_graphemes_without_parent_link() {
+    let app = browser_fixture_at(PathBuf::from("/outside/fixture"));
+    let mut crumbs = Breadcrumbs::default();
+    crumbs.sync(&app.root, &app.model, 5);
+    let line = crumbs.line(25, Rect::new(0, 0, 25, 1), false, Color::Cyan);
+    assert_eq!(line.to_string(), "…/folder/child-folder");
+    assert_eq!(
+        crumbs.hits.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+        vec![1, 5]
+    );
+    assert!(crumbs.hits.iter().all(|(area, _)| area.x >= 2));
+    assert_eq!(
+        crumbs
+            .line(8, Rect::new(0, 0, 8, 1), false, Color::Cyan)
+            .to_string(),
+        "…-folder"
+    );
+    assert_eq!(crumbs.hits, vec![(Rect::new(1, 0, 7, 1), 5)]);
+    for width in 0..20 {
+        let tail = breadcrumb_tail("界1\u{fe0f}\u{20e3}界tail", width);
+        assert!(Line::from(tail).width() <= width);
+    }
+    let mut root = Breadcrumbs::default();
+    root.sync(&app.root, &app.model, ROOT);
+    assert_eq!(
+        root.line(10, Rect::new(0, 0, 10, 1), false, Color::Cyan)
+            .to_string(),
+        "…/fixture"
+    );
+    assert!(root.hits.iter().all(|(_, id)| *id == ROOT));
+}
+
+#[test]
+fn breadcrumb_cells_escape_names_and_keep_separators_inactive() {
+    let app = browser_fixture_at(PathBuf::from("/outside/界\nroot"));
+    let mut crumbs = Breadcrumbs::default();
+    crumbs.sync(&app.root, &app.model, 1);
+    let area = Rect::new(4, 2, 80, 1);
+    assert_eq!(
+        crumbs.line(80, area, false, Color::Cyan).to_string(),
+        "/outside/界\\nroot/folder"
+    );
+    let root = crumbs.hits.iter().find(|(_, id)| *id == ROOT).unwrap().0;
+    assert_eq!((root.x, root.width), (13, 8));
+    assert!(
+        !crumbs
+            .hits
+            .iter()
+            .any(|(hit, _)| hit.contains(ratatui::layout::Position::new(root.right(), area.y)))
+    );
+    for width in 0..80 {
+        let line = crumbs.line(width, area, false, Color::Cyan);
+        assert!(line.width() <= width);
+        assert!(
+            crumbs.hits.iter().all(
+                |(hit, _)| hit.x >= area.x && usize::from(hit.right() - area.x) <= line.width()
+            )
+        );
+    }
+    let app = browser_fixture_at(PathBuf::from("/"));
+    crumbs.sync(&app.root, &app.model, ROOT);
+    assert_eq!(
+        crumbs
+            .line(1, Rect::new(0, 0, 1, 1), false, Color::Cyan)
+            .to_string(),
+        "/"
+    );
+    assert_eq!(crumbs.hits, vec![(Rect::new(0, 0, 1, 1), ROOT)]);
 }
 
 #[test]
@@ -8301,21 +10425,17 @@ fn compact_header_retains_trailing_path_help_and_integrated_queue_key() {
     let screen = rendered(&terminal);
     let header = screen.lines().next().unwrap();
     assert!(
-        header.starts_with("←─..")
-            && header.contains("visible-tail")
-            && header.contains("? help")
+        header.starts_with("…/") && header.contains("visible-tail") && header.contains("? help")
     );
     assert!(!header.contains("v select") && !header.contains("[D]"));
-    app.queue_view.status = "Deleting · 20 removed · 3 queued".to_owned();
+    app.queue_view.pending = 3;
+    app.queue_view.status = "3 queued".to_owned();
     terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
     let screen = rendered(&terminal);
     let header = screen.lines().next().unwrap();
-    assert!(header.contains("[D]") && header.contains("? help"));
+    assert!(header.contains("3 queued [D]") && header.contains("? help"));
+    assert!(!header.contains("removed") && !header.contains("Deleting"));
     assert!(!header.contains("D queue") && !header.contains("v select"));
-    assert_eq!(clipped_path_tail("/one/two/three", 10), "..wo/three");
-    for width in 0..12 {
-        assert!(Line::from(clipped_path_tail("/parent/界界界tail", width)).width() <= width);
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -8339,32 +10459,33 @@ fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
     );
     assert!(batch.is_some());
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-    let mut header =
-        |app: &mut App, queue: &mut DeleteQueue, batch: Option<&BatchPreparation>| {
-            terminal
-                .draw(|frame| {
-                    app.sync_queue(queue, frame.area());
-                    app.draw(frame, false, deletion_busy(queue, batch));
-                })
-                .unwrap();
-            rendered(&terminal).lines().next().unwrap().to_owned()
-        };
+    let mut header = |app: &mut App, queue: &mut DeleteQueue, batch: Option<&BatchPreparation>| {
+        terminal
+            .draw(|frame| {
+                app.sync_queue(queue, frame.area());
+                app.draw(frame, false, deletion_busy(queue, batch));
+            })
+            .unwrap();
+        rendered(&terminal).lines().next().unwrap().to_owned()
+    };
     for ready in [false, true] {
         let Some(Modal::Batch { ready: state, .. }) = app.modal.as_mut() else {
             panic!("batch review must remain open");
         };
         *state = ready;
         let text = header(&mut app, &mut queue, batch.as_ref());
-        assert!(text.contains("Visual") && text.contains("? help"));
         assert!(
-            !text.contains("Deleting") && !text.contains("[D]"),
+            text.contains("1 selected") && text.contains("[D] delete") && text.contains("? help")
+        );
+        assert!(
+            !text.contains("deleting…") && !text.contains("queued"),
             "unconfirmed batch advertised deletion: {text}"
         );
     }
     let queued = queue.enqueue(2, Arc::clone(&anchor), "root-file".into());
     assert!(queued.inserted);
     let text = header(&mut app, &mut queue, batch.as_ref());
-    assert!(text.contains("Deleting") && text.contains("[D]"));
+    assert!(text.contains("1 selected") && text.contains("[D] delete"));
     assert!(queue.remove_pending(queued.id).is_some());
     assert!(matches!(
         app.key(
@@ -8380,7 +10501,7 @@ fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
         preparation.dispatching = dispatching;
         assert!(!queue.is_busy());
         let text = header(&mut app, &mut queue, batch.as_ref());
-        assert!(text.contains("Deleting") && text.contains("[D]"));
+        assert!(text.contains("deleting…") && text.contains("[D]"));
         assert!(matches!(app.modal, Some(Modal::Enqueueing)));
     }
     drop(batch.take());
@@ -8388,10 +10509,10 @@ fn deletion_header_tracks_confirmed_work_through_batch_review_and_admission() {
     let queued = queue.enqueue(2, anchor, "root-file".into());
     assert!(queued.inserted);
     let text = header(&mut app, &mut queue, None);
-    assert!(text.contains("queued") && text.contains("Paused") && text.contains("[D]"));
+    assert!(text.contains("1 queued") && !text.contains("Paused") && text.contains("[D]"));
     assert!(queue.remove_pending(queued.id).is_some());
     let text = header(&mut app, &mut queue, None);
-    assert!(!text.contains("Deleting") && !text.contains("[D]"));
+    assert!(!text.contains("deleting…") && !text.contains("queued"));
     assert!(fixture.path().join("root-file").is_file());
 }
 
@@ -8400,8 +10521,7 @@ fn visual_header_restores_controls_without_idle_selection_hints() {
     for width in [39, 40, 59, 60, 80, 160] {
         let mut app = browser_fixture();
         app.selected = Some(1);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8416,10 +10536,10 @@ fn visual_header_restores_controls_without_idle_selection_hints() {
                 .unwrap();
             let screen = rendered(&terminal);
             let header = screen.lines().next().unwrap();
-            assert!(header.contains("Visual") && header.contains("? help"));
-            assert_eq!(header.contains("d delete"), width >= 40);
-            assert_eq!(header.contains("Esc clear"), width >= 60);
-            assert_eq!(header.contains("[D]"), deleting);
+            assert!(header.contains("1 selected") && header.contains("? help"));
+            assert!(header.contains("[D] delete"));
+            assert!(!header.contains("Esc clear") && !header.contains("Visual"));
+            assert!(!header.contains("Selecting") && !header.contains("removed"));
             assert!(!header.contains("v select") && !header.contains("D queue"));
         }
     }
@@ -8612,7 +10732,7 @@ fn visual_hover_reanchors_shift_ranges_but_same_row_keeps_enter_deselection() {
         let mut app = navigation_fixture(20, 21..=21);
         app.selected = Some(1);
         app.visual.enter(ROOT, Some(1));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 21)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 22)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8626,7 +10746,7 @@ fn visual_hover_reanchors_shift_ranges_but_same_row_keeps_enter_deselection() {
             app.visual
                 .begin_range(Arc::clone(&app.view), 1, RangeMode::Add);
         }
-        app.mouse(hover(10));
+        app.mouse_entry(hover(10));
         app.key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
             None,
@@ -8651,7 +10771,7 @@ fn visual_hover_reanchors_shift_ranges_but_same_row_keeps_enter_deselection() {
             app.visual
                 .begin_range(Arc::clone(&app.view), 11, RangeMode::Add);
         }
-        app.mouse(hover(11));
+        app.mouse_entry(hover(11));
         app.key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
             None,
@@ -8672,6 +10792,11 @@ fn visual_enter_deselection_survives_shift_and_plain_boundary_noops() {
             (1, KeyCode::Up, KeyCode::Down, 2),
             (5, KeyCode::Down, KeyCode::Up, 4),
         ] {
+            if boundary_noop && start == 1 {
+                // Up from the first real entry now reaches ../; it is no
+                // longer a boundary no-op. Parent selection has separate coverage.
+                continue;
+            }
             let mut app = navigation_fixture(5, 6..=6);
             app.selected = Some(start);
             app.visual.enter(ROOT, Some(start));
@@ -8727,6 +10852,11 @@ fn visual_keyboard_ranges_keep_scroll_margin_and_all_selected_ids() {
         false,
     );
     app.key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    app.key(
         KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
         None,
         false,
@@ -8752,12 +10882,12 @@ fn visual_keyboard_ranges_keep_scroll_margin_and_all_selected_ids() {
 fn stationary_hover_preserves_rows_then_keyboard_and_resize_restore_margin() {
     let mut app = navigation_fixture(40, 41..=41);
     app.edge_selection(false);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
     for _ in 0..3 {
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 35,
             row: 10,
@@ -8783,7 +10913,7 @@ fn stationary_hover_preserves_rows_then_keyboard_and_resize_restore_margin() {
         (app.selected, app.offset, app.selection_screen_row()),
         (Some(11), 4, Some(6))
     );
-    terminal.backend_mut().resize(80, 7);
+    terminal.backend_mut().resize(80, 8);
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -8791,7 +10921,7 @@ fn stationary_hover_preserves_rows_then_keyboard_and_resize_restore_margin() {
         (app.selected, app.page_size, app.selection_screen_row()),
         (Some(11), 6, Some(3))
     );
-    terminal.backend_mut().resize(80, 11);
+    terminal.backend_mut().resize(80, 12);
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -8807,15 +10937,16 @@ fn resizing_held_mouse_presses_preserves_the_pressed_viewport() {
         let mut app = navigation_fixture(40, 41..=41);
         app.selected = Some(11);
         app.offset = 10;
-        app.visual.enter(ROOT, Some(11));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        app.visual.enter(ROOT, None);
+        app.visual.reanchor(11);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         let pressed_view = Arc::clone(&app.painted_view);
         if deferred {
             app.visual
-                .begin_range(Arc::clone(&app.view), 11, RangeMode::Add);
+                .begin_range(Arc::clone(&app.view), 11, RangeMode::Remove);
         }
         let mouse = |kind, row| MouseEvent {
             kind,
@@ -8823,17 +10954,17 @@ fn resizing_held_mouse_presses_preserves_the_pressed_viewport() {
             column: 35,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 1));
         assert_eq!(app.has_held_mouse(), deferred);
-        terminal.backend_mut().resize(80, 7);
+        terminal.backend_mut().resize(80, 8);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         assert!(Arc::ptr_eq(&app.painted_view, &pressed_view));
         assert_eq!(app.painted_offset, 10);
         assert_eq!(app.painted_rows, vec![11, 12, 13, 14, 15, 16]);
-        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2));
+        app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 2));
         finish_visual(&mut app);
         assert_eq!(app.selected, Some(12));
         assert_eq!(app.visual.len(), 2);
@@ -8852,8 +10983,7 @@ fn bottom_row_mouse_capture_preserves_viewport_through_shrink_and_growth() {
             if visual {
                 app.visual.enter(ROOT, None);
             }
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -8865,8 +10995,8 @@ fn bottom_row_mouse_capture_preserves_viewport_through_shrink_and_growth() {
                 column: 35,
                 modifiers: KeyModifiers::NONE,
             };
-            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
-            terminal.backend_mut().resize(80, 7);
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
+            terminal.backend_mut().resize(80, 8);
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
@@ -8875,21 +11005,21 @@ fn bottom_row_mouse_capture_preserves_viewport_through_shrink_and_growth() {
             assert_eq!(app.painted_rows, original[..6]);
             assert_eq!(app.selected, Some(first + 9));
             assert_eq!(app.selection_screen_row(), None);
-            terminal.backend_mut().resize(80, 11);
+            terminal.backend_mut().resize(80, 12);
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
             assert_eq!(app.painted_offset, offset);
             assert_eq!(app.painted_rows, original);
             assert_eq!(app.selection_screen_row(), Some(9));
-            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+            app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
             terminal
                 .draw(|frame| app.draw(frame, false, false))
                 .unwrap();
-            assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+            assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
             assert_eq!(app.painted_offset, offset);
             assert_eq!(app.selection_screen_row(), Some(9));
-            assert_eq!(app.hover_position, (!visual).then_some((35, 10)));
+            assert_eq!(app.entry_hover_position(), (!visual).then_some((35, 10)));
             assert_eq!(app.visual.len(), usize::from(visual));
             app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), None, false);
             terminal
@@ -8898,6 +11028,192 @@ fn bottom_row_mouse_capture_preserves_viewport_through_shrink_and_growth() {
             assert_eq!(app.selected, Some(first + 8));
             assert_eq!(app.painted_offset, offset + 2);
             assert_eq!(app.selection_screen_row(), Some(6));
+        }
+    }
+}
+
+#[test]
+fn stale_geometry_release_ends_normal_capture_without_activation() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let mouse = |kind| MouseEvent {
+        kind,
+        row: 1,
+        column: 35,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
+    assert_eq!(app.normal_click, Some(1));
+    assert!(!app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Left), (80, 12)));
+    assert!(app.mouse_press_view.is_some());
+
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(6, "largest", NodeKind::File, 10_000)],
+        },
+    );
+    wait_cache(&mut app, ROOT, &[6, 1, 2]);
+    app.sync_order(true);
+    assert_eq!(app.view.ids, vec![1, 2]);
+
+    // Exercise the production guard before any resize event or new frame.
+    assert!(app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Left), (79, 12)));
+    assert_eq!(app.directory, ROOT);
+    assert!(app.normal_click.is_none() && app.mouse_press_view.is_none());
+    assert!(app.mouse_position.is_none() && app.hover_position.is_none());
+    app.sync_order(true);
+    assert_eq!(app.view.ids, vec![6, 1, 2]);
+    terminal.backend_mut().resize(79, 12);
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.mouse_entry(mouse(MouseEventKind::Moved));
+    assert_eq!(app.selected, Some(6));
+    assert_eq!(app.directory, ROOT);
+    assert!(app.hover_position.is_some());
+}
+
+#[test]
+fn stale_geometry_release_stops_visual_capture_without_synthesizing_shift_click() {
+    for modifiers in [
+        KeyModifiers::NONE,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for dragged in [false, true] {
+            let mut app = navigation_fixture(40, 41..=41);
+            app.visual.enter(ROOT, Some(1));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let mouse = |kind, row| MouseEvent {
+                kind,
+                row,
+                column: 35,
+                modifiers,
+            };
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 3));
+            if dragged {
+                app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 10));
+                assert!(app.drag_scroll.is_some());
+            }
+            assert!(app.mouse_press_view.is_some());
+            assert!(
+                app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Right), (79, 12))
+            );
+            assert!(app.mouse_press_view.is_some() && app.mouse_position.is_some());
+            assert!(
+                app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Left), (79, 12))
+            );
+            assert!(app.mouse_press_view.is_none() && app.mouse_baseline.is_none());
+            assert!(app.mouse_position.is_none() && app.drag_scroll.is_none());
+            assert!(!app.mouse_dragging && !app.drag_started && app.drag_anchor.is_none());
+            finish_visual(&mut app);
+            assert!(!app.pump_mouse_scroll(Instant::now() + Duration::from_secs(1)));
+            for id in 1..=40 {
+                let expected = id == 1
+                    || (!modifiers.contains(KeyModifiers::CONTROL)
+                        && if dragged {
+                            (3..=10).contains(&id)
+                        } else {
+                            !modifiers.contains(KeyModifiers::SHIFT) && id == 3
+                        });
+                assert_eq!(
+                    app.visual.contains(id),
+                    expected,
+                    "modifiers={modifiers:?}, dragged={dragged}, id={id}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_geometry_release_preserves_completed_and_deferred_visual_intents() {
+    for modifiers in [
+        KeyModifiers::NONE,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for dragged in [false, true] {
+            let mut app = navigation_fixture(40, 41..=41);
+            app.visual.enter(ROOT, Some(1));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            app.visual
+                .begin_range(Arc::clone(&app.view), 8, RangeMode::Add);
+            let mouse = |kind, row, modifiers| MouseEvent {
+                kind,
+                row,
+                column: 35,
+                modifiers,
+            };
+            // This earlier admitted click must replay after the pending range.
+            app.mouse_entry(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                5,
+                KeyModifiers::NONE,
+            ));
+            app.mouse_entry(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                5,
+                KeyModifiers::NONE,
+            ));
+            assert!(matches!(
+                app.visual_intents.front(),
+                Some(VisualIntent::Mouse(gesture)) if gesture.released
+            ));
+            app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 7, modifiers));
+            if dragged {
+                app.mouse_entry(mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    10,
+                    modifiers,
+                ));
+            }
+            assert!(app.has_held_mouse());
+            assert!(
+                app.reject_stale_mouse_geometry(MouseEventKind::Up(MouseButton::Left), (79, 12))
+            );
+            assert!(!app.has_held_mouse());
+            assert!(matches!(
+                app.visual_intents.front(),
+                Some(VisualIntent::Mouse(gesture)) if gesture.released && gesture.anchor == 5
+            ));
+            assert!(app.visual_intents.iter().all(|intent| match intent {
+                VisualIntent::Mouse(gesture) => gesture.released && gesture.edge == 0,
+                _ => true,
+            }));
+            finish_visual(&mut app);
+            assert!(app.mouse_press_view.is_none() && app.drag_scroll.is_none());
+            assert!(!app.pump_mouse_scroll(Instant::now() + Duration::from_secs(1)));
+            for id in 1..=40 {
+                let expected = if dragged && (7..=10).contains(&id) {
+                    modifiers.contains(KeyModifiers::SHIFT)
+                        && !modifiers.contains(KeyModifiers::CONTROL)
+                        && id > 8
+                } else if !dragged && id == 7 {
+                    modifiers.contains(KeyModifiers::SHIFT)
+                        && !modifiers.contains(KeyModifiers::CONTROL)
+                } else {
+                    id <= 8 && id != 5
+                };
+                assert_eq!(
+                    app.visual.contains(id),
+                    expected,
+                    "modifiers={modifiers:?}, dragged={dragged}, id={id}"
+                );
+            }
         }
     }
 }
@@ -8913,7 +11229,7 @@ fn resized_visual_capture_keeps_original_drag_and_release_targets() {
                 app.offset = offset;
                 app.visual.enter(ROOT, None);
                 let mut terminal =
-                    Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -8928,9 +11244,9 @@ fn resized_visual_capture_keeps_original_drag_and_release_targets() {
                     column: 35,
                     modifiers: KeyModifiers::NONE,
                 };
-                app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10));
+                app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left), 10));
                 assert_eq!(app.has_held_mouse(), deferred);
-                terminal.backend_mut().resize(80, 7);
+                terminal.backend_mut().resize(80, 8);
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
@@ -8946,16 +11262,16 @@ fn resized_visual_capture_keeps_original_drag_and_release_targets() {
                 assert_eq!(app.selected, Some(first + 9));
                 assert_eq!(app.painted_offset, offset);
                 assert_eq!(app.painted_rows, original[..6]);
-                terminal.backend_mut().resize(80, 11);
+                terminal.backend_mut().resize(80, 12);
                 terminal
                     .draw(|frame| app.draw(frame, false, false))
                     .unwrap();
                 assert_eq!(app.painted_offset, offset);
                 assert_eq!(app.painted_rows, original);
                 if !release_only {
-                    app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9));
+                    app.mouse_entry(mouse(MouseEventKind::Drag(MouseButton::Left), 9));
                 }
-                app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9));
+                app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left), 9));
                 finish_visual(&mut app);
                 assert_eq!(app.selected, Some(first + 8));
                 assert_eq!(app.visual.len(), 2 + usize::from(deferred));
@@ -8966,7 +11282,7 @@ fn resized_visual_capture_keeps_original_drag_and_release_targets() {
                         "deferred={deferred}, release_only={release_only}, offset={offset}, id={id}"
                     );
                 }
-                assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
+                assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
             }
         }
     }
@@ -8980,7 +11296,7 @@ fn releasing_a_resize_clipped_press_restores_visibility_and_keyboard_margin() {
         if visual {
             app.visual.enter(ROOT, None);
         }
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -8990,19 +11306,19 @@ fn releasing_a_resize_clipped_press_restores_visibility_and_keyboard_margin() {
             column: 35,
             modifiers: KeyModifiers::NONE,
         };
-        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
-        terminal.backend_mut().resize(80, 7);
+        app.mouse_entry(mouse(MouseEventKind::Down(MouseButton::Left)));
+        terminal.backend_mut().resize(80, 8);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
         assert_eq!(app.painted_offset, 0);
         assert_eq!(app.selection_screen_row(), None);
-        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        app.mouse_entry(mouse(MouseEventKind::Up(MouseButton::Left)));
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        assert!(app.mouse_press_view.is_none() && app.mouse_position.is_none());
-        assert!(app.hover_position.is_none());
+        assert!(app.mouse_press_view.is_none() && app.entry_mouse_position().is_none());
+        assert!(app.entry_hover_position().is_none());
         assert_eq!(app.selected, Some(10));
         assert_eq!(app.painted_offset, 4);
         assert_eq!(app.selection_screen_row(), Some(5));
@@ -9397,9 +11713,7 @@ fn unresolved_navigation_cannot_activate_the_previous_selection() {
 fn deletion_neighbor_repair_does_not_scan_an_unbounded_hidden_span() {
     let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
     let mut entries = vec![entry(1, "deleted", NodeKind::File, 200)];
-    entries.extend(
-        (2..=300).map(|id| entry(id, &format!(".hidden-{id:03}"), NodeKind::File, 100)),
-    );
+    entries.extend((2..=300).map(|id| entry(id, &format!(".hidden-{id:03}"), NodeKind::File, 100)));
     entries.push(entry(301, "survivor", NodeKind::File, 1));
     apply(
         &mut app,
@@ -9460,11 +11774,19 @@ fn home_and_end_target_the_requested_sort_even_when_old_edges_remain_eligible() 
         app.selected = Some(1);
         app.offset = 0;
         app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false);
+        if !end {
+            assert!(app.parent_selected);
+            app.key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                None,
+                false,
+            );
+        }
         assert!(
             app.pending_navigation
                 .is_some_and(|intent| intent.end == Some(end))
         );
-        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.selected, end.then_some(1));
         wait_cache(&mut app, ROOT, &[2, 3, 1]);
         app.sync_order(false);
         assert_eq!(app.selected, Some(expected));
@@ -9791,7 +12113,7 @@ fn filter_changes_clear_visual_marks_and_pending_input_without_leaving_visual_mo
         None,
         false,
     );
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 11)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -9805,7 +12127,7 @@ fn filter_changes_clear_visual_marks_and_pending_input_without_leaving_visual_mo
         "the old frame must not remain clickable"
     );
     let selected = app.selected;
-    app.mouse(MouseEvent {
+    app.mouse_entry(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 35,
         row: 2,
@@ -9858,8 +12180,7 @@ fn filter_q_is_text_during_deletion_but_ctrl_c_still_uses_the_quit_guard() {
         if deleting {
             assert!(matches!(action, Action::QuitWarning));
             assert!(matches!(app.modal, Some(Modal::Quit { reviewable: false })));
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
             terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
             assert!(matches!(
                 app.key(
@@ -9909,11 +12230,11 @@ fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
         }
 
         app.visual.enter(1, Some(4));
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 9)).unwrap();
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
-        app.mouse(MouseEvent {
+        app.mouse_entry(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             row: 1,
             column: 35,
@@ -9941,7 +12262,7 @@ fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
             MouseEventKind::Down(MouseButton::Left),
             MouseEventKind::Up(MouseButton::Left),
         ] {
-            app.mouse(MouseEvent {
+            app.mouse_entry(MouseEvent {
                 kind,
                 row: 1,
                 column: 35,
@@ -10005,48 +12326,904 @@ fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
     }
 }
 
-#[test]
-fn fixed_edge_layout_matches_solver_across_terminal_sizes() {
-    use ratatui::layout::{Constraint, Layout};
+fn control_event(kind: MouseEventKind, area: Rect) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
 
-    let mut edges = vec![(2, 4), (3, 2), (1, 3)];
-    edges.extend((0..=18).map(|height| (height, 3)));
-    edges.extend(
-        ["? help", "d delete  ? help", "d delete  Esc clear  ? help"]
-            .map(|hint| (2, hint.len() as u16 + 2)),
+fn click_control(app: &mut App, area: Rect, deleting: bool) -> Option<Action> {
+    assert!(matches!(
+        app.control_mouse(
+            control_event(MouseEventKind::Down(MouseButton::Left), area),
+            deleting
+        ),
+        Some(Action::Continue)
+    ));
+    app.control_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), area),
+        deleting,
+    )
+}
+
+#[test]
+fn header_controls_use_exact_labels_and_preserve_visual_and_filter_modes() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    app.queue_view.pending = 2;
+    app.queue_view.status = "2 queued".to_owned();
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert_eq!(app.help_area.width, 6);
+    assert_eq!(app.header_queue_area.width, 3);
+    let help = app.help_area;
+    let queue = app.header_queue_area;
+    for (area, text) in [(help, "? help"), (queue, "[D]")] {
+        for (column, expected) in text.chars().enumerate() {
+            assert_eq!(
+                terminal.backend().buffer()[(area.x + column as u16, area.y)].symbol(),
+                expected.to_string()
+            );
+        }
+    }
+    assert!(app.control_at(queue.x - 1, queue.y, true).is_none());
+    assert!(app.control_at(queue.right(), queue.y, true).is_none());
+    app.control_mouse(control_event(MouseEventKind::Moved, help), true);
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(help.x, help.y)].bg,
+        Color::Cyan
     );
-    let mut differences = Vec::new();
-    for direction in [Direction::Horizontal, Direction::Vertical] {
-        for &(leading, trailing) in &edges {
-            for available in 0..=100 {
-                let area = match direction {
-                    Direction::Horizontal => Rect::new(7, 9, available, 3),
-                    Direction::Vertical => Rect::new(7, 9, 3, available),
-                };
-                let reference = Layout::default()
-                    .direction(direction)
-                    .constraints([
-                        Constraint::Length(leading),
-                        Constraint::Min(0),
-                        Constraint::Length(trailing),
-                    ])
-                    .split(area);
-                let actual = split_edges(area, direction, leading, trailing);
-                if actual.as_slice() != reference.as_ref() {
-                    differences.push(format!(
-                        "{direction:?} {leading}/{trailing} in {available}: {actual:?} != {reference:?}",
-                    ));
+    app.filter_editing = true;
+    app.filter = "keep query".to_owned();
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let help = app.help_area;
+    assert!(matches!(
+        click_control(&mut app, help, true),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(app.modal, Some(Modal::Text { title: "Help", .. })));
+    assert!(app.filter_editing);
+    assert_eq!(app.filter, "keep query");
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let close = app.dialog_close_area;
+    assert!(matches!(
+        click_control(&mut app, close, true),
+        Some(Action::Continue)
+    ));
+    assert!(app.modal.is_none() && app.filter_editing);
+    app.filter_editing = false;
+    app.visual.enter(ROOT, app.selected);
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert!(app.header_queue_area.is_empty());
+    let delete = app.header_delete_area;
+    assert!(matches!(
+        click_control(&mut app, delete, true),
+        Some(Action::BatchPrepare)
+    ));
+    assert!(app.modal.is_none() && app.visual.active());
+    app.queue_view.pending = 0;
+    app.queue_view.status.clear();
+    app.visual.exit();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(app.header_queue_area.is_empty() && app.header_delete_area.is_empty());
+    assert!(app.control_at(queue.x, queue.y, false).is_none());
+}
+
+#[test]
+fn mouse_controls_cancel_drag_resize_and_changed_dialog_presses() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let help = app.help_area;
+    app.control_mouse(
+        control_event(MouseEventKind::Down(MouseButton::Left), help),
+        false,
+    );
+    app.control_mouse(
+        control_event(MouseEventKind::Drag(MouseButton::Left), help),
+        false,
+    );
+    app.control_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), help),
+        false,
+    );
+    assert!(app.modal.is_none());
+    app.control_mouse(
+        control_event(MouseEventKind::Down(MouseButton::Left), help),
+        false,
+    );
+    let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(79, 20)).unwrap();
+    narrow.draw(|frame| app.draw(frame, false, false)).unwrap();
+    app.control_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), help),
+        false,
+    );
+    assert!(app.modal.is_none());
+    app.modal = Some(Modal::info("first notice".to_owned()));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let close = app.dialog_close_area;
+    app.control_mouse(
+        control_event(MouseEventKind::Down(MouseButton::Left), close),
+        false,
+    );
+    // Allocate the replacement while the first allocation remains live.
+    let replacement = Modal::info("second notice".to_owned());
+    app.modal = Some(replacement);
+    app.control_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), close),
+        false,
+    );
+    assert!(matches!(app.modal, Some(Modal::Text { ref text, .. }) if text == "second notice"));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let close = app.dialog_close_area;
+    app.control_mouse(
+        control_event(MouseEventKind::Down(MouseButton::Left), close),
+        false,
+    );
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+    app.modal = Some(Modal::help(false));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let close = app.dialog_close_area;
+    app.control_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), close),
+        false,
+    );
+    assert!(matches!(app.modal, Some(Modal::Text { title: "Help", .. })));
+}
+
+#[test]
+fn dialog_close_controls_follow_cancel_fifo_and_shutdown_semantics() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    let dialogs = [
+        Modal::help(false),
+        Modal::Queue {
+            selected: None,
+            offset: None,
+        },
+        Modal::Delete {
+            id: 1,
+            anchor,
+            relative: PathBuf::from("child"),
+            target: "child".to_owned(),
+            scroll: 0,
+            reviewable: false,
+            confirm_requested: false,
+            confirmed: None,
+            capture: None,
+        },
+        Modal::Batch {
+            target: "selected".to_owned(),
+            count: 3,
+            ready: false,
+            reviewable: false,
+            confirm_requested: false,
+            scroll: 0,
+        },
+        Modal::Enqueueing,
+    ];
+    for (index, modal) in dialogs.into_iter().enumerate() {
+        app.modal = Some(modal);
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        let close = app.dialog_close_area;
+        assert_eq!(close.width, 3);
+        assert_eq!(
+            terminal.backend().buffer()[(close.x + 1, close.y)].symbol(),
+            "x"
+        );
+        let action = click_control(&mut app, close, true);
+        assert!(if index >= 3 {
+            matches!(action, Some(Action::BatchCancel))
+        } else {
+            matches!(action, Some(Action::Continue))
+        });
+        assert!(app.modal.is_none());
+    }
+    app.previous_modal = Some(Modal::help(false));
+    app.modal = Some(Modal::Quit { reviewable: false });
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let close = app.dialog_close_area;
+    assert!(matches!(
+        click_control(&mut app, close, true),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(app.modal, Some(Modal::Text { title: "Help", .. })));
+    app.modal = Some(Modal::Stopping);
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    let close = app.dialog_close_area;
+    assert!(matches!(
+        click_control(&mut app, close, true),
+        Some(Action::Quit)
+    ));
+    app.modal = None;
+    for target in ["first", "second"] {
+        app.delete_notices.push_back(DeleteReport::single(
+            PathBuf::from(target),
+            "permission denied".to_owned(),
+        ));
+    }
+    app.show_delete_notice();
+    for target in ["first", "second"] {
+        assert_eq!(app.delete_notices.front().unwrap().target, target);
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let close = app.dialog_close_area;
+        assert!(matches!(
+            click_control(&mut app, close, false),
+            Some(Action::Continue)
+        ));
+    }
+    assert!(app.modal.is_none() && app.delete_notices.is_empty());
+    for width in 1..=5 {
+        let mut tiny = Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        app.modal = Some(Modal::help(false));
+        tiny.draw(|frame| app.draw(frame, false, false)).unwrap();
+        let close = app.dialog_close_area;
+        assert!(close.width > 0 && close.right() <= width);
+        assert!(matches!(
+            click_control(&mut app, close, false),
+            Some(Action::Continue)
+        ));
+        assert!(app.modal.is_none());
+    }
+}
+
+#[test]
+fn selected_count_hover_keeps_hitbox_and_clear_exits_even_while_selection_waits() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+    for count in [0, 1, 1234] {
+        app.visual.enter(ROOT, None);
+        for id in 1..=count {
+            app.visual.toggle(id);
+        }
+        app.parent_select_pending = true;
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        let before = app.selection_clear_area;
+        assert!(before.width >= 10);
+        let header = rendered(&terminal).lines().next().unwrap().to_owned();
+        assert!(header.contains(&format!("{count} selected")));
+        assert!(header.contains("[D] delete"));
+        assert!(
+            !header.contains("Selecting")
+                && !header.contains("Visual")
+                && !header.contains("removed")
+        );
+        app.control_mouse(control_event(MouseEventKind::Moved, before), true);
+        terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+        assert_eq!(app.selection_clear_area, before);
+        assert!(
+            rendered(&terminal)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("X selected")
+        );
+        assert!(matches!(
+            click_control(&mut app, before, true),
+            Some(Action::Continue)
+        ));
+        assert!(!app.visual.active() && app.visual.is_empty() && !app.parent_select_pending);
+    }
+    for width in 1..=45 {
+        app.visual.enter(ROOT, Some(1));
+        let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(width, 5)).unwrap();
+        narrow.draw(|frame| app.draw(frame, false, false)).unwrap();
+        for (area, text) in [
+            (app.help_area, "? help"),
+            (
+                app.header_delete_area,
+                if app.header_delete_area.width == 10 {
+                    "[D] delete"
+                } else {
+                    "delete"
+                },
+            ),
+        ] {
+            if !area.is_empty() {
+                assert_eq!(area.width as usize, text.len());
+                assert!(area.right() <= width);
+                for (offset, ch) in text.chars().enumerate() {
+                    assert_eq!(
+                        narrow.backend().buffer()[(area.x + offset as u16, area.y)].symbol(),
+                        ch.to_string()
+                    );
                 }
             }
         }
+        if width >= 10 {
+            assert!(!app.selection_clear_area.is_empty());
+            assert!(
+                rendered(&narrow)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("1 selected")
+            );
+        }
     }
-    assert!(differences.is_empty(), "{}", differences.join("\n"));
-    for height in 0..=100 {
-        let area = Rect::new(7, 9, 50, height);
-        let reference = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(area);
-        assert_eq!(
-            &split_edges(area, Direction::Vertical, 0, 2)[1..],
-            reference.as_ref(),
+}
+
+#[test]
+fn parent_press_does_not_activate_after_crossing_header_controls_or_breadcrumbs() {
+    let mut app = browser_fixture_at(PathBuf::from("/outside/fixture"));
+    app.directory = 5;
+    app.selected = None;
+    app.reset_order(false);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let parent = app.parent_area;
+    let crumb = app
+        .breadcrumbs
+        .hits
+        .iter()
+        .find(|(_, id)| *id == ROOT)
+        .unwrap()
+        .0;
+    let help = app.help_area;
+    for (kind, destination) in [
+        (MouseEventKind::Drag(MouseButton::Left), crumb),
+        (MouseEventKind::Moved, crumb),
+        (MouseEventKind::Moved, help),
+    ] {
+        app.mouse(control_event(
+            MouseEventKind::Down(MouseButton::Left),
+            parent,
+        ));
+        assert!(app.parent_press.is_some());
+        let motion = control_event(kind, destination);
+        if app.control_mouse(motion, false).is_none() {
+            app.mouse(motion);
+        }
+        app.mouse(control_event(MouseEventKind::Up(MouseButton::Left), parent));
+        assert_eq!(app.directory, 5);
+        assert!(app.parent_press.is_none());
+    }
+}
+
+fn click_dialog_option(app: &mut App, key: KeyCode, deleting: bool) -> Option<Action> {
+    let option = app
+        .dialog_mouse
+        .options
+        .iter()
+        .flatten()
+        .find(|option| option.key.code == key)
+        .copied()
+        .expect("painted option");
+    assert!(matches!(
+        app.modal_option_mouse(
+            control_event(MouseEventKind::Down(MouseButton::Left), option.area),
+            deleting
+        ),
+        Some(Action::Continue)
+    ));
+    app.modal_option_mouse(
+        control_event(MouseEventKind::Up(MouseButton::Left), option.area),
+        deleting,
+    )
+}
+
+#[test]
+fn dialog_options_reuse_pending_confirmation_and_cancellation() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    let anchor = Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap());
+    app.modal = Some(Modal::Delete {
+        id: 1,
+        anchor,
+        relative: PathBuf::from("child"),
+        target: "child".to_owned(),
+        scroll: 0,
+        reviewable: false,
+        confirm_requested: false,
+        confirmed: None,
+        capture: None,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, false),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            confirm_requested: true,
+            ..
+        })
+    ));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Esc, false),
+        Some(Action::Continue)
+    ));
+    assert!(app.modal.is_none());
+    app.modal = Some(Modal::Batch {
+        target: "/selected/folder".to_owned(),
+        count: 0,
+        ready: false,
+        reviewable: false,
+        confirm_requested: false,
+        scroll: 0,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, false),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Batch {
+            confirm_requested: true,
+            ..
+        })
+    ));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Esc, false),
+        Some(Action::BatchCancel)
+    ));
+    assert!(app.modal.is_none());
+    app.modal = Some(Modal::Quit { reviewable: false });
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, true),
+        Some(Action::Quit)
+    ));
+    let mut tiny = Terminal::new(ratatui::backend::TestBackend::new(18, 5)).unwrap();
+    app.modal = Some(Modal::Batch {
+        target: "hidden target".to_owned(),
+        count: 2,
+        ready: true,
+        reviewable: false,
+        confirm_requested: false,
+        scroll: 0,
+    });
+    tiny.draw(|frame| app.draw(frame, false, false)).unwrap();
+    assert!(
+        app.dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .all(|option| option.key.code != KeyCode::Enter)
+    );
+}
+
+#[test]
+fn dialog_option_presses_reject_motion_resize_and_replaced_targets() {
+    for mutation in 0..4 {
+        let mut app = browser_fixture();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        app.modal = Some(Modal::Batch {
+            target: "original target".to_owned(),
+            count: 2,
+            ready: true,
+            reviewable: false,
+            confirm_requested: false,
+            scroll: 0,
+        });
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        let option = app
+            .dialog_mouse
+            .options
+            .iter()
+            .flatten()
+            .find(|option| option.key.code == KeyCode::Enter)
+            .copied()
+            .unwrap();
+        app.modal_option_mouse(
+            control_event(MouseEventKind::Down(MouseButton::Left), option.area),
+            false,
         );
+        match mutation {
+            0 => {
+                app.modal_option_mouse(
+                    control_event(MouseEventKind::Drag(MouseButton::Left), option.area),
+                    false,
+                );
+            }
+            1 => {
+                let mut narrow = Terminal::new(ratatui::backend::TestBackend::new(79, 24)).unwrap();
+                narrow.draw(|frame| app.draw(frame, false, false)).unwrap();
+            }
+            2 => {
+                let replacement = Modal::Batch {
+                    target: "replacement target".to_owned(),
+                    count: 3,
+                    ready: true,
+                    reviewable: false,
+                    confirm_requested: false,
+                    scroll: 0,
+                };
+                app.modal = Some(replacement);
+                terminal
+                    .draw(|frame| app.draw(frame, false, false))
+                    .unwrap();
+            }
+            _ => {
+                app.key(
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+            }
+        }
+        assert!(!matches!(
+            app.modal_option_mouse(
+                control_event(MouseEventKind::Up(MouseButton::Left), option.area),
+                false
+            ),
+            Some(Action::BatchConfirm)
+        ));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Batch {
+                confirm_requested: false,
+                ..
+            })
+        ));
     }
+}
+
+#[test]
+fn scrolling_dialogs_accept_wheel_and_draw_bounded_scrollbars() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    app.modal = Some(Modal::help(false));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let popup = app.dialog_mouse.scroll_area;
+    assert!(rendered(&terminal).contains('█'));
+    assert!(!rendered(&terminal).contains("Enter / Esc: close"));
+    app.mouse(control_event(MouseEventKind::ScrollDown, popup));
+    assert!(matches!(app.modal, Some(Modal::Text { scroll: 3, .. })));
+    app.mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(matches!(app.modal, Some(Modal::Text { scroll: 3, .. })));
+    app.mouse(control_event(MouseEventKind::ScrollUp, popup));
+    assert!(matches!(app.modal, Some(Modal::Text { scroll: 0, .. })));
+    app.modal = Some(Modal::Batch {
+        target: "long folder name/".repeat(120),
+        count: 2,
+        ready: true,
+        reviewable: false,
+        confirm_requested: false,
+        scroll: 0,
+    });
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let popup = app.dialog_mouse.scroll_area;
+    app.mouse(control_event(MouseEventKind::ScrollDown, popup));
+    assert!(matches!(app.modal, Some(Modal::Batch { scroll: 3, .. })));
+    app.modal = None;
+    app.delete_notices.push_back(DeleteReport {
+        target: "/many/failures".to_owned(),
+        errors: (0..40_000)
+            .map(|_| DeleteError {
+                path: PathBuf::from("/many/failures/entry"),
+                message: "denied".to_owned(),
+            })
+            .collect(),
+    });
+    app.show_delete_notice();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), None, false);
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    let popup = app.dialog_mouse.scroll_area;
+    let before = match app.modal {
+        Some(Modal::DeleteErrors { scroll, .. }) => scroll,
+        _ => unreachable!(),
+    };
+    assert!(before > usize::from(u16::MAX));
+    app.mouse(control_event(MouseEventKind::ScrollUp, popup));
+    assert!(matches!(app.modal, Some(Modal::DeleteErrors { scroll, .. }) if scroll == before - 3));
+    app.mouse(control_event(MouseEventKind::ScrollRight, popup));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::DeleteErrors { horizontal: 8, .. })
+    ));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(rendered(&terminal).contains('█'));
+}
+
+#[test]
+fn header_right_click_requests_quit_over_every_label_and_preserves_modes_on_no() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+    for mode in 0..6 {
+        app.modal = None;
+        app.visual.exit();
+        app.filter_editing = false;
+        app.filter.clear();
+        match mode {
+            1 => app.visual.enter(ROOT, Some(1)),
+            2 => {
+                app.filter_editing = true;
+                app.filter = "keep query".to_owned();
+            }
+            3 => {
+                app.visual.enter(ROOT, Some(1));
+                app.filter_editing = true;
+                app.filter = "keep query".to_owned();
+            }
+            4 => app.modal = Some(Modal::info("keep this dialog".to_owned())),
+            5 => {
+                app.modal = Some(Modal::Queue {
+                    selected: None,
+                    offset: None,
+                })
+            }
+            _ => {}
+        }
+        let original = app.control_dialog();
+        let visual = app.visual.active();
+        let count = app.visual.len();
+        let filter = app.filter.clone();
+        let editing = app.filter_editing;
+        for column in [0, 25, 50, 94, 99] {
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let position = Rect::new(column, 0, 1, 1);
+            assert!(matches!(
+                app.header_right_mouse(control_event(
+                    MouseEventKind::Up(MouseButton::Right),
+                    position
+                )),
+                Some(Action::Continue)
+            ));
+            assert_eq!(app.control_dialog(), original);
+            assert!(matches!(
+                app.header_right_mouse(control_event(
+                    MouseEventKind::Down(MouseButton::Right),
+                    position
+                )),
+                Some(Action::Continue)
+            ));
+            assert_eq!(
+                app.control_dialog(),
+                original,
+                "right press must not open the question yet"
+            );
+            assert!(matches!(
+                app.header_right_mouse(control_event(
+                    MouseEventKind::Up(MouseButton::Right),
+                    position
+                )),
+                Some(Action::Continue)
+            ));
+            assert!(matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(matches!(
+                app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false),
+                Action::Continue
+            ));
+            assert_eq!(app.control_dialog(), original);
+            assert_eq!(
+                (app.visual.active(), app.visual.len(), app.filter_editing),
+                (visual, count, editing)
+            );
+            assert_eq!(app.filter, filter);
+        }
+    }
+}
+
+#[test]
+fn header_right_click_rejects_drag_key_resize_and_replaced_dialogs() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+    let position = Rect::new(3, 0, 1, 1);
+    for interruption in 0..6 {
+        app.modal = None;
+        terminal
+            .draw(|frame| app.draw(frame, false, false))
+            .unwrap();
+        app.header_right_mouse(control_event(
+            MouseEventKind::Down(MouseButton::Right),
+            position,
+        ));
+        assert!(app.header_right_press.is_some());
+        match interruption {
+            0 => {
+                app.header_right_mouse(control_event(
+                    MouseEventKind::Drag(MouseButton::Right),
+                    position,
+                ));
+            }
+            1 => {
+                app.header_right_mouse(control_event(MouseEventKind::Moved, Rect::new(4, 0, 1, 1)));
+            }
+            2 => {
+                app.header_right_mouse(control_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    position,
+                ));
+            }
+            3 => {
+                app.key(
+                    KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                    None,
+                    false,
+                );
+            }
+            4 => {
+                let mut resized =
+                    Terminal::new(ratatui::backend::TestBackend::new(79, 12)).unwrap();
+                resized.draw(|frame| app.draw(frame, false, false)).unwrap();
+            }
+            _ => {
+                app.modal = Some(Modal::info("arrived after the press".to_owned()));
+            }
+        }
+        app.header_right_mouse(control_event(
+            MouseEventKind::Up(MouseButton::Right),
+            position,
+        ));
+        assert!(!matches!(app.modal, Some(Modal::ConfirmQuit { .. })));
+        assert!(app.header_right_press.is_none());
+    }
+}
+
+#[test]
+fn quit_confirmation_preserves_reports_and_requires_only_one_yes() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    app.delete_notices.push_back(DeleteReport::single(
+        PathBuf::from("/failed/target"),
+        "denied".to_owned(),
+    ));
+    app.show_delete_notice();
+    app.request_quit_confirmation();
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert!(rendered(&terminal).contains("Quit LDU?"));
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Esc, true),
+        Some(Action::Continue)
+    ));
+    assert!(matches!(app.modal, Some(Modal::DeleteErrors { .. })));
+    assert_eq!(app.delete_notices.len(), 1);
+    app.request_quit_confirmation();
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, true),
+        Some(Action::QuitWarning)
+    ));
+    assert!(app.finishing_deletions());
+    assert!(matches!(
+        app.previous_modal,
+        Some(Modal::DeleteErrors { .. })
+    ));
+    assert_eq!(app.delete_notices.len(), 1);
+    // Reopening the explicit prompt must preserve an already-admitted exit.
+    app.request_quit_confirmation();
+    assert!(app.finishing_deletions());
+    terminal.draw(|frame| app.draw(frame, false, true)).unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, true),
+        Some(Action::Continue)
+    ));
+    assert!(app.finishing_deletions());
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, true);
+    assert!(matches!(app.modal, Some(Modal::DeleteErrors { .. })));
+    app.request_quit_confirmation();
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, false),
+        Some(Action::Quit)
+    ));
+    assert_eq!(app.delete_notices.len(), 1);
+}
+
+#[test]
+fn quit_prompt_suspends_auto_confirmation_but_keeps_validation_results() {
+    let mut app = browser_fixture();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    let (sender, receiver) = bounded(1);
+    app.modal = Some(Modal::Delete {
+        id: 2,
+        anchor: Arc::new(RootAnchor::open(std::path::Path::new(".")).unwrap()),
+        relative: PathBuf::from("root-file"),
+        target: "/fixture/root-file".to_owned(),
+        scroll: 0,
+        reviewable: true,
+        confirm_requested: true,
+        confirmed: None,
+        capture: Some(receiver),
+    });
+    app.request_quit_confirmation();
+    sender.send(Ok(test_confirmed_target())).unwrap();
+    app.pump_confirmation();
+    assert!(!app.confirmation_ready());
+    assert!(matches!(
+        app.background_modal_slot(),
+        Some(Modal::Delete {
+            confirmed: Some(_),
+            confirm_requested: false,
+            reviewable: false,
+            ..
+        })
+    ));
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    click_dialog_option(&mut app, KeyCode::Esc, false);
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+    assert!(matches!(
+        click_dialog_option(&mut app, KeyCode::Enter, false),
+        Some(Action::Delete(2, _, _, _))
+    ));
+    app.modal = Some(Modal::Batch {
+        target: "/fixture".to_owned(),
+        count: 0,
+        ready: false,
+        reviewable: true,
+        confirm_requested: true,
+        scroll: 0,
+    });
+    app.request_quit_confirmation();
+    if let Some(Modal::Batch { ready, count, .. }) = batch_modal(&mut app) {
+        *ready = true;
+        *count = 2;
+    } else {
+        panic!("suspended batch lost its validation destination");
+    }
+    assert!(!app.confirmation_ready());
+    terminal
+        .draw(|frame| app.draw(frame, false, false))
+        .unwrap();
+    click_dialog_option(&mut app, KeyCode::Esc, false);
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Batch {
+            count: 2,
+            ready: true,
+            confirm_requested: false,
+            ..
+        })
+    ));
 }
