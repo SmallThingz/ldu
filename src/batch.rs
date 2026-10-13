@@ -170,13 +170,13 @@ impl BatchCapture {
     #[cfg(test)]
     pub fn event(&self) -> Option<BatchEvent> {
         let event = self.events.try_recv().ok();
-        if event.is_none() {
-            if let Some(finish) = self.after_empty.borrow_mut().take() {
-                for event in finish.events {
-                    assert!(finish.output.try_send(event).is_ok());
-                }
-                self.finished.store(true, Ordering::Release);
+        if event.is_none()
+            && let Some(finish) = self.after_empty.borrow_mut().take()
+        {
+            for event in finish.events {
+                assert!(finish.output.try_send(event).is_ok());
             }
+            self.finished.store(true, Ordering::Release);
         }
         event
     }

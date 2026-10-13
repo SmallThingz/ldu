@@ -258,25 +258,25 @@ impl VisualSelection {
         if self.range.as_ref().is_some_and(|range| range.mode != mode) {
             self.restart_range(lead, mode);
         }
-        if let Some(range) = &self.range {
-            if !range.snapshot.positions.contains_key(&lead) {
-                if !snapshot.positions.contains_key(&lead) {
-                    return false;
-                }
-                let boundary = if range.desired.0 == range.anchor {
-                    range.desired.1
-                } else {
-                    range.desired.0
-                };
-                self.clear_pending_range();
-                self.pending_range = Some(PendingRange {
-                    snapshot,
-                    lead,
-                    mode,
-                    boundary,
-                });
-                return true;
+        if let Some(range) = &self.range
+            && !range.snapshot.positions.contains_key(&lead)
+        {
+            if !snapshot.positions.contains_key(&lead) {
+                return false;
             }
+            let boundary = if range.desired.0 == range.anchor {
+                range.desired.1
+            } else {
+                range.desired.0
+            };
+            self.clear_pending_range();
+            self.pending_range = Some(PendingRange {
+                snapshot,
+                lead,
+                mode,
+                boundary,
+            });
+            return true;
         }
         self.clear_pending_range();
         if self.range.is_none() {
@@ -327,16 +327,16 @@ impl VisualSelection {
         self.flush_retired();
         let mut progressed = false;
         for _ in 0..limit {
-            if !self.range_pending() {
-                if let Some(next) = &mut self.pending_range {
-                    // A deleted endpoint may leave a long missing span. Find a
-                    // surviving shared boundary one slot per budget step before
-                    // starting the next segment, preserving its existing mark.
-                    let range = self.range.as_ref().expect("pending segment has a range");
-                    let id = range.snapshot.ids[next.boundary];
-                    let boundary = if !range.excluded.contains(&id)
-                        && next.snapshot.positions.contains_key(&id)
-                    {
+            if !self.range_pending()
+                && let Some(next) = &mut self.pending_range
+            {
+                // A deleted endpoint may leave a long missing span. Find a
+                // surviving shared boundary one slot per budget step before
+                // starting the next segment, preserving its existing mark.
+                let range = self.range.as_ref().expect("pending segment has a range");
+                let id = range.snapshot.ids[next.boundary];
+                let boundary =
+                    if !range.excluded.contains(&id) && next.snapshot.positions.contains_key(&id) {
                         Some(Some(id))
                     } else if next.boundary == range.anchor {
                         Some(None)
@@ -348,22 +348,21 @@ impl VisualSelection {
                         };
                         None
                     };
-                    progressed = true;
-                    if let Some(boundary) = boundary {
-                        let excluded = range.excluded.clone();
-                        let explicit_anchor = range.explicit_anchor;
-                        let next = self.pending_range.take().expect("pending segment exists");
-                        self.reanchor(boundary.unwrap_or(next.lead));
-                        self.preserve_anchor = boundary.is_some();
-                        self.begin_range(next.snapshot, next.lead, next.mode);
-                        let range = self.range.as_mut().expect("next segment exists");
-                        range.excluded = excluded;
-                        // Only a user toggle owns this override. The new shared
-                        // boundary is protected separately by preserve_anchor.
-                        range.explicit_anchor = explicit_anchor;
-                    }
-                    continue;
+                progressed = true;
+                if let Some(boundary) = boundary {
+                    let excluded = range.excluded.clone();
+                    let explicit_anchor = range.explicit_anchor;
+                    let next = self.pending_range.take().expect("pending segment exists");
+                    self.reanchor(boundary.unwrap_or(next.lead));
+                    self.preserve_anchor = boundary.is_some();
+                    self.begin_range(next.snapshot, next.lead, next.mode);
+                    let range = self.range.as_mut().expect("next segment exists");
+                    range.excluded = excluded;
+                    // Only a user toggle owns this override. The new shared
+                    // boundary is protected separately by preserve_anchor.
+                    range.explicit_anchor = explicit_anchor;
                 }
+                continue;
             }
             let Some(range) = &mut self.range else {
                 break;
@@ -558,7 +557,10 @@ mod tests {
         assert!(!selection.contains(3));
         assert!(selection.contains(259));
         finish(&mut selection);
-        assert_eq!(selection.snapshot(), [1u32, 699].into_iter().collect());
+        assert_eq!(
+            selection.snapshot(),
+            [1u32, 699].into_iter().collect::<HashSet<NodeId>>()
+        );
 
         // A resort cannot change the subtraction interval, and contraction
         // restores only the rows that were marked before this gesture.
@@ -597,7 +599,10 @@ mod tests {
         assert!(selection.is_empty());
         selection.begin_range(Arc::clone(&extended), 4, RangeMode::Remove);
         finish(&mut selection);
-        assert_eq!(selection.snapshot(), [5u32].into_iter().collect());
+        assert_eq!(
+            selection.snapshot(),
+            [5u32].into_iter().collect::<HashSet<NodeId>>()
+        );
 
         selection.deselect(5);
         selection.deselect(5);
@@ -607,7 +612,10 @@ mod tests {
         );
         selection.begin_range(extended, 2, RangeMode::Add);
         finish(&mut selection);
-        assert_eq!(selection.snapshot(), [2u32, 3, 4].into_iter().collect());
+        assert_eq!(
+            selection.snapshot(),
+            [2u32, 3, 4].into_iter().collect::<HashSet<NodeId>>()
+        );
     }
 
     #[test]

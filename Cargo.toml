@@ -2,36 +2,41 @@
 name = "ldu"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "MIT"
 description = "Live disk usage with effort-first scanning"
 repository = "https://github.com/SmallThingz/ldu"
 
 [dependencies]
-arc-swap = "1.7"
-im = "15.1"
-clap = { version = "4.5", features = ["derive"] }
-crossbeam-channel = "0.5"
+arc-swap = "1.9.2"
+im = { package = "imbl", version = "7.0.2" }
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
 # Level-triggered polling preserves simultaneous resize and keyboard input.
-crossterm = { version = "0.28", features = ["use-dev-tty"] }
-ctrlc = { version = "3.5", features = ["termination"] }
-ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
-rayon = "1.11"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "termios", "process", "event"] }
+rustix = { version = "1.1.5", features = ["fs", "termios", "process", "event"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))'.dependencies]
+compio-driver = { version = "0.12.5", default-features = false, features = ["io-uring"] }
+compio-buf = { version = "0.8.3", default-features = false }
+io-uring = { version = "0.7.15", default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 

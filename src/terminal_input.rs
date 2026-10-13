@@ -76,7 +76,7 @@ impl Waiter {
         use std::time::Duration;
 
         // The outer crossterm reader can answer a zero-time poll. Its Unix
-        // source cannot: crossterm 0.28's tty.rs skips even parser.next() when
+        // source cannot: crossterm 0.29's tty.rs skips even parser.next() when
         // the timeout is zero. After a successful read, drain that inner parser
         // with a positive timeout before waiting for more descriptor activity.
         if crossterm::event::poll(Duration::ZERO)? {

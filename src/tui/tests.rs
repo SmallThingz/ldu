@@ -4241,7 +4241,7 @@ fn control_click_deselects_without_adding_and_wins_over_shift() {
                 finish_visual(&mut app);
                 assert_eq!(
                     app.visual.snapshot(),
-                    [3u32, 5].into_iter().collect(),
+                    [3u32, 5].into_iter().collect::<im::HashSet<NodeId>>(),
                     "deferred={deferred}, marked={marked}, shift={shift}"
                 );
                 assert_eq!(app.selected, Some(4));

@@ -4446,7 +4446,10 @@ fn pump_batch(
             }
             let candidate = if let Some(candidate) = preparation.pending.take() {
                 Some(candidate)
-            } else if let Some(id) = preparation.remaining.iter().next().copied() {
+            } else {
+                let Some(id) = preparation.remaining.iter().next().copied() else {
+                    break;
+                };
                 preparation.remaining.remove(&id);
                 status.productive = true;
                 if !app.model.is_live(id)
@@ -4463,8 +4466,6 @@ fn pump_batch(
                         ordinal,
                     )
                 })
-            } else {
-                None
             };
             let Some((id, relative, ordinal)) = candidate else {
                 break;

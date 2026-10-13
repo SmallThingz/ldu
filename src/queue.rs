@@ -604,10 +604,10 @@ impl DeleteQueue {
     fn covering_pending(&self, root: usize, path: &Path) -> Option<QueueId> {
         let paths = self.paths.get(&root)?;
         let empty = Path::new("");
-        if let Some(&id) = paths.get(empty) {
-            if !self.is_superseded(root, empty, id) {
-                return Some(id);
-            }
+        if let Some(&id) = paths.get(empty)
+            && !self.is_superseded(root, empty, id)
+        {
+            return Some(id);
         }
         // Ancestors arrive longest first. Keep the final eligible match to
         // preserve shortest-prefix coverage without allocating component keys.
@@ -616,10 +616,10 @@ impl DeleteQueue {
             .ancestors()
             .take_while(|path| !path.as_os_str().is_empty())
         {
-            if let Some(&id) = paths.get(prefix) {
-                if !self.is_superseded(root, prefix, id) {
-                    covering = Some(id);
-                }
+            if let Some(&id) = paths.get(prefix)
+                && !self.is_superseded(root, prefix, id)
+            {
+                covering = Some(id);
             }
         }
         covering
@@ -674,7 +674,7 @@ impl DeleteQueue {
                     .front_mut()
                     .expect("prune exists")
                     .paths
-                    .remove(&path);
+                    .remove(path.as_ref());
                 if let Some(entry) = self.remove_pending_inner(id) {
                     self.retired.push(Retired::Entry { _entry: entry });
                 }
@@ -685,8 +685,8 @@ impl DeleteQueue {
                     self.superseded_nodes.remove(&prune.node);
                 }
                 if let Some(markers) = self.superseded.get_mut(&prune.anchor) {
-                    if markers.get(&prune.prefix) == Some(&prune.ancestor) {
-                        markers.remove(&prune.prefix);
+                    if markers.get(prune.prefix.as_ref()) == Some(&prune.ancestor) {
+                        markers.remove(prune.prefix.as_ref());
                     }
                     if markers.is_empty() {
                         self.superseded.remove(&prune.anchor);
