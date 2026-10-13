@@ -783,7 +783,6 @@ fn headless_export_exports_deep_trees_without_recursive_serialization() {
     assert_eq!(total, expected);
 }
 
-#[cfg(target_os = "linux")]
 fn delete_result(
     anchor: &std::sync::Arc<ldu::backend::RootAnchor>,
     relative: &Path,
@@ -797,7 +796,6 @@ fn delete_result(
     result.outcome
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn confirmed_async_deletion_removes_owned_files_trees_and_links_without_following_targets() {
     let work = fixture();
@@ -831,7 +829,6 @@ fn confirmed_async_deletion_removes_owned_files_trees_and_links_without_followin
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn deletion_uses_the_original_root_anchor_and_rejects_symlinked_parent_replacement() {
     let work = fixture();
@@ -859,7 +856,6 @@ fn deletion_uses_the_original_root_anchor_and_rejects_symlinked_parent_replaceme
     assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"preserve");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn incremental_delete_keeps_the_scan_stream_and_promotes_a_late_hardlink_alias() {
     let work = fixture();
