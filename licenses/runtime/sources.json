@@ -1,7 +1,10 @@
 {
   "musl-COPYRIGHT.txt": {
     "url": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5",
-    "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
+    "platforms": [
+      "linux-musl"
+    ]
   },
   "compiler-builtins-LICENSE.txt": {
     "url": "https://raw.githubusercontent.com/rust-lang/rust/1.99.0/library/compiler-builtins/LICENSE.txt",
@@ -22,5 +25,149 @@
   "compiler-rt-CREDITS.txt": {
     "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/compiler-rt/CREDITS.TXT",
     "sha256": "a9901f47a089da41e4690682d00ce4cedaa2baf41fedbe79beee366d43ac2461"
+  },
+  "freebsd-14.5-common-crtbegin.c.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/crtbegin.c",
+    "sha256": "1590bc69d0d237426d37b6380214c8a5fa7ad23bee17fb93687d9ef02650a551",
+    "source_sha256": "d90ae7a02c3806245e076215fea08180af23324e7f8fe3f0400e3da030add609",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-crtbrand.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/crtbrand.S",
+    "sha256": "b4cde94617658373f4e0ef6c8374d63a92794db699eee4148d5f73ecc70ee761",
+    "source_sha256": "0dc8fa4bc6a94ee4e23bbb80309b56929890552fcd5528108c99bb1b4d749d45",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-crtend.c.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/crtend.c",
+    "sha256": "1590bc69d0d237426d37b6380214c8a5fa7ad23bee17fb93687d9ef02650a551",
+    "source_sha256": "4c63f704764ddd312139a4f6d0ffe353213f0a156dd17d77ed232ed77d489508",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-csu_common.h.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/csu_common.h",
+    "sha256": "efb43d32b08e79c12595fff6523067428e36b79efd2b714fa923b06deb1b52de",
+    "source_sha256": "edd016161457c021442259767f63c9cc0341481a6efa0aa61158a9ad397b3565",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-feature_note.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/feature_note.S",
+    "sha256": "b4cde94617658373f4e0ef6c8374d63a92794db699eee4148d5f73ecc70ee761",
+    "source_sha256": "09cdee20e6baedcdc65710b951c3556466bb2bee362263568715d84d17424480",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-ignore_init_note.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/ignore_init_note.S",
+    "sha256": "f594a2eb0ae76481ae866ebc16ca3a453cce14d815f1791683eeb99bd48ab6d3",
+    "source_sha256": "39c78d447b7bc91a8daf52492d5ec4bb14a8d94f7e122122e707a3d67ab5241f",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-common-notes.h.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/common/notes.h",
+    "sha256": "7eb3b114e8b8970f2885c894a070be65ebf5f4016c686405aac6b2b86c3852c9",
+    "source_sha256": "9b59ed99abe81c9b1fb4cc51b2e1760bec2c3e0c6443a06c22d3cc6966d8785d",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-amd64-crt.h.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/amd64/crt.h",
+    "sha256": "1590bc69d0d237426d37b6380214c8a5fa7ad23bee17fb93687d9ef02650a551",
+    "source_sha256": "a3d8413a68097ae11a04d9a003e434556fda1080ff11ba043f5e9cafbc47181f",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-amd64-crt1_c.c.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/amd64/crt1_c.c",
+    "sha256": "accb29febb0740c7c7f280bf6a4145323289c986ee851004303d0bcdee1e2c78",
+    "source_sha256": "91335796667623cc5270a7d6d4edbf65efa7424a9864f8fb69ad9f8ddcd62a45",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-amd64-crt1_s.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/amd64/crt1_s.S",
+    "sha256": "689f3bfde29ee5043f790db2e212666524c60ac85348c8be736b4bca18d73acd",
+    "source_sha256": "17a98aaa876b0c9732f43d935325197ae57c28e80bb345bcfa8eacdc0456b526",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-amd64-crti.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/amd64/crti.S",
+    "sha256": "e0aa0cb72e256fc516bf0efa51212b65045db3d01c4e73e9ade18b3ae511d519",
+    "source_sha256": "c6de85fe10a2f33a469cc80fbc6af322792db578d435568e510cb629f3f424de",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-amd64-crtn.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/amd64/crtn.S",
+    "sha256": "e0aa0cb72e256fc516bf0efa51212b65045db3d01c4e73e9ade18b3ae511d519",
+    "source_sha256": "ecf3c3ea5629488e837ecd0de0585c4f3f8c7cfa391bda8de89bc595036cc618",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-aarch64-crt1_c.c.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/aarch64/crt1_c.c",
+    "sha256": "c616128618c39775434380c853f15f679444d2233cd92bc8b8bc754a55d7b813",
+    "source_sha256": "46b1a2d7c372e284a8831edc7278f2724294514f5afa93656b8a5f43c595aa11",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-aarch64-crt1_s.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/aarch64/crt1_s.S",
+    "sha256": "c616128618c39775434380c853f15f679444d2233cd92bc8b8bc754a55d7b813",
+    "source_sha256": "d9dc0d819a4ab24c0ed959bc8bbf6277001513f0aec63f676d499e96ff612e08",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-aarch64-crti.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/aarch64/crti.S",
+    "sha256": "964cd63fbc8fb3b117b2bdf73898c390f58c3160d4c8e599b3fa762d20948271",
+    "source_sha256": "f4cdf1f4406568cfbb4810a915bb35cf3716f0fd9418ca4253ee5e3dfa225c40",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
+  },
+  "freebsd-14.5-aarch64-crtn.S.txt": {
+    "url": "https://raw.githubusercontent.com/freebsd/freebsd-src/4099b5c828800776fda3eccd6537ceed638a2a8b/lib/csu/aarch64/crtn.S",
+    "sha256": "964cd63fbc8fb3b117b2bdf73898c390f58c3160d4c8e599b3fa762d20948271",
+    "source_sha256": "825c506096096f180ef608a65bd668a9b7835179cb3da589f9e865574ed3423f",
+    "extraction": "complete leading comment blocks",
+    "platforms": [
+      "freebsd"
+    ]
   }
 }

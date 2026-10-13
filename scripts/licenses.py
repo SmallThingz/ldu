@@ -3,7 +3,7 @@
 The Cargo graph is filtered to the release target and normal dependency edges.
 Procedural macro dependencies are retained conservatively because they generate
 code. Rust's own standard-library attribution catalog is also kept intact: it
-covers implementation details that cannot safely be inferred from ELF symbols.
+covers implementation details that cannot safely be inferred from binary symbols.
 Only byte-identical license bodies are shared; package/source associations and
 all copyright, exception and third-party notices remain in the readable catalog.
 """
@@ -273,11 +273,28 @@ def add_rust_library(book, base, toolchain):
 
 
 def add_runtime(book, root, target):
-    require("-linux-musl" in target, "Release notices require a Linux musl target")
+    if "-linux-musl" in target:
+        system = "linux-musl"
+    elif target.endswith("-unknown-freebsd"):
+        system = "freebsd"
+    elif target.endswith("-apple-darwin"):
+        system = "darwin"
+    else:
+        raise RuntimeError("Release notices require a Linux musl, FreeBSD or macOS target")
     bundled = root / "licenses" / "runtime"
     sources = json.loads((bundled / "sources.json").read_text(encoding="utf-8"))
-    require("musl-COPYRIGHT.txt" in sources, "Missing musl notice provenance")
+    if system == "linux-musl":
+        require("musl-COPYRIGHT.txt" in sources, "Missing musl notice provenance")
+    elif system == "freebsd":
+        require(any(name.startswith("freebsd-14.5-") for name in sources),
+                "Missing FreeBSD startup notice provenance")
     for name, source in sorted(sources.items()):
+        platforms = source.get("platforms")
+        # Older inventories predate target filters; musl was their only OS runtime.
+        if platforms is None and name == "musl-COPYRIGHT.txt":
+            platforms = ["linux-musl"]
+        if platforms is not None and system not in platforms:
+            continue
         require(Path(name).name == name, "Invalid runtime notice filename")
         content = (bundled / name).read_bytes()
         require(hashlib.sha256(content).hexdigest() == source["sha256"],

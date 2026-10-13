@@ -177,10 +177,26 @@ class NoticeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
                 licenses.add_runtime(licenses.NoticeBook(), root, "x86_64-unknown-linux-musl")
 
-    def test_non_musl_runtime_is_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "musl target"):
+    def test_unsupported_runtime_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "Linux musl, FreeBSD or macOS"):
             licenses.add_runtime(licenses.NoticeBook(), Path("."), "x86_64-unknown-linux-gnu")
 
+
+    def test_runtime_notices_follow_the_target_platform(self):
+        root = Path(__file__).resolve().parents[1]
+        for target, wanted, unwanted in [
+            ("x86_64-unknown-linux-musl", b"musl-COPYRIGHT.txt", b"freebsd-14.5-"),
+            ("aarch64-unknown-freebsd", b"freebsd-14.5-", b"musl-COPYRIGHT.txt"),
+            ("aarch64-apple-darwin", b"compiler-builtins-LICENSE.txt", b"musl-COPYRIGHT.txt"),
+        ]:
+            with self.subTest(target=target):
+                book = licenses.NoticeBook()
+                licenses.add_runtime(book, root, target)
+                rendered = book.render()
+                self.assertIn(wanted, rendered)
+                self.assertNotIn(unwanted, rendered)
+                if "apple" in target:
+                    self.assertNotIn(b"freebsd-14.5-", rendered)
 
     def test_upx_preserves_exception_license_and_current_authors_only_when_requested(self):
         with tempfile.TemporaryDirectory() as directory:

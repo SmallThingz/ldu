@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare and smoke-test Linux release binaries (Python 3.11+, Git, Rust 1.99.0)."""
+"""Prepare and smoke-test Linux, FreeBSD and macOS release binaries (Python 3.11+, Git, Rust 1.99.0)."""
 
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,10 @@ TARGETS = {
     "aarch64-unknown-linux-musl",
     "armv7-unknown-linux-musleabihf",
     "riscv64gc-unknown-linux-musl",
+    "x86_64-unknown-freebsd",
+    "aarch64-unknown-freebsd",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
 }
 TOOLCHAIN = "1.99.0"
 UPX_VERSION = "5.2.1"
@@ -34,10 +39,10 @@ UPX_SHA256 = {
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def run(command, timeout=120):
+def run(command, timeout=120, env=None):
     result = subprocess.run(
         [str(part) for part in command], cwd=ROOT, check=False, timeout=timeout,
-        stdout=subprocess.PIPE, text=True, encoding="utf-8",
+        stdout=subprocess.PIPE, text=True, encoding="utf-8", env=env,
     )
     if result.returncode:
         print(result.stdout, flush=True)
@@ -58,15 +63,171 @@ def binary_for(target):
     return ROOT / "target" / target / "release" / "ldu"
 
 
-def check_architecture(data, target):
+def target_system(target):
+    require(target in TARGETS, f"Unsupported release target: {target}")
+    if target.endswith("-apple-darwin"):
+        return "Darwin"
+    if target.endswith("-unknown-freebsd"):
+        return "FreeBSD"
+    return "Linux"
+
+
+def bounded(data, offset, size):
+    require(0 <= offset <= len(data) and 0 <= size <= len(data) - offset,
+            "Truncated executable structure")
+    return data[offset:offset + size]
+
+
+def c_string(data, offset):
+    require(0 <= offset < len(data), "Invalid executable string offset")
+    end = data.find(b"\0", offset)
+    require(end >= offset, "Unterminated executable string")
+    return data[offset:end].decode("utf-8", errors="strict")
+
+
+def inspect_elf(data, target):
     expected = {"x86_64": 62, "aarch64": 183, "armv7": 40, "riscv64gc": 243}
-    require(len(data) >= 20 and data[:4] == b"\x7fELF" and data[5] == 1,
+    require(len(data) >= 20 and data[:4] == b"\x7fELF" and data[5:7] == b"\x01\x01",
             "Expected little-endian ELF")
-    expected_class = 1 if target.startswith("armv7-") else 2
-    require(data[4] == expected_class, f"Wrong ELF class for {target}")
-    actual = struct.unpack_from("<H", data, 18)[0]
-    require(actual == expected[target.split("-")[0]],
+    is_32 = target.startswith("armv7-")
+    require(data[4] == (1 if is_32 else 2), f"Wrong ELF class for {target}")
+    require(struct.unpack_from("<H", data, 18)[0] == expected[target.split("-")[0]],
             f"Wrong executable architecture for {target}")
+    system = target_system(target)
+    require(data[7] == 9 if system == "FreeBSD" else data[7] in (0, 3),
+            f"Wrong ELF OS ABI for {target}")
+    require(struct.unpack_from("<H", data, 16)[0] in (2, 3), "ELF is not executable")
+    bounded(data, 0, 52 if is_32 else 64)
+    if is_32:
+        phoff = struct.unpack_from("<I", data, 28)[0]
+        phsize, phnum = struct.unpack_from("<HH", data, 42)
+    else:
+        phoff = struct.unpack_from("<Q", data, 32)[0]
+        phsize, phnum = struct.unpack_from("<HH", data, 54)
+    require(phnum > 0 and phsize == (32 if is_32 else 56), "Invalid ELF program headers")
+    bounded(data, phoff, phsize * phnum)
+    segments, dynamic, interpreters = [], [], []
+    for index in range(phnum):
+        offset = phoff + index * phsize
+        if is_32:
+            kind, start, address, _, size = struct.unpack_from("<IIIII", data, offset)
+        else:
+            kind, _, start, address, _, size = struct.unpack_from("<IIQQQQ", data, offset)
+        content = bounded(data, start, size)
+        if kind == 1:
+            segments.append((address, start, size))
+        elif kind == 3:
+            interpreters.append(c_string(content, 0))
+        elif kind == 2:
+            entry_size = 8 if is_32 else 16
+            require(size % entry_size == 0, "Invalid ELF dynamic table")
+            terminated = False
+            for entry in range(0, size, entry_size):
+                tag, value = struct.unpack_from("<II" if is_32 else "<QQ", content, entry)
+                if tag == 0:
+                    terminated = True
+                    break
+                dynamic.append((tag, value))
+            require(terminated, "Unterminated ELF dynamic table")
+    needed_offsets = [value for tag, value in dynamic if tag == 1]
+    libraries = []
+    if needed_offsets:
+        tables = [value for tag, value in dynamic if tag == 5]
+        sizes = [value for tag, value in dynamic if tag == 10]
+        require(len(tables) == len(sizes) == 1, "Missing ELF dynamic string table")
+        matches = [(start + tables[0] - address, sizes[0])
+                   for address, start, size in segments
+                   if address <= tables[0] and tables[0] + sizes[0] <= address + size]
+        require(len(matches) == 1, "Invalid ELF dynamic string table")
+        strings = bounded(data, *matches[0])
+        libraries = [c_string(strings, offset) for offset in needed_offsets]
+    if system == "Linux":
+        require(not interpreters and not libraries, "musl release must be statically linked")
+    else:
+        require(interpreters == ["/libexec/ld-elf.so.1"],
+                "FreeBSD releases require the base-system dynamic loader")
+        allowed = {"libc.so.7", "libm.so.5", "libthr.so.3", "librt.so.1", "libgcc_s.so.1",
+                   "libutil.so.9", "libexecinfo.so.1"}
+        require(libraries and set(libraries) <= allowed,
+                f"Unexpected FreeBSD shared libraries: {libraries}")
+        require(not any(tag in (15, 29) for tag, _ in dynamic),
+                "FreeBSD releases must not depend on a custom library search path")
+    return {"format": "ELF", "static": not interpreters and not libraries,
+            "interpreter": interpreters[0] if interpreters else None,
+            "libraries": libraries}
+
+
+def inspect_macho(data, target):
+    bounded(data, 0, 32)
+    require(data[:4] == b"\xcf\xfa\xed\xfe", "Expected little-endian 64-bit Mach-O")
+    cpu, _, kind, commands, command_bytes = struct.unpack_from("<IIIII", data, 4)
+    expected_cpu = 0x1000007 if target.startswith("x86_64-") else 0x100000c
+    require(cpu == expected_cpu, f"Wrong executable architecture for {target}")
+    require(kind == 2, "Mach-O is not an executable")
+    bounded(data, 32, command_bytes)
+    offset, libraries, interpreters, sections, signatures = 32, [], [], [], []
+    platforms = []
+    for _ in range(commands):
+        require(offset + 8 <= 32 + command_bytes, "Truncated Mach-O load command")
+        command, size = struct.unpack_from("<II", data, offset)
+        require(size >= 8 and size % 8 == 0 and offset + size <= 32 + command_bytes,
+                "Invalid Mach-O load command size")
+        content = bounded(data, offset, size)
+        if command in (0xc, 0x80000018, 0x8000001f, 0x80000023, 0x20):
+            require(size >= 24, "Truncated Mach-O dylib command")
+            libraries.append(c_string(content, struct.unpack_from("<I", content, 8)[0]))
+        elif command == 0xe:
+            require(size >= 12, "Truncated Mach-O loader command")
+            interpreters.append(c_string(content, struct.unpack_from("<I", content, 8)[0]))
+        elif command == 0x19:
+            require(size >= 72, "Truncated Mach-O segment")
+            segment_name = content[8:24].rstrip(b"\0")
+            segment_start, segment_length = struct.unpack_from("<QQ", content, 40)
+            bounded(data, segment_start, segment_length)
+            count = struct.unpack_from("<I", content, 64)[0]
+            require(72 + count * 80 == size, "Invalid Mach-O section table")
+            for index in range(count):
+                section = content[72 + index * 80:152 + index * 80]
+                if section[:16].rstrip(b"\0") == b"__ldu_notices":
+                    require(segment_name == b"__TEXT" and section[16:32].rstrip(b"\0") == b"__TEXT",
+                            "Notice section must be in __TEXT")
+                    length = struct.unpack_from("<Q", section, 40)[0]
+                    start = struct.unpack_from("<I", section, 48)[0]
+                    require(segment_start <= start and start + length <= segment_start + segment_length,
+                            "Notice section lies outside its segment")
+                    bounded(data, start, length)
+                    sections.append((start, length))
+        elif command == 0x32:
+            require(size >= 24, "Truncated Mach-O platform command")
+            platforms.append(struct.unpack_from("<I", content, 8)[0])
+        elif command == 0x24:
+            platforms.append(1)
+        elif command in (0x25, 0x2f, 0x30):
+            raise RuntimeError("Expected a macOS executable, not another Apple OS")
+        elif command == 0x8000001c:
+            raise RuntimeError("macOS releases must not depend on a custom library search path")
+        elif command == 0x1d:
+            require(size == 16, "Invalid Mach-O code signature command")
+            start, length = struct.unpack_from("<II", content, 8)
+            bounded(data, start, length)
+            require(length > 0 and start + length == len(data),
+                    "Mach-O code signature must end the file; no appended data")
+            signatures.append((start, length))
+        offset += size
+    require(offset == 32 + command_bytes, "Invalid Mach-O load command count")
+    require(platforms == [1], "Expected macOS platform metadata")
+    require(interpreters == ["/usr/lib/dyld"], "Unexpected macOS dynamic loader")
+    require(libraries and all(path.startswith(("/usr/lib/", "/System/Library/Frameworks/"))
+                              and "/../" not in path for path in libraries),
+            f"Unexpected macOS shared libraries: {libraries}")
+    require(len(sections) <= 1 and len(signatures) <= 1, "Duplicate Mach-O metadata")
+    return {"format": "Mach-O", "static": False, "interpreter": interpreters[0],
+            "libraries": libraries, "notice_section": sections[0] if sections else None,
+            "code_signature": signatures[0] if signatures else None}
+
+
+def check_architecture(data, target):
+    return inspect_macho(data, target) if target_system(target) == "Darwin" else inspect_elf(data, target)
 
 
 def check_ncdu_export(report, root, paths, version, backend):
@@ -119,7 +280,12 @@ def check_ncdu_export(report, root, paths, version, backend):
 
 def smoke(args, version, binary):
     data = binary.read_bytes()
-    check_architecture(data, args.target)
+    linkage = check_architecture(data, args.target)
+    require(platform.system() == target_system(args.target),
+            "Run smoke inside the target OS; a cross-build or remote launcher is not a native smoke")
+    if target_system(args.target) == "Darwin":
+        run(["codesign", "--verify", "--strict", binary])
+        linkage["signature_verified"] = True
     runner = json.loads(args.runner_json)
     require(isinstance(runner, list) and all(isinstance(arg, str) for arg in runner),
             "--runner-json must be an array of command arguments")
@@ -131,6 +297,7 @@ def smoke(args, version, binary):
     (ROOT / ".tmp").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="release-smoke-", dir=ROOT / ".tmp") as work:
         root = Path(work).resolve()
+        smoke_env = dict(os.environ, XDG_CONFIG_HOME=str(root / "absent-config"))
         nested = root / "nested"
         empty = nested / "empty"
         empty.mkdir(parents=True)
@@ -148,7 +315,7 @@ def smoke(args, version, binary):
                 "-o", "-", "--backend", backend, "--threads", "2", str(root),
             ]
             try:
-                report = json.loads(run(scan_command))
+                report = json.loads(run(scan_command, env=smoke_env))
             except subprocess.CalledProcessError:
                 if runner and Path(runner[0]).name.startswith("qemu-"):
                     trace = subprocess.run(
@@ -163,11 +330,10 @@ def smoke(args, version, binary):
                 reference = exported
             else:
                 require(exported == reference, f"{backend}: export differs between backends")
-    check_static_linkage(binary)
-    linkage = {"static": True}
     result = {
         "version": version, "target": args.target, "binary_sha256": digest(data),
         "runner": runner, "host_system": platform.system(), "host_machine": platform.machine(),
+        "runtime_evidence": "emulated-architecture" if runner else "native-os",
         "checks": ["architecture", "version", "help", *[f"ncdu-export-{backend}" for backend in backends]],
         "linkage": linkage,
     }
@@ -177,11 +343,64 @@ def smoke(args, version, binary):
     print(f"Smoke passed: {args.target} ({' '.join(runner) if runner else 'native'})")
 
 
-def check_static_linkage(binary):
-    headers = run(["readelf", "--program-headers", binary])
-    dynamic = run(["readelf", "--dynamic", binary])
-    require("INTERP" not in headers and "(NEEDED)" not in dynamic,
-            "musl release must be statically linked")
+def notice_contents(notices, epoch):
+    timestamp = datetime.datetime.fromtimestamp(max(epoch, 315532800), datetime.timezone.utc)
+    stamp = (timestamp.year, timestamp.month, timestamp.day,
+             timestamp.hour, timestamp.minute, timestamp.second // 2 * 2)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
+        for name, content in sorted(notices.items()):
+            entry = zipfile.ZipInfo(name, date_time=stamp)
+            entry.create_system = 3
+            entry.external_attr = 0o100644 << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            handle.writestr(entry, content, compresslevel=9)
+    return output.getvalue()
+
+
+def validate_notices(data, notices):
+    with zipfile.ZipFile(io.BytesIO(data)) as handle:
+        require(handle.testzip() is None, "Corrupt license archive")
+        require(len(handle.namelist()) == len(notices) and set(handle.namelist()) == set(notices),
+                "Unexpected license archive entries")
+        require(all(handle.read(name) == content for name, content in notices.items()),
+                "License archive content mismatch; regenerate notices and rebuild")
+
+
+def release_notices(target):
+    notices = collect_licenses(ROOT, TOOLCHAIN, target, run)
+    notices["LICENSE"] = (ROOT / "LICENSE").read_bytes()
+    return notices
+
+
+def prepare_notices(args):
+    epoch = int(run(["git", "show", "-s", "--format=%ct", "HEAD"]))
+    notices = release_notices(args.target)
+    data = notice_contents(notices, epoch)
+    validate_notices(data, notices)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
+    print(f"Prepared {len(data):,} notice bytes for {args.target}: {output}")
+
+
+def extract_notices(args, binary):
+    data = binary.read_bytes()
+    linkage = check_architecture(data, args.target)
+    if target_system(args.target) == "Darwin":
+        section = linkage["notice_section"]
+        require(section is not None, "Missing __TEXT,__ldu_notices section")
+        archive = bounded(data, *section)
+    else:
+        with zipfile.ZipFile(io.BytesIO(data)) as handle:
+            start = min(entry.header_offset for entry in handle.infolist())
+        archive = data[start:]
+    # The output is a ZIP, never arbitrary archive extraction onto the filesystem.
+    with zipfile.ZipFile(io.BytesIO(archive)) as handle:
+        require(handle.testzip() is None, "Corrupt license archive")
+    with Path(args.output).open("xb") as output:
+        output.write(archive)
+
 
 
 def pack_upx(binary, original, upx):
@@ -214,13 +433,13 @@ def pack_upx(binary, original, upx):
 
 def package(args, version, binary):
     data = binary.read_bytes()
-    check_architecture(data, args.target)
+    linkage = check_architecture(data, args.target)
+    system = target_system(args.target)
+    require(not args.upx or system == "Linux", "UPX packaging is supported only for Linux musl")
     commit = run(["git", "rev-parse", "HEAD"])
     source_dirty = bool(run(["git", "status", "--porcelain", "--untracked-files=all"]))
     epoch = int(run(["git", "show", "-s", "--format=%ct", "HEAD"]))
-    check_static_linkage(binary)
-    notices = collect_licenses(ROOT, TOOLCHAIN, args.target, run)
-    notices["LICENSE"] = (ROOT / "LICENSE").read_bytes()
+    notices = release_notices(args.target)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     released = output / f"ldu-v{version}-{args.target}"
@@ -234,32 +453,40 @@ def package(args, version, binary):
         if args.upx:
             compression = pack_upx(prepared, data, args.upx)
             check_architecture(prepared.read_bytes(), args.target)
-            check_static_linkage(prepared)
             notices.update(collect_upx_licenses(args.upx.resolve()))
         executable_bytes = prepared.stat().st_size
         executable_sha256 = compression["sha256"] if compression else digest(data)
-        # ELF loaders ignore trailing data. Append notices after packing so ZIP
-        # readers can inspect them without running or unpacking the executable.
-        timestamp = datetime.datetime.fromtimestamp(max(epoch, 315532800), datetime.timezone.utc)
-        stamp = (timestamp.year, timestamp.month, timestamp.day,
-                 timestamp.hour, timestamp.minute, timestamp.second // 2 * 2)
-        with zipfile.ZipFile(prepared, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as handle:
-            for name, content in sorted(notices.items()):
-                entry = zipfile.ZipInfo(name, date_time=stamp)
-                entry.create_system = 3
-                entry.external_attr = 0o100644 << 16
-                entry.compress_type = zipfile.ZIP_DEFLATED
-                handle.writestr(entry, content, compresslevel=9)
-        final = prepared.read_bytes()
-        require(digest(final[:executable_bytes]) == executable_sha256,
-                "Appending notices changed executable bytes")
-        with zipfile.ZipFile(prepared) as handle:
-            require(handle.testzip() is None, "Corrupt license archive")
-            require(set(handle.namelist()) == set(notices), "Unexpected license archive entries")
-            require(min(entry.header_offset for entry in handle.infolist()) == executable_bytes,
-                    "License archive overlaps executable bytes")
-            require(all(handle.read(name) == content for name, content in notices.items()),
-                    "License archive content mismatch")
+        if system == "Darwin":
+            # Apple forbids Mach-O overlays. The linker places these bytes in a
+            # proper section before code signing; packaging never edits the image.
+            section = linkage["notice_section"]
+            require(section is not None,
+                    "Missing __TEXT,__ldu_notices; run notices and build with -sectcreate")
+            require(linkage["code_signature"] is not None, "Mach-O release needs a code signature")
+            archive = bounded(data, *section)
+            validate_notices(archive, notices)
+            notice_offset = section[0]
+            if platform.system() == "Darwin":
+                run(["codesign", "--verify", "--strict", prepared])
+                linkage["signature_verified"] = True
+            else:
+                linkage["signature_verified"] = False
+            final = prepared.read_bytes()
+            require(final == data, "Packaging changed Mach-O executable bytes")
+        else:
+            # ELF loaders ignore trailing data. Keep the ZIP readable without
+            # executing or unpacking the program, including after optional UPX.
+            archive = notice_contents(notices, epoch)
+            with prepared.open("ab") as output_file:
+                output_file.write(archive)
+            final = prepared.read_bytes()
+            require(digest(final[:executable_bytes]) == executable_sha256,
+                    "Appending notices changed executable bytes")
+            notice_offset = executable_bytes
+            validate_notices(archive, notices)
+            with zipfile.ZipFile(prepared) as handle:
+                require(min(entry.header_offset for entry in handle.infolist()) == executable_bytes,
+                        "License archive overlaps executable bytes")
         if args.upx:
             # UPX's inspection tool locates its header at EOF. The loader accepts
             # our ZIP trailer, but --test/--decompress need the original ELF prefix.
@@ -277,11 +504,12 @@ def package(args, version, binary):
         "release_profile": tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["profile"]["release"],
         "target_rustflags": os.environ.get("CARGO_TARGET_" + args.target.upper().replace("-", "_") + "_RUSTFLAGS", ""),
         "build_binary_sha256": digest(data), "build_binary_bytes": len(data),
-        "compression": compression,
-        "notice_trailer": {
-            "format": "zip", "offset": executable_bytes,
-            "bytes": len(final) - executable_bytes,
-            "sha256": digest(final[executable_bytes:]),
+        "compression": compression, "linkage": linkage,
+        "runtime_tested": False,
+        "notice_trailer" if system != "Darwin" else "notice_section": {
+            "format": "zip", "offset": notice_offset,
+            "bytes": len(archive),
+            "sha256": digest(archive),
             "entries": sorted(notices), "verified": True,
         },
         "binary": {"name": released.name, "bytes": len(final), "sha256": digest(final)},
@@ -295,7 +523,7 @@ def package(args, version, binary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["smoke", "package"])
+    parser.add_argument("action", choices=["smoke", "package", "notices", "extract-notices"])
     parser.add_argument("--target", required=True, choices=sorted(TARGETS))
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--runner-json", default="[]")
@@ -305,10 +533,19 @@ def main():
     args = parser.parse_args()
     if args.upx and args.action != "package":
         parser.error("--upx is only valid for package")
+    if args.upx and target_system(args.target) != "Linux":
+        parser.error("--upx supports only Linux musl targets")
+    if args.action in ("notices", "extract-notices") and args.output == ".tmp/release":
+        parser.error("--output must name the notice ZIP file")
+    if args.action == "notices":
+        prepare_notices(args)
+        return
     version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     binary = (args.binary or binary_for(args.target)).resolve()
     if args.action == "smoke":
         smoke(args, version, binary)
+    elif args.action == "extract-notices":
+        extract_notices(args, binary)
     else:
         package(args, version, binary)
 
