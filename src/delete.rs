@@ -1084,6 +1084,7 @@ fn remove_from_parent(
     };
     let mut stack = vec![root];
     let mut buffer = Vec::<u8>::new();
+    let mut leaves = LeafUnlinks::default();
     buffer
         .try_reserve_exact(64 * 1024)
         .map_err(io::Error::other)?;
@@ -1106,7 +1107,7 @@ fn remove_from_parent(
         }
         let frame = stack.last_mut().unwrap();
         if !frame.exhausted {
-            match read_directory_batch(frame, &mut buffer, state, path, errors) {
+            match read_directory_batch(frame, &mut buffer, &mut leaves, state, path, errors) {
                 Ok(exhausted) => frame.exhausted = exhausted,
                 Err(error) => {
                     if error.kind() == io::ErrorKind::Interrupted {
@@ -1252,11 +1253,175 @@ fn prepare_directory_retry(
     Ok(true)
 }
 
-/// Consume one whole getdents buffer before suspending its descriptor.
+#[cfg(target_os = "linux")]
+const LEAF_UNLINK_WINDOW: usize = crate::uring::BATCH_LIMIT;
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LeafUnlinks {
+    bytes: Vec<u8>,
+    entries: Vec<LeafName>,
+    enabled: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct LeafName {
+    end: usize,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LeafUnlinks {
+    fn push(&mut self, name: &std::ffi::OsStr, inode: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        self.bytes.extend_from_slice(name.as_bytes());
+        self.entries.push(LeafName {
+            end: self.bytes.len(),
+            inode,
+        });
+    }
+
+    fn name(&self, index: usize) -> &std::ffi::OsStr {
+        use std::os::unix::ffi::OsStrExt;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.entries[previous].end);
+        std::ffi::OsStr::from_bytes(&self.bytes[start..self.entries[index].end])
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.entries.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn leaf_unlinks_available(state: &WorkerState) -> bool {
+    // Deterministic syscall hooks exercise the unchanged blocking path. Batch
+    // result handling has separate tests that do not depend on host io_uring.
+    #[cfg(test)]
+    if state.cancel_after.load(Ordering::Relaxed) != 0
+        || state.deny_next_unlink.load(Ordering::Relaxed)
+        || !state.failed_names.lock().unwrap().is_empty()
+        || state.unlink_hook.lock().unwrap().is_some()
+    {
+        return false;
+    }
+    let _ = state;
+    crate::uring::unlink_available()
+}
+
+#[cfg(target_os = "linux")]
+fn apply_leaf_completions(
+    parent: &rustix::fd::OwnedFd,
+    leaves: &LeafUnlinks,
+    state: &WorkerState,
+    path: &Path,
+    errors: &mut Vec<DeleteError>,
+    outcome: crate::uring::BatchOutcome<()>,
+) -> io::Result<()> {
+    use crate::uring::{BatchOutcome, EntryOutcome};
+    let (entries, driver_error) = match outcome {
+        BatchOutcome::Unsupported => (None, None),
+        BatchOutcome::Complete(entries) => (Some(entries), None),
+        BatchOutcome::Failed { entries, error } => (Some(entries), Some(error)),
+    };
+    // Cancellation can arrive after several accepted unlinks complete. Publish
+    // every known success before stopping retries or unsubmitted work.
+    if let Some(entries) = &entries {
+        debug_assert_eq!(entries.len(), leaves.entries.len());
+        for result in entries {
+            if matches!(result, EntryOutcome::Completed(Ok(()))) {
+                state.removed(false);
+            }
+        }
+    }
+    state.check_cancel()?;
+    let mut entries = entries.map(Vec::into_iter);
+    for (index, leaf) in leaves.entries.iter().enumerate() {
+        let name = leaves.name(index);
+        let status = entries
+            .as_mut()
+            .map_or(EntryOutcome::NotSubmitted, |entries| {
+                entries.next().unwrap()
+            });
+        let initial = match status {
+            EntryOutcome::Completed(Ok(())) => continue,
+            EntryOutcome::Completed(Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
+            EntryOutcome::Completed(Err(error)) if error.kind() != io::ErrorKind::Interrupted => {
+                Err(error)
+            }
+            EntryOutcome::Completed(Err(_)) | EntryOutcome::NotSubmitted => {
+                // A completed EINTR did not consume the ordinary failure retry.
+                // The existing wrapper retries signals and observes cancellation.
+                unlink_entry(parent, name, false, state)
+            }
+            EntryOutcome::Unknown => {
+                // Failed batches return only after their driver has closed.
+                // Absence is safe to inspect, but never replay an uncertain
+                // unlink: this name may now refer to a newly created entry.
+                match retry_operation(state, || {
+                    rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                }) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                    _ => {}
+                }
+                let message = match &driver_error {
+                    Some(error) => format!("deletion completion could not be confirmed: {error}"),
+                    None => "deletion completion could not be confirmed".to_owned(),
+                };
+                record_error(errors, path.join(name), io::Error::other(message))?;
+                continue;
+            }
+        };
+        if let Err(error) = initial
+            && let Err(error) = retry_failed_unlink(
+                parent, name, false, None, leaf.inode, false, state, error, None,
+            )
+        {
+            record_error(errors, path.join(name), error)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn flush_leaf_unlinks(
+    parent: &rustix::fd::OwnedFd,
+    leaves: &mut LeafUnlinks,
+    state: &WorkerState,
+    path: &Path,
+    errors: &mut Vec<DeleteError>,
+) -> io::Result<()> {
+    if leaves.entries.is_empty() {
+        return Ok(());
+    }
+    // RawDir may refill its buffer on next(), so retain names in one reusable
+    // packed buffer. Only the submitted operation needs a per-name CString.
+    let mut names = [std::ffi::OsStr::new(""); LEAF_UNLINK_WINDOW];
+    for (index, name) in names.iter_mut().take(leaves.entries.len()).enumerate() {
+        *name = leaves.name(index);
+    }
+    let outcome = crate::uring::unlink_batch(parent, &names[..leaves.entries.len()], &state.cancel);
+    if !matches!(&outcome, crate::uring::BatchOutcome::Complete(_)) {
+        leaves.enabled = false;
+    }
+    let result = apply_leaf_completions(parent, leaves, state, path, errors, outcome);
+    leaves.clear();
+    result
+}
+
+/// Consume one whole getdents buffer before suspending its descriptor. Known
+/// leaves use bounded io_uring batches when available; blocking deletion keeps
+/// borrowed names and allocates full paths only for final errors.
 #[cfg(target_os = "linux")]
 fn read_directory_batch(
     frame: &mut DirectoryFrame,
     buffer: &mut Vec<u8>,
+    leaves: &mut LeafUnlinks,
     state: &WorkerState,
     path: &Path,
     errors: &mut Vec<DeleteError>,
@@ -1267,6 +1432,8 @@ fn read_directory_batch(
     // The caller drains each batch before reading again. Retain its allocations
     // for wide directory trees instead of rebuilding them for every getdents.
     debug_assert!(frame.pending.is_empty());
+    debug_assert!(leaves.entries.is_empty());
+    leaves.enabled = leaf_unlinks_available(state);
     #[cfg(test)]
     if let Some(hook) = state.read_hook.lock().unwrap().as_mut() {
         state.check_cancel()?;
@@ -1280,15 +1447,18 @@ fn read_directory_batch(
             loop {
                 state.check_cancel()?;
                 let Some(entry) = entries.next() else {
+                    flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                     return Ok(true);
                 };
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(Errno::INTR) => continue,
                     Err(Errno::INVAL) if capacity < 1024 * 1024 => {
+                        flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                         break;
                     }
                     Err(error) => {
+                        flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                         return Err(error.into());
                     }
                 };
@@ -1301,6 +1471,7 @@ fn read_directory_batch(
                         .is_some_and(|skipped| skipped.contains(name))
                     {
                         if entries.is_buffer_empty() {
+                            flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                             return Ok(false);
                         }
                         continue;
@@ -1308,7 +1479,15 @@ fn read_directory_batch(
                     state.examined();
                     let kind = entry.file_type();
                     let mut is_directory = kind == FileType::Directory;
-                    if !is_directory {
+                    if leaves.enabled && !is_directory && kind != FileType::Unknown {
+                        leaves.push(name, entry.ino());
+                        if leaves.entries.len() == LEAF_UNLINK_WINDOW {
+                            flush_leaf_unlinks(fd, leaves, state, path, errors)?;
+                        }
+                    } else if !is_directory {
+                        // Unknown d_type classification and its permission repair
+                        // remain serial, after previously admitted leaf work.
+                        flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                         if let Err(error) = unlink_entry(fd, entry.file_name(), false, state) {
                             let mut captured = None;
                             if kind == FileType::Unknown
@@ -1367,6 +1546,7 @@ fn read_directory_batch(
                     }
                 }
                 if entries.is_buffer_empty() {
+                    flush_leaf_unlinks(fd, leaves, state, path, errors)?;
                     return Ok(false);
                 }
             }
@@ -2306,6 +2486,182 @@ mod tests {
             b"keep"
         );
         assert!(work.path().join("original").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_leaves(names: &[&str], state: &WorkerState) -> LeafUnlinks {
+        for _ in names {
+            state.examined();
+        }
+        let mut leaves = LeafUnlinks::default();
+        for name in names {
+            leaves.push(std::ffi::OsStr::new(name), 0);
+        }
+        leaves
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_leaf_batch_counts_all_completed_unlinks_before_stopping() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        let work = fixture();
+        std::fs::write(work.path().join("waiting"), b"keep").unwrap();
+        let fd = rustix::fs::open(
+            work.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let state = WorkerState::default();
+        let leaves = synthetic_leaves(&["removed-first", "removed-second", "waiting"], &state);
+        state.cancel.store(true, Ordering::Relaxed);
+        let mut errors = Vec::new();
+        let result = apply_leaf_completions(
+            &fd,
+            &leaves,
+            &state,
+            work.path(),
+            &mut errors,
+            BatchOutcome::Complete(vec![
+                EntryOutcome::Completed(Ok(())),
+                EntryOutcome::Completed(Ok(())),
+                EntryOutcome::NotSubmitted,
+            ]),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(state.snapshot().removed_entries, 2);
+        assert!(work.path().join("waiting").exists());
+        assert!(errors.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leaf_batch_interrupted_completion_retries_and_absence_does_not_count() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        let work = fixture();
+        for name in ["interrupted", "sibling"] {
+            std::fs::write(work.path().join(name), b"remove").unwrap();
+        }
+        let fd = rustix::fs::open(
+            work.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let state = WorkerState::default();
+        let leaves = synthetic_leaves(&["absent", "interrupted", "sibling"], &state);
+        let mut errors = Vec::new();
+        apply_leaf_completions(
+            &fd,
+            &leaves,
+            &state,
+            work.path(),
+            &mut errors,
+            BatchOutcome::Complete(vec![
+                EntryOutcome::Completed(Err(rustix::io::Errno::NOENT.into())),
+                EntryOutcome::Completed(Err(rustix::io::Errno::INTR.into())),
+                EntryOutcome::NotSubmitted,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(state.snapshot().removed_entries, 2);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 0);
+        assert!(errors.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_leaf_batch_retries_once_and_continues_siblings() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        let work = fixture();
+        for name in ["denied", "sibling"] {
+            std::fs::write(work.path().join(name), b"entry").unwrap();
+        }
+        let fd = rustix::fs::open(
+            work.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let state = WorkerState::default();
+        state.failed_names.lock().unwrap().insert("denied".into());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&attempts);
+        *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, _| {
+            if name == "denied" {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }));
+        let leaves = synthetic_leaves(&["denied", "sibling"], &state);
+        let mut errors = Vec::new();
+        apply_leaf_completions(
+            &fd,
+            &leaves,
+            &state,
+            work.path(),
+            &mut errors,
+            BatchOutcome::Complete(vec![
+                EntryOutcome::Completed(Err(rustix::io::Errno::ACCESS.into())),
+                EntryOutcome::NotSubmitted,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(state.snapshot().removed_entries, 1);
+        assert!(work.path().join("denied").exists());
+        assert!(!work.path().join("sibling").exists());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, work.path().join("denied"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uncertain_leaf_completion_is_not_replayed_or_revisited_on_parent_retry() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        let work = fixture();
+        let target = work.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        for name in ["uncertain", "sibling"] {
+            std::fs::write(target.join(name), b"entry").unwrap();
+        }
+        let parent = rustix::fs::open(
+            work.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let state = WorkerState::default();
+        let mut frame = open_checked_directory(&parent, "target".into(), None, 0, &state)
+            .unwrap()
+            .unwrap();
+        let leaves = synthetic_leaves(&["uncertain", "absent", "sibling"], &state);
+        let mut errors = Vec::new();
+        apply_leaf_completions(
+            &frame.fd,
+            &leaves,
+            &state,
+            &target,
+            &mut errors,
+            BatchOutcome::Failed {
+                entries: vec![
+                    EntryOutcome::Unknown,
+                    EntryOutcome::Unknown,
+                    EntryOutcome::NotSubmitted,
+                ],
+                error: io::Error::other("injected driver failure"),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.snapshot().removed_entries, 1);
+        assert!(target.join("uncertain").exists());
+        assert!(!target.join("sibling").exists());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, target.join("uncertain"));
+        assert!(prepare_directory_retry(&mut frame, &parent, &state, &target, &errors).unwrap());
+        let skipped = frame.retry_skip.as_ref().unwrap();
+        assert!(skipped.contains(std::ffi::OsStr::new("uncertain")));
+        assert!(!skipped.contains(std::ffi::OsStr::new("absent")));
     }
 
     #[cfg(target_os = "linux")]

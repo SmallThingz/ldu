@@ -1182,25 +1182,51 @@ fn scan_directory_emit(
                         control.wait_unpaused(cancel, Some(&active.cancel))?;
                         // Include files and failed metadata checks in the batch's effort.
                         let checked = names.len();
-                        // Nested Rayon jobs use the same bounded pool, including for a single wide directory.
-                        let discovered = names
-                            .into_par_iter()
-                            .map(|name| {
-                                let metadata = control
-                                    .wait_unpaused(cancel, Some(&active.cancel))
-                                    .and_then(|()| {
-                                        if control.excludes_child(&task.path, &name) {
-                                            Err(io::Error::new(
-                                                io::ErrorKind::Interrupted,
-                                                "scan cancelled",
-                                            ))
-                                        } else {
-                                            reader.metadata(&name)
-                                        }
-                                    });
-                                (name, metadata)
-                            })
-                            .collect();
+                        #[cfg(target_os = "linux")]
+                        let discovered = if options.backend == Backend::Auto
+                            && crate::uring::metadata_available()
+                        {
+                            let backend::MetadataReader::Native(fd) = reader;
+                            ring_metadata_batch(
+                                names,
+                                reader,
+                                &task.path,
+                                cancel,
+                                &active.cancel,
+                                control,
+                                |window| {
+                                    crate::uring::metadata_batch(
+                                        fd,
+                                        window,
+                                        &active.cancel,
+                                        |index| {
+                                            !cancel.load(Ordering::Acquire)
+                                                && !control.paused.load(Ordering::Acquire)
+                                                && !control
+                                                    .excludes_child(&task.path, &window[index])
+                                        },
+                                    )
+                                },
+                            )?
+                        } else {
+                            blocking_metadata_batch(
+                                names,
+                                reader,
+                                &task.path,
+                                cancel,
+                                &active.cancel,
+                                control,
+                            )
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let discovered = blocking_metadata_batch(
+                            names,
+                            reader,
+                            &task.path,
+                            cancel,
+                            &active.cancel,
+                            control,
+                        );
                         let directories = emitter
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1227,6 +1253,118 @@ fn scan_directory_emit(
             cancel,
             false,
         );
+}
+
+fn read_metadata(
+    name: &OsStr,
+    reader: &backend::MetadataReader,
+    parent: &Path,
+    cancel: &AtomicBool,
+    task_cancel: &AtomicBool,
+    control: &ScanControl,
+) -> io::Result<EntryMetadata> {
+    control.wait_unpaused(cancel, Some(task_cancel))?;
+    if control.excludes_child(parent, name) {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"))
+    } else {
+        reader.metadata(name)
+    }
+}
+
+fn blocking_metadata_batch(
+    names: Vec<Arc<OsStr>>,
+    reader: &backend::MetadataReader,
+    parent: &Path,
+    cancel: &AtomicBool,
+    task_cancel: &AtomicBool,
+    control: &ScanControl,
+) -> Vec<(Arc<OsStr>, io::Result<EntryMetadata>)> {
+    // Keep the original bounded Rayon batch when the ring is unavailable, including
+    // parallel metadata for a single wide directory. No ring result slots are built.
+    names
+        .into_par_iter()
+        .map(|name| {
+            let metadata = read_metadata(&name, reader, parent, cancel, task_cancel, control);
+            (name, metadata)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn ring_metadata_batch(
+    names: Vec<Arc<OsStr>>,
+    reader: &backend::MetadataReader,
+    parent: &Path,
+    cancel: &AtomicBool,
+    task_cancel: &AtomicBool,
+    control: &ScanControl,
+    mut submit: impl FnMut(&[Arc<OsStr>]) -> crate::uring::BatchOutcome<rustix::fs::Stat>,
+) -> io::Result<Vec<(Arc<OsStr>, io::Result<EntryMetadata>)>> {
+    use crate::uring::{BatchOutcome, EntryOutcome};
+    use rustix::io::Errno;
+
+    let mut completed = Vec::with_capacity(names.len());
+    let mut needs_blocking = false;
+    for window in names.chunks(crate::uring::BATCH_LIMIT) {
+        control.wait_unpaused(cancel, Some(task_cancel))?;
+        let outcome = submit(window);
+        // The driver has drained submitted work or closed its ring before returning.
+        // Never pause while it still owns an in-flight metadata operation.
+        control.wait_unpaused(cancel, Some(task_cancel))?;
+        let (entries, failed) = match outcome {
+            BatchOutcome::Unsupported => {
+                needs_blocking = true;
+                break;
+            }
+            BatchOutcome::Complete(entries) => (entries, false),
+            BatchOutcome::Failed { entries, .. } => (entries, true),
+        };
+        debug_assert_eq!(entries.len(), window.len());
+        for entry in entries {
+            let metadata = match entry {
+                EntryOutcome::Completed(Ok(stat)) => Some(Ok(backend::native_metadata(stat))),
+                EntryOutcome::Completed(Err(error))
+                    if matches!(error.raw_os_error(), Some(code) if
+                        code == Errno::INTR.raw_os_error()
+                            || code == Errno::NOSYS.raw_os_error()
+                            || code == Errno::OPNOTSUPP.raw_os_error()
+                            || code == Errno::INVAL.raw_os_error()) =>
+                {
+                    None
+                }
+                EntryOutcome::Completed(Err(error)) => Some(Err(error)),
+                EntryOutcome::NotSubmitted | EntryOutcome::Unknown => None,
+            };
+            needs_blocking |= metadata.is_none();
+            completed.push(metadata);
+        }
+        // Metadata is read-only: retry unresolved reads after draining, retaining
+        // completed results and leaving ordinary per-entry errors unchanged.
+        if failed || needs_blocking {
+            needs_blocking = true;
+            break;
+        }
+    }
+    if needs_blocking {
+        completed.resize_with(names.len(), || None);
+        Ok(names
+            .into_par_iter()
+            .zip(completed.into_par_iter())
+            .map(|(name, metadata)| {
+                let metadata = metadata.unwrap_or_else(|| {
+                    read_metadata(&name, reader, parent, cancel, task_cancel, control)
+                });
+                (name, metadata)
+            })
+            .collect())
+    } else {
+        // Fully completed rings need no further Rayon dispatch or Arc clones.
+        Ok(names
+            .into_iter()
+            .zip(completed)
+            .map(|(name, metadata)| (name, metadata.expect("completed metadata")))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1486,6 +1624,219 @@ mod tests {
             Some(FocusRequest::Prioritize(PathBuf::from("focused")))
         );
         assert_eq!(control.take_focus(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_ring_metadata_preserves_raw_names_order_and_nofollow() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture = Fixture::new();
+        let raw_name = OsStr::from_bytes(b"raw-\xff");
+        fs::write(fixture.0.join(raw_name), b"payload").unwrap();
+        fs::create_dir(fixture.0.join("directory")).unwrap();
+        std::os::unix::fs::symlink("directory", fixture.0.join("link")).unwrap();
+        let anchor = RootAnchor::open(&fixture.0).unwrap();
+        let reader = backend::MetadataReader::Native(anchor.open_directory(Path::new("")).unwrap());
+        let mut names: Vec<Arc<OsStr>> = [raw_name, OsStr::new("link"), OsStr::new("directory")]
+            .into_iter()
+            .map(Arc::from)
+            .collect();
+        names.extend((0..130).map(|index| Arc::from(OsStr::new(&format!("missing-{index}")))));
+        let expected = names.clone();
+        let mut calls = 0;
+        let discovered = ring_metadata_batch(
+            names,
+            &reader,
+            Path::new(""),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &ScanControl::default(),
+            |window| {
+                calls += 1;
+                assert_eq!(window.len(), crate::uring::BATCH_LIMIT);
+                crate::uring::BatchOutcome::Unsupported
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            discovered.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(discovered[0].1.as_ref().unwrap().sizes.apparent, 7);
+        assert_eq!(discovered[1].1.as_ref().unwrap().kind, NodeKind::Symlink);
+        assert_eq!(discovered[2].1.as_ref().unwrap().kind, NodeKind::Directory);
+        assert!(
+            discovered[3..]
+                .iter()
+                .all(|(_, result)| result.as_ref().unwrap_err().kind() == io::ErrorKind::NotFound)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_ring_metadata_keeps_completions_and_retries_only_unresolved_reads() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        use rustix::fs::{AtFlags, statat};
+        use rustix::io::Errno;
+
+        let fixture = Fixture::new();
+        let names: Vec<Arc<OsStr>> = (0..9)
+            .map(|index| {
+                let name = format!("file-{index}");
+                fs::write(fixture.0.join(&name), b"payload").unwrap();
+                Arc::from(OsStr::new(&name))
+            })
+            .collect();
+        let anchor = RootAnchor::open(&fixture.0).unwrap();
+        let reader = backend::MetadataReader::Native(anchor.open_directory(Path::new("")).unwrap());
+        let backend::MetadataReader::Native(fd) = &reader;
+        let control = ScanControl::default();
+        let mut calls = 0;
+        let discovered = ring_metadata_batch(
+            names,
+            &reader,
+            Path::new(""),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &control,
+            |window| {
+                calls += 1;
+                let first = statat(fd, window[0].as_ref(), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+                // A completed read must survive later path changes and driver failure.
+                fs::remove_file(fixture.0.join(window[0].as_ref())).unwrap();
+                control.exclude(Path::new("file-8"));
+                BatchOutcome::Failed {
+                    entries: vec![
+                        EntryOutcome::Completed(Ok(first)),
+                        EntryOutcome::Completed(Err(Errno::ACCESS.into())),
+                        EntryOutcome::Unknown,
+                        EntryOutcome::NotSubmitted,
+                        EntryOutcome::Completed(Err(Errno::INTR.into())),
+                        EntryOutcome::Completed(Err(Errno::NOSYS.into())),
+                        EntryOutcome::Completed(Err(Errno::OPNOTSUPP.into())),
+                        EntryOutcome::Completed(Err(Errno::INVAL.into())),
+                        EntryOutcome::NotSubmitted,
+                    ],
+                    error: io::Error::other("injected driver failure after drain"),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(discovered[0].1.as_ref().unwrap().sizes.apparent, 7);
+        assert_eq!(
+            discovered[1].1.as_ref().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            discovered[2..8]
+                .iter()
+                .all(|(_, result)| result.as_ref().unwrap().sizes.apparent == 7)
+        );
+        assert_eq!(
+            discovered[8].1.as_ref().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ring_metadata_windows_pause_after_drain_and_cancel_before_readmission() {
+        use crate::uring::{BatchOutcome, EntryOutcome};
+        use rustix::fs::{AtFlags, statat};
+
+        for finish in 0..3 {
+            let fixture = Fixture::new();
+            fs::write(fixture.0.join("source"), b"payload").unwrap();
+            let anchor = RootAnchor::open(&fixture.0).unwrap();
+            let reader =
+                backend::MetadataReader::Native(anchor.open_directory(Path::new("")).unwrap());
+            let control = Arc::new(ScanControl::default());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_control = Arc::clone(&control);
+            let worker_cancel = Arc::clone(&cancel);
+            let (paused_sender, paused_receiver) = bounded(1);
+            let (done_sender, done_receiver) = bounded(1);
+            let worker = thread::spawn(move || {
+                let task = task(0, "");
+                let active = worker_control.activate(&task, &worker_cancel);
+                let backend::MetadataReader::Native(fd) = &reader;
+                let names: Vec<Arc<OsStr>> = (0..130)
+                    .map(|index| Arc::from(OsStr::new(&format!("entry-{index}"))))
+                    .collect();
+                let expected = names.clone();
+                let mut windows = Vec::new();
+                let result = ring_metadata_batch(
+                    names,
+                    &reader,
+                    &task.path,
+                    &worker_cancel,
+                    &active.cancel,
+                    &worker_control,
+                    |window| {
+                        windows.push(window.len());
+                        let entries = window
+                            .iter()
+                            .map(|_| {
+                                EntryOutcome::Completed(
+                                    statat(fd, "source", AtFlags::SYMLINK_NOFOLLOW)
+                                        .map_err(io::Error::from),
+                                )
+                            })
+                            .collect();
+                        if windows.len() == 1 {
+                            worker_control.set_paused(true);
+                            paused_sender.send(()).unwrap();
+                        }
+                        BatchOutcome::Complete(entries)
+                    },
+                );
+                if let Ok(discovered) = &result {
+                    assert_eq!(
+                        discovered.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                        expected.iter().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        discovered.iter().all(|(_, result)| result
+                            .as_ref()
+                            .unwrap()
+                            .sizes
+                            .apparent
+                            == 7)
+                    );
+                }
+                done_sender.send((result.is_ok(), windows)).unwrap();
+            });
+            paused_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(
+                done_receiver.recv_timeout(SEND_INTERVAL * 2),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ));
+            match finish {
+                0 => control.set_paused(false),
+                1 => {
+                    cancel.store(true, Ordering::Release);
+                    control.cancel_active();
+                    control.wake();
+                }
+                _ => control.exclude(Path::new("")),
+            }
+            let (complete, windows) = done_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(complete, finish == 0);
+            assert_eq!(
+                windows,
+                if finish == 0 {
+                    vec![64, 64, 2]
+                } else {
+                    vec![64]
+                }
+            );
+        }
     }
 
     #[test]

@@ -12,4 +12,7 @@ mod terminal_input;
 pub mod tui;
 pub mod types;
 
+#[cfg(target_os = "linux")]
+mod uring;
+
 pub use types::*;
