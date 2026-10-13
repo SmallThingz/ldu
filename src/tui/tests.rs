@@ -1211,9 +1211,12 @@ fn right_click_never_marks_after_stale_rows_keys_resize_and_modal_interruption()
         let row = app.list_area.y;
         app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
         assert!(app.right_press.is_some());
-        let mut release_row = row;
+        // A moved release is a drag unless another event invalidated the
+        // capture. Removal alone keeps frozen range positions, so its plain
+        // click case still releases at the original position.
+        let release_row = row + u16::from(interruption != 3);
         match interruption {
-            0 => release_row = row + 1,
+            0 => app.mouse(right_event(MouseEventKind::Moved, row + 1)),
             1 => {
                 app.key(
                     KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
@@ -7944,7 +7947,12 @@ fn normal_presses_preserve_painted_rows_through_release_and_live_publication() {
 
 #[test]
 fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
-    for button in [MouseButton::Left, MouseButton::Right] {
+    for (button, release_only) in [
+        (MouseButton::Left, false),
+        (MouseButton::Left, true),
+        (MouseButton::Right, false),
+        (MouseButton::Right, true),
+    ] {
         for existing in [false, true] {
             for modifiers in [
                 KeyModifiers::NONE,
@@ -7993,8 +8001,10 @@ fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
                         "right press changed membership"
                     );
                 }
-                app.mouse(mouse(MouseEventKind::Drag(button), end, KeyModifiers::ALT));
-                app.mouse(mouse(MouseEventKind::Up(button), end, KeyModifiers::NONE));
+                if !release_only {
+                    app.mouse(mouse(MouseEventKind::Drag(button), end, KeyModifiers::ALT));
+                }
+                app.mouse(mouse(MouseEventKind::Up(button), end, KeyModifiers::ALT));
                 finish_visual(&mut app);
                 assert!(app.visual.active());
                 for id in 1..=12 {
@@ -8006,7 +8016,7 @@ fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
                     assert_eq!(
                         app.visual.contains(id),
                         expected,
-                        "{button:?} existing={existing} {modifiers:?} id={id}"
+                        "{button:?} release_only={release_only} existing={existing} {modifiers:?} id={id}"
                     );
                 }
                 assert_eq!(app.selected, Some(7));
@@ -8015,6 +8025,60 @@ fn left_and_right_drags_select_or_erase_with_captured_modifiers() {
                 assert!(!app.right_dragging && app.right_press.is_none());
                 assert!(!app.mouse_dragging && app.drag_scroll.is_none());
             }
+        }
+    }
+}
+
+#[test]
+fn right_release_only_drag_resolves_membership_after_prior_range_work() {
+    for initially_selected in [false, true] {
+        for (anchor, lead) in [(3, 7), (7, 3)] {
+            let mut app = navigation_fixture(12, 13..=13);
+            app.visual.enter(ROOT, None);
+            app.visual.select(11);
+            if initially_selected {
+                for id in 3..=7 {
+                    app.visual.select(id);
+                }
+            }
+            app.selected = Some(anchor);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            let row = |id| {
+                app.list_area.y
+                    + app
+                        .painted_rows
+                        .iter()
+                        .position(|&value| value == id)
+                        .unwrap() as u16
+            };
+            let (start, end) = (row(anchor), row(lead));
+            app.visual.reanchor(anchor);
+            app.visual.begin_range(
+                Arc::clone(&app.view),
+                lead,
+                if initially_selected {
+                    RangeMode::Remove
+                } else {
+                    RangeMode::Add
+                },
+            );
+            assert!(app.visual.is_pending());
+            app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), start));
+            app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), end));
+            finish_visual(&mut app);
+            for id in 1..=12 {
+                assert_eq!(
+                    app.visual.contains(id),
+                    id == 11 || (initially_selected && (3..=7).contains(&id)),
+                    "initially_selected={initially_selected} anchor={anchor} id={id}"
+                );
+            }
+            assert_eq!(app.selected, Some(lead));
+            assert!(app.visual_intents.is_empty() && app.mouse_press_view.is_none());
+            assert!(!app.right_dragging && app.right_press.is_none());
         }
     }
 }
@@ -8036,7 +8100,7 @@ fn right_drag_retains_removed_origin_direction_and_frozen_rows() {
     app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), start));
     assert_eq!(app.visual.len(), 6);
     app.removed(3);
-    app.mouse(right_event(MouseEventKind::Drag(MouseButton::Right), end));
+    // The only endpoint report must retain the vanished origin's membership.
     app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), end));
     finish_visual(&mut app);
     assert_eq!(app.visual.len(), 1);
@@ -8060,12 +8124,14 @@ fn parent_right_drag_toggles_every_child_but_plain_click_preserves_marks() {
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
     let row = app.parent_area.y;
-    for selected in [true, false] {
+    for (selected, release_only) in [(true, false), (false, false), (true, true), (false, true)] {
         app.mouse(right_event(MouseEventKind::Down(MouseButton::Right), row));
-        app.mouse(right_event(
-            MouseEventKind::Drag(MouseButton::Right),
-            row + 1,
-        ));
+        if !release_only {
+            app.mouse(right_event(
+                MouseEventKind::Drag(MouseButton::Right),
+                row + 1,
+            ));
+        }
         app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row + 1));
         finish_visual(&mut app);
         assert_eq!(app.visual.len(), if selected { 2 } else { 0 });
@@ -8075,6 +8141,14 @@ fn parent_right_drag_toggles_every_child_but_plain_click_preserves_marks() {
         assert_eq!(app.visual.len(), if selected { 2 } else { 0 });
         assert_eq!(app.directory, ROOT);
     }
+    app.visual.select(1);
+    let mut press = right_event(MouseEventKind::Down(MouseButton::Right), row);
+    press.modifiers = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    app.mouse(press);
+    app.mouse(right_event(MouseEventKind::Up(MouseButton::Right), row + 1));
+    finish_visual(&mut app);
+    assert!(app.visual.active() && app.visual.is_empty());
+    assert_eq!(app.directory, ROOT);
 }
 
 #[test]

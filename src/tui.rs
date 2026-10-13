@@ -1851,7 +1851,12 @@ impl App {
         }
         if let Some(mut press) = self.right_press.take() {
             match mouse.kind {
-                MouseEventKind::Drag(MouseButton::Right) => {
+                MouseEventKind::Drag(MouseButton::Right)
+                | MouseEventKind::Up(MouseButton::Right)
+                    if mouse.kind == MouseEventKind::Drag(MouseButton::Right)
+                        || press.position != (mouse.column, mouse.row) =>
+                {
+                    let released = mouse.kind == MouseEventKind::Up(MouseButton::Right);
                     let valid = press.valid
                         && press.directory == self.directory
                         && press.epoch == self.model.node(self.directory).child_epoch
@@ -1891,6 +1896,13 @@ impl App {
                                         kind: MouseEventKind::Drag(MouseButton::Left),
                                         ..mouse
                                     });
+                                    if released {
+                                        self.right_dragging = false;
+                                        self.mouse(MouseEvent {
+                                            kind: MouseEventKind::Up(MouseButton::Left),
+                                            ..mouse
+                                        });
+                                    }
                                 }
                             }
                             BrowserTarget::Parent => {
@@ -1908,8 +1920,8 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Up(MouseButton::Right) => {
-                    // Right-click only enters/focuses visual mode. Membership
-                    // changes require a drag or an explicit selection action.
+                    // An unmoved right-click only enters/focuses visual mode.
+                    // A moved release above completes a coalesced drag.
                     self.visual
                         .retire_snapshot_and_order(im::HashSet::new(), press.view);
                     return true;
