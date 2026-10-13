@@ -1,0 +1,83 @@
+{
+  "compio-buf-0.8.3": {
+    "license": "MIT",
+    "registry_sha256": "b51a2c35873865376ed4cdb6cfeb602b6cf569815f017ddd7bd8f86ad49b34c7",
+    "vcs": {
+      "git": {
+        "sha1": "13d847631b7b43ad00ba9253e22acfc8d49f2664"
+      },
+      "path_in_vcs": "compio-buf"
+    },
+    "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "kind": "upstream",
+    "file": "compio-LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/compio-rs/compio/13d847631b7b43ad00ba9253e22acfc8d49f2664/LICENSE",
+    "sha256": "386a2583a79c7f1381ea0ac18a3bf488d92ee71514535cdba3f0b6e2a1920aa2"
+  },
+  "compio-driver-0.12.5": {
+    "license": "MIT",
+    "registry_sha256": "293e8086a35f52b5002402937cf4e69b5e414917e511c29c5e7ba2cebe6ef7b3",
+    "vcs": {
+      "git": {
+        "sha1": "1ff9aedeaf69939459fa45aef664d0a7eec856a0"
+      },
+      "path_in_vcs": "compio-driver"
+    },
+    "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "kind": "upstream",
+    "file": "compio-LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/compio-rs/compio/1ff9aedeaf69939459fa45aef664d0a7eec856a0/LICENSE",
+    "sha256": "386a2583a79c7f1381ea0ac18a3bf488d92ee71514535cdba3f0b6e2a1920aa2"
+  },
+  "compio-log-0.2.1": {
+    "license": "MIT",
+    "registry_sha256": "9dd867f29de59e4eff577dfeee3744cb0a264249f3faaf11945e8be79a3c3c62",
+    "vcs": {
+      "git": {
+        "sha1": "1ff9aedeaf69939459fa45aef664d0a7eec856a0"
+      },
+      "path_in_vcs": "compio-log"
+    },
+    "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "kind": "upstream",
+    "file": "compio-LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/compio-rs/compio/1ff9aedeaf69939459fa45aef664d0a7eec856a0/LICENSE",
+    "sha256": "386a2583a79c7f1381ea0ac18a3bf488d92ee71514535cdba3f0b6e2a1920aa2"
+  },
+  "mod_use-0.2.3": {
+    "license": "MIT",
+    "registry_sha256": "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a",
+    "vcs": {
+      "git": {
+        "sha1": "77024c956c8e4b4e90dad9aedc82c1eda0723d65"
+      },
+      "path_in_vcs": ""
+    },
+    "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "kind": "spdx-template",
+    "file": "SPDX-MIT-template.txt",
+    "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+    "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+    "declaration_url": "https://raw.githubusercontent.com/George-Miao/mod_use/77024c956c8e4b4e90dad9aedc82c1eda0723d65/Cargo.toml",
+    "declaration_manifest_sha256": "cfc8d45228e1dda9433c39abaa705bb8407c2db79bfedc2dd511b90d88d0e2bf",
+    "declaration": "license     = \"MIT\"\n"
+  },
+  "synchrony-0.1.9": {
+    "license": "MIT",
+    "registry_sha256": "f9d6d5fbc4583cf3e5eee953506f13853a42ee6b4a21a983dffffb10c765cb80",
+    "vcs": {
+      "git": {
+        "sha1": "3996816da25d4f4c68f4a54b5d71186fee9492d3"
+      },
+      "path_in_vcs": ""
+    },
+    "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "kind": "spdx-template",
+    "file": "SPDX-MIT-template.txt",
+    "url": "https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt",
+    "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+    "declaration_url": "https://raw.githubusercontent.com/compio-rs/synchrony/3996816da25d4f4c68f4a54b5d71186fee9492d3/Cargo.toml",
+    "declaration_manifest_sha256": "fff8f8f1b544f85bafc6082494536d82c4c9e290a703ff983e51d01a9af1fc00",
+    "declaration": "license = \"MIT\"\n"
+  }
+}
