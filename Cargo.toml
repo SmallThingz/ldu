@@ -10,7 +10,7 @@ repository = "https://github.com/SmallThingz/ldu"
 [dependencies]
 arc-swap = "1.9.2"
 im = { package = "imbl", version = "7.0.2" }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 crossbeam-channel = "0.5.17"
 # Level-triggered polling preserves simultaneous resize and keyboard input.
 crossterm = { version = "0.29.0", features = ["use-dev-tty"] }

@@ -256,6 +256,7 @@ mod tests {
         for version in ["-v", "-V", "--version"] {
             let error = Args::try_parse_from(["ldu", version]).err().unwrap();
             assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+            assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
         }
         for args in [
             vec!["ldu", "--json"],
@@ -266,6 +267,57 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(args).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_preserves_non_utf8_scan_and_export_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let scan = OsString::from_vec(b"scan-\xff".to_vec());
+        let output = OsString::from_vec(b"export-\xfe".to_vec());
+        let args = Args::try_parse_from([
+            OsString::from("ldu"),
+            scan.clone(),
+            OsString::from("-o"),
+            output.clone(),
+        ])
+        .unwrap();
+        assert_eq!(args.path, PathBuf::from(scan));
+        assert_eq!(args.output, Some(PathBuf::from(output)));
+    }
+
+    #[test]
+    fn cli_help_and_errors_retain_usage_and_argument_context() {
+        let help = Args::try_parse_from(["ldu", "--help"]).err().unwrap();
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        for expected in [
+            "Usage:",
+            "--output",
+            "--threads",
+            "--color",
+            "--no-mouse",
+            "--version",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let error = Args::try_parse_from(["ldu", "--backend", "bogus"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        let text = error.to_string();
+        for expected in ["--backend", "bogus", "auto", "std"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let error = Args::try_parse_from(["ldu", "--threds"]).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        let text = error.to_string();
+        assert!(
+            text.contains("--threds") && text.contains("Usage:"),
+            "{text}"
+        );
     }
 
     #[test]
