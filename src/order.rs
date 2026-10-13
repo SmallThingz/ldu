@@ -515,11 +515,24 @@ impl CachedOrderWorker {
 
     /// Read an immutable index without waiting for sorting or publication.
     pub fn snapshot(&self, directory: NodeId) -> Option<Arc<CachedSnapshot>> {
-        let cache = self.cache.load_full();
+        let cache = self.cache.load();
         cache
             .get(&directory)
             .filter(|view| view.generation == self.generation)
             .cloned()
+    }
+
+    /// Compare a retained frame without acquiring another snapshot reference.
+    pub fn snapshot_matches(
+        &self,
+        directory: NodeId,
+        expected: Option<&Arc<CachedSnapshot>>,
+    ) -> bool {
+        let cache = self.cache.load();
+        let current = cache
+            .get(&directory)
+            .filter(|view| view.generation == self.generation);
+        current.map(Arc::as_ptr) == expected.map(Arc::as_ptr)
     }
 
     /// Replace the current basename query without queueing earlier keystrokes.
@@ -542,13 +555,35 @@ impl CachedOrderWorker {
 
     /// Only completed results for the current query and sort generation qualify.
     pub fn filtered_snapshot(&self, directory: NodeId) -> Option<Arc<CachedSnapshot>> {
-        let request = self.filter.request.load_full()?;
+        let request = self.filter.request.load();
+        let request = request.as_ref()?;
         if request.directory != directory {
             return None;
         }
-        let snapshot = self.filter.snapshot.load_full()?;
+        let snapshot = self.filter.snapshot.load();
+        let snapshot = snapshot.as_ref()?;
         (snapshot.revision == request.revision && snapshot.view.generation == self.generation)
             .then(|| Arc::clone(&snapshot.view))
+    }
+
+    pub fn filtered_snapshot_matches(
+        &self,
+        directory: NodeId,
+        expected: Option<&Arc<CachedSnapshot>>,
+    ) -> bool {
+        let request = self.filter.request.load();
+        let snapshot = self.filter.snapshot.load();
+        let current = request
+            .as_ref()
+            .filter(|request| request.directory == directory)
+            .and_then(|request| {
+                snapshot.as_ref().filter(|snapshot| {
+                    snapshot.revision == request.revision
+                        && snapshot.view.generation == self.generation
+                })
+            })
+            .map(|snapshot| &snapshot.view);
+        current.map(Arc::as_ptr) == expected.map(Arc::as_ptr)
     }
 
     pub fn try_upsert(&mut self, rows: Vec<CachedRow>) -> Result<(), Vec<CachedRow>> {
@@ -913,17 +948,17 @@ impl CacheState {
             CacheCommand::Remove { generation, ids } if generation == self.generation => {
                 for id in ids {
                     self.removed.insert(id);
-                    if let Some(parent) = self.parents.get(&id).and_then(|link| link.parent) {
-                        if let Some(directory) = self.directories.get_mut(&parent) {
-                            if let Some(removed) = directory.order.rows.remove(&id) {
-                                let visible = self.config.show_hidden
-                                    || !removed.row.name.as_encoded_bytes().starts_with(b".");
-                                directory.visible_count -= usize::from(visible);
-                                directory.directory_count -=
-                                    usize::from(visible && removed.row.kind == NodeKind::Directory);
-                            }
-                            self.mark_dirty(parent);
+                    if let Some(parent) = self.parents.get(&id).and_then(|link| link.parent)
+                        && let Some(directory) = self.directories.get_mut(&parent)
+                    {
+                        if let Some(removed) = directory.order.rows.remove(&id) {
+                            let visible = self.config.show_hidden
+                                || !removed.row.name.as_encoded_bytes().starts_with(b".");
+                            directory.visible_count -= usize::from(visible);
+                            directory.directory_count -=
+                                usize::from(visible && removed.row.kind == NodeKind::Directory);
                         }
+                        self.mark_dirty(parent);
                     }
                     self.cleanup.push_back(id);
                     self.remove_view(id, cache);
@@ -1881,10 +1916,10 @@ mod tests {
     ) -> Arc<CachedSnapshot> {
         for _ in 0..16 {
             filtering.pump(state, mailbox);
-            if filtering.task.is_none() {
-                if let Some(snapshot) = mailbox.snapshot.load_full() {
-                    return Arc::clone(&snapshot.view);
-                }
+            if filtering.task.is_none()
+                && let Some(snapshot) = mailbox.snapshot.load_full()
+            {
+                return Arc::clone(&snapshot.view);
             }
         }
         panic!("filter did not finish");
@@ -2080,19 +2115,36 @@ mod tests {
             ids: vec![1],
             positions: HashMap::from([(1, 0)]),
         });
+        assert!(worker.snapshot_matches(ROOT, None));
+        let mut published = PublishedCache::new();
+        published.insert(ROOT, Arc::clone(&view));
+        worker.cache.store(Arc::new(published));
         filter.snapshot.store(Some(Arc::new(FilteredSnapshot {
             revision: 1,
             source: Arc::clone(&view),
-            view,
+            view: Arc::clone(&view),
         })));
+        assert!(worker.snapshot_matches(ROOT, Some(&view)));
+        assert!(!worker.snapshot_matches(ROOT, None));
         assert!(worker.filtered_snapshot(ROOT).is_some());
+        assert!(worker.filtered_snapshot_matches(ROOT, Some(&view)));
+        assert!(!worker.filtered_snapshot_matches(ROOT, None));
         assert!(worker.filtered_snapshot(1).is_none());
+        assert!(worker.filtered_snapshot_matches(1, None));
+        assert!(!worker.filtered_snapshot_matches(1, Some(&view)));
         worker.generation = 2;
+        assert!(worker.snapshot_matches(ROOT, None));
+        assert!(!worker.snapshot_matches(ROOT, Some(&view)));
         assert!(worker.filtered_snapshot(ROOT).is_none());
+        assert!(worker.filtered_snapshot_matches(ROOT, None));
+        assert!(!worker.filtered_snapshot_matches(ROOT, Some(&view)));
         worker.generation = 1;
         worker.set_filter(ROOT, "second", false);
         assert!(worker.filtered_snapshot(ROOT).is_none());
+        assert!(worker.filtered_snapshot_matches(ROOT, None));
+        assert!(!worker.filtered_snapshot_matches(ROOT, Some(&view)));
         worker.clear_filter();
         assert!(worker.filtered_snapshot(ROOT).is_none());
+        assert!(worker.filtered_snapshot_matches(ROOT, None));
     }
 }

@@ -10004,3 +10004,49 @@ fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
         assert_eq!(app.filter, if ancestor { "" } else { "sur" });
     }
 }
+
+#[test]
+fn fixed_edge_layout_matches_solver_across_terminal_sizes() {
+    use ratatui::layout::{Constraint, Layout};
+
+    let mut edges = vec![(2, 4), (3, 2), (1, 3)];
+    edges.extend((0..=18).map(|height| (height, 3)));
+    edges.extend(
+        ["? help", "d delete  ? help", "d delete  Esc clear  ? help"]
+            .map(|hint| (2, hint.len() as u16 + 2)),
+    );
+    let mut differences = Vec::new();
+    for direction in [Direction::Horizontal, Direction::Vertical] {
+        for &(leading, trailing) in &edges {
+            for available in 0..=100 {
+                let area = match direction {
+                    Direction::Horizontal => Rect::new(7, 9, available, 3),
+                    Direction::Vertical => Rect::new(7, 9, 3, available),
+                };
+                let reference = Layout::default()
+                    .direction(direction)
+                    .constraints([
+                        Constraint::Length(leading),
+                        Constraint::Min(0),
+                        Constraint::Length(trailing),
+                    ])
+                    .split(area);
+                let actual = split_edges(area, direction, leading, trailing);
+                if actual.as_slice() != reference.as_ref() {
+                    differences.push(format!(
+                        "{direction:?} {leading}/{trailing} in {available}: {actual:?} != {reference:?}",
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    for height in 0..=100 {
+        let area = Rect::new(7, 9, 50, height);
+        let reference = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(area);
+        assert_eq!(
+            &split_edges(area, Direction::Vertical, 0, 2)[1..],
+            reference.as_ref(),
+        );
+    }
+}

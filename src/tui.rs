@@ -20,7 +20,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
@@ -369,25 +369,33 @@ impl FrameSnapshot {
     }
 
     fn unchanged(&self, app: &App) -> bool {
-        fn same<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
-            match (left, right) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
+        self.model_revision == app.model.revision()
+            && self.directory == app.directory
+            && self.selected == app.selected
+            && self.offset == app.offset
+            && Arc::ptr_eq(&self.view, &app.view)
+            && if app.filter.is_empty() {
+                app.order
+                    .snapshot_matches(app.directory, self.available.as_ref())
+            } else {
+                app.order
+                    .filtered_snapshot_matches(app.directory, self.available.as_ref())
             }
-        }
-        let current = Self::capture(app);
-        self.model_revision == current.model_revision
-            && self.directory == current.directory
-            && self.selected == current.selected
-            && self.offset == current.offset
-            && Arc::ptr_eq(&self.view, &current.view)
-            && same(&self.available, &current.available)
-            && same(&self.preview, &current.preview)
-            && same(&self.file, &current.file)
-            && self.modal == current.modal
-            && self.capturing == current.capturing
-            && self.confirmed == current.confirmed
+            && match app.preview.directory {
+                Some(id) => app.order.snapshot_matches(id, self.preview.as_ref()),
+                None => self.preview.is_none(),
+            }
+            && app.file_preview.snapshot_matches(self.file.as_ref())
+            && self.modal == app.modal.as_ref().map(std::mem::discriminant)
+            && self.capturing == app.capture_inflight.is_some()
+            && self.confirmed
+                == matches!(
+                    app.modal,
+                    Some(Modal::Delete {
+                        confirmed: Some(_),
+                        ..
+                    })
+                )
     }
 }
 
@@ -3220,14 +3228,7 @@ impl App {
         } else {
             "? help"
         };
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(0),
-                Constraint::Length(hint.len() as u16 + 2),
-            ])
-            .split(header);
+        let columns = split_edges(header, Direction::Horizontal, 2, hint.len() as u16 + 2);
         self.back_area = columns[0];
         let mut phase_text = if self.filter_editing {
             format!(
@@ -3628,18 +3629,34 @@ fn controls(keys: &'static str, action: &'static str) -> Line<'static> {
     ])
 }
 
+/// Split fixed edges around the remaining space without a general layout solver.
+fn split_edges(area: Rect, direction: Direction, leading: u16, trailing: u16) -> [Rect; 3] {
+    let available = match direction {
+        Direction::Horizontal => area.width,
+        Direction::Vertical => area.height,
+    };
+    let trailing = trailing.min(available);
+    let leading = leading.min(available - trailing);
+    let middle = available - leading - trailing;
+    match direction {
+        Direction::Horizontal => [
+            Rect::new(area.x, area.y, leading, area.height),
+            Rect::new(area.x + leading, area.y, middle, area.height),
+            Rect::new(area.x + leading + middle, area.y, trailing, area.height),
+        ],
+        Direction::Vertical => [
+            Rect::new(area.x, area.y, area.width, leading),
+            Rect::new(area.x, area.y + leading, area.width, middle),
+            Rect::new(area.x, area.y + leading + middle, area.width, trailing),
+        ],
+    }
+}
+
 /// Share the current frame's queue capacity with row synchronization.
 fn queue_layout(area: Rect) -> (Rect, Rect, [Rect; 3]) {
     let popup = centered(area, area.width.min(76), area.height.min(20));
     let inner = Block::bordered().inner(popup);
-    let regions = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(4),
-        ])
-        .split(inner);
+    let regions = split_edges(inner, Direction::Vertical, 2, 4);
     (popup, inner, [regions[0], regions[1], regions[2]])
 }
 
@@ -3680,14 +3697,7 @@ fn draw_modal(
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let regions = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(2),
-                ])
-                .split(inner);
+            let regions = split_edges(inner, Direction::Vertical, 3, 2);
             *page = usize::from(regions[1].height).max(1);
             *scroll = (*scroll).min(report.lines().saturating_sub(*page));
             let first = if report.errors.is_empty() {
@@ -3751,14 +3761,7 @@ fn draw_modal(
             let popup = centered(area, width, height);
             let block = border("Delete selection?");
             let inner = block.inner(popup);
-            let regions = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
-                ])
-                .split(inner);
+            let regions = split_edges(inner, Direction::Vertical, 1, 3);
             let geometry = inner.width >= 32 && regions[1].height > 0 && regions[2].height == 3;
             *reviewable = geometry && *ready && *count > 0;
             frame.render_widget(Clear, popup);
@@ -3956,14 +3959,7 @@ fn draw_modal(
             let popup = centered(area, width, height);
             let block = border("Delete?");
             let inner = block.inner(popup);
-            let regions = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(prompt_height),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
-                ])
-                .split(inner);
+            let regions = split_edges(inner, Direction::Vertical, prompt_height, 3);
             let geometry = inner.width >= 18 && regions[1].height > 0 && regions[2].height == 3;
             *reviewable = geometry && confirmed.is_some();
             frame.render_widget(Clear, popup);
@@ -4048,10 +4044,8 @@ fn draw_modal(
             let inner = block.inner(popup);
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
-            let regions = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(2)])
-                .split(inner);
+            let [_, content, footer] = split_edges(inner, Direction::Vertical, 0, 2);
+            let regions = [content, footer];
             clamp_scroll(scroll, line_count, regions[0].height);
             frame.render_widget(paragraph.scroll((*scroll, 0)).style(style), regions[0]);
             frame.render_widget(

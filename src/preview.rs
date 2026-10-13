@@ -171,6 +171,18 @@ impl FilePreview {
             .load_full()
             .filter(|contents| contents.revision == revision)
     }
+
+    /// Check for a new publication without cloning the retained contents.
+    pub fn snapshot_matches(&self, expected: Option<&Arc<FileContents>>) -> bool {
+        let request = self.request.load();
+        let result = self.result.load();
+        let current = request.as_ref().and_then(|request| {
+            result
+                .as_ref()
+                .filter(|contents| contents.revision == request.revision)
+        });
+        current.map(Arc::as_ptr) == expected.map(Arc::as_ptr)
+    }
 }
 
 impl Drop for FilePreview {
@@ -485,11 +497,13 @@ fn decode(bytes: &[u8], truncated: bool) -> FileContents {
     let text = if utf16(bytes) {
         let little = bytes[0] == 0xff;
         let bytes = &bytes[2..];
-        if bytes.len() % 2 != 0 && !truncated {
+        if !bytes.len().is_multiple_of(2) && !truncated {
             return fallback();
         }
         let mut units: Vec<_> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 if little {
                     u16::from_le_bytes([pair[0], pair[1]])
@@ -736,6 +750,7 @@ mod tests {
         );
         preview.clear();
         assert!(preview.selected().is_none() && preview.snapshot().is_none());
+        assert!(preview.snapshot_matches(None));
         preview.request(
             2,
             Arc::clone(&anchor),
@@ -747,7 +762,10 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert_eq!(preview.snapshot().unwrap().text.as_deref(), Some("last"));
+        let contents = preview.snapshot().unwrap();
+        assert_eq!(contents.text.as_deref(), Some("last"));
+        assert!(preview.snapshot_matches(Some(&contents)));
+        assert!(!preview.snapshot_matches(None));
         #[cfg(target_os = "linux")]
         {
             std::fs::rename(&root, directory.path().join("moved")).unwrap();
