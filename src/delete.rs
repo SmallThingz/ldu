@@ -457,19 +457,6 @@ fn remove_unix(
     if expected.is_some_and(|expected| expected.parent != Some(FileIdentity::from_stat(&held))) {
         return Err(changed_target());
     }
-    #[cfg(target_os = "linux")]
-    {
-        let parent_path = descriptor_path(parent.as_fd());
-        let visible = retry_operation(state, || rustix::fs::stat(&parent_path))?;
-        if rustix::fs::FileType::from_raw_mode(visible.st_mode) != rustix::fs::FileType::Directory
-            || visible.st_dev != held.st_dev
-            || visible.st_ino != held.st_ino
-        {
-            return Err(io::Error::other(
-                "the anchored parent is unavailable through /proc/self/fd",
-            ));
-        }
-    }
     let basename = relative.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
