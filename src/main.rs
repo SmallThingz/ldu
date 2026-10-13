@@ -9,7 +9,7 @@ use ldu::{
 };
 use std::{
     fs::{self, File, Metadata, OpenOptions},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -206,7 +206,8 @@ fn main() {
         Ok(false) => (),
         Ok(true) => std::process::exit(2),
         Err(error) => {
-            eprintln!("ldu: {error}");
+            // A disconnected terminal can also make the diagnostic unwritable.
+            let _ = writeln!(io::stderr().lock(), "ldu: {error}");
             std::process::exit(1);
         }
     }

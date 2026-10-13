@@ -324,8 +324,8 @@ pub struct DeleteQueue {
     superseded_nodes: HashMap<NodeId, QueueId>,
     pruning: Vector<Prune>,
     active: Option<ActiveDelete>,
-    #[cfg(target_os = "linux")]
-    completion: Arc<rustix::fd::OwnedFd>,
+    #[cfg(unix)]
+    completion: Option<crate::completion::Completion>,
     paused: bool,
     next_id: QueueId,
     retirer: Retirer<Vec<Retired>>,
@@ -341,11 +341,8 @@ impl DeleteQueue {
             superseded_nodes: HashMap::new(),
             pruning: Vector::new(),
             active: None,
-            #[cfg(target_os = "linux")]
-            completion: Arc::new(rustix::event::eventfd(
-                0,
-                rustix::event::EventfdFlags::NONBLOCK | rustix::event::EventfdFlags::CLOEXEC,
-            )?),
+            #[cfg(unix)]
+            completion: crate::completion::Completion::new().ok(),
             paused: false,
             next_id: 0,
             retirer: Retirer::new()?,
@@ -353,11 +350,12 @@ impl DeleteQueue {
         })
     }
 
-    /// Readiness means a worker finished; the input loop drains this counter.
-    #[cfg(target_os = "linux")]
+    /// Readiness means a worker finished; polling remains available without a notifier.
+    #[cfg(unix)]
     pub fn completion_fd(&self) -> Option<rustix::fd::BorrowedFd<'_>> {
-        use std::os::fd::AsFd;
-        Some(self.completion.as_ref().as_fd())
+        self.completion
+            .as_ref()
+            .map(|completion| completion.as_fd())
     }
 
     /// Production jobs retain the identity captured before confirmation.
@@ -701,17 +699,21 @@ impl DeleteQueue {
     }
 
     pub fn start_next(&mut self) -> bool {
-        #[cfg(target_os = "linux")]
-        let completion = Arc::clone(&self.completion);
+        #[cfg(unix)]
+        let completion = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.wake())
+            .unwrap_or_default();
         self.start_next_with(move |entry| {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             let handle = delete::spawn_with_completion(
                 Arc::clone(&entry.anchor),
                 entry.relative.clone(),
                 entry.target,
                 completion,
             );
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             let handle = match entry.target {
                 Some(target) => delete::spawn_confirmed(
                     Arc::clone(&entry.anchor),

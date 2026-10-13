@@ -1,8 +1,12 @@
 pub mod backend;
 pub mod batch;
+#[cfg(unix)]
+mod completion;
 pub mod config;
 pub mod delete;
 pub mod export;
+#[cfg(unix)]
+mod interrupts;
 pub mod model;
 pub mod order;
 pub mod preview;

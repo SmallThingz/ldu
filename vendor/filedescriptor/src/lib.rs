@@ -367,6 +367,23 @@ fn poll_timeout_millis(duration: Option<Duration>) -> libc::c_int {
     })
 }
 
+// Darwin uses select's microsecond timeout instead of poll's milliseconds.
+// Preserve a positive wait after rounding, including a carry into tv_sec.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn select_timeout_timeval(duration: Duration) -> libc::timeval {
+    let micros = duration.as_micros() + u128::from(!duration.subsec_nanos().is_multiple_of(1_000));
+    let seconds = micros / 1_000_000;
+    let maximum = libc::time_t::MAX as u128;
+    libc::timeval {
+        tv_sec: seconds.min(maximum) as _,
+        tv_usec: if seconds > maximum {
+            999_999
+        } else {
+            (micros % 1_000_000) as _
+        },
+    }
+}
+
 /// Examines a set of FileDescriptors to see if some of them are ready for I/O,
 /// or if certain events have occurred on them.
 ///
@@ -432,6 +449,37 @@ mod poll_timeout_tests {
                 expected,
                 "timeout of {nanos} ns"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_positive_fractional_microseconds_round_up_with_carry() {
+        for (nanos, seconds, micros) in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (999, 0, 1),
+            (1_000, 0, 1),
+            (1_001, 0, 2),
+            (999_999_000, 0, 999_999),
+            (999_999_001, 1, 0),
+            (1_000_000_001, 1, 1),
+        ] {
+            let timeout = super::select_timeout_timeval(Duration::from_nanos(nanos));
+            assert_eq!((timeout.tv_sec, timeout.tv_usec), (seconds, micros));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_long_finite_waits_saturate_without_wrapping() {
+        for duration in [
+            Duration::new(libc::time_t::MAX as u64, 999_999_999),
+            Duration::MAX,
+        ] {
+            let timeout = super::select_timeout_timeval(duration);
+            assert_eq!(timeout.tv_sec, libc::time_t::MAX);
+            assert_eq!(timeout.tv_usec, 999_999);
         }
     }
 

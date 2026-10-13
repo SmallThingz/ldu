@@ -263,23 +263,7 @@ impl DeleteHandle {
     }
 }
 
-#[derive(Clone, Default)]
-struct CompletionWake {
-    #[cfg(target_os = "linux")]
-    fd: Option<Arc<rustix::fd::OwnedFd>>,
-}
-
-impl CompletionWake {
-    fn signal(&self) {
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = &self.fd {
-            let increment = 1_u64.to_ne_bytes();
-            // The queue owns a nonblocking eventfd. A full counter is already
-            // readable, so notification never waits for the input thread.
-            while let Err(rustix::io::Errno::INTR) = rustix::io::write(fd.as_ref(), &increment) {}
-        }
-    }
-}
+use crate::completion::Wake as CompletionWake;
 
 struct FinishedGuard {
     state: Arc<WorkerState>,
@@ -313,22 +297,15 @@ pub fn spawn_confirmed(
     spawn_inner(anchor, relative, Some(target), CompletionWake::default())
 }
 
-/// The queue's nonblocking eventfd wakes input polling after final publication.
-#[cfg(target_os = "linux")]
+/// Wake input polling after the result and completion state are published.
+#[cfg(unix)]
 pub(crate) fn spawn_with_completion(
     anchor: Arc<RootAnchor>,
     relative: PathBuf,
     target: Option<ConfirmedTarget>,
-    completion: Arc<rustix::fd::OwnedFd>,
+    completion: CompletionWake,
 ) -> DeleteHandle {
-    spawn_inner(
-        anchor,
-        relative,
-        target,
-        CompletionWake {
-            fd: Some(completion),
-        },
-    )
+    spawn_inner(anchor, relative, target, completion)
 }
 
 fn spawn_inner(
@@ -1588,20 +1565,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn completion_notification_follows_result_and_finished_publication() {
-        use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, eventfd, poll};
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
         let work = fixture();
         std::fs::write(work.path().join("target"), b"remove").unwrap();
         let anchor = Arc::new(RootAnchor::open(work.path()).unwrap());
         let target = capture(&anchor, Path::new("target")).unwrap();
-        let completion =
-            Arc::new(eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC).unwrap());
+        let completion = crate::completion::Completion::new().unwrap();
         let handle = spawn_with_completion(
             anchor,
             PathBuf::from("target"),
             Some(target),
-            Arc::clone(&completion),
+            completion.wake(),
         );
-        let mut fds = [PollFd::new(completion.as_ref(), PollFlags::IN)];
+        let completion_fd = completion.as_fd();
+        let mut fds = [PollFd::new(&completion_fd, PollFlags::IN)];
         assert_eq!(
             poll(
                 &mut fds,
@@ -1616,13 +1593,10 @@ mod tests {
         assert!(handle.is_finished());
         assert!(handle.receiver.try_recv().unwrap().outcome.is_ok());
         let mut count = [0_u8; 8];
-        assert_eq!(
-            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
-            8
-        );
+        assert_eq!(rustix::io::read(completion.as_fd(), &mut count).unwrap(), 8);
         assert_eq!(u64::from_ne_bytes(count), 1);
         assert_eq!(
-            rustix::io::read(completion.as_ref(), &mut count),
+            rustix::io::read(completion.as_fd(), &mut count),
             Err(rustix::io::Errno::AGAIN)
         );
     }
@@ -1630,13 +1604,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn completion_guard_wakes_on_unwind_and_never_waits_on_a_full_counter() {
-        use rustix::event::{EventfdFlags, eventfd};
-        let completion =
-            Arc::new(eventfd(0, EventfdFlags::NONBLOCK | EventfdFlags::CLOEXEC).unwrap());
+        let completion = crate::completion::Completion::new().unwrap();
         let state = Arc::new(WorkerState::default());
-        let wake = CompletionWake {
-            fd: Some(Arc::clone(&completion)),
-        };
+        let wake = completion.wake();
         let (sender, receiver) = bounded(1);
         let result = std::panic::catch_unwind(|| {
             let _guard = FinishedGuard {
@@ -1653,12 +1623,9 @@ mod tests {
         ));
         assert!(state.finished.load(Ordering::Acquire));
         let mut count = [0_u8; 8];
-        assert_eq!(
-            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
-            8
-        );
+        assert_eq!(rustix::io::read(completion.as_fd(), &mut count).unwrap(), 8);
         assert_eq!(u64::from_ne_bytes(count), 1);
-        rustix::io::write(completion.as_ref(), &(u64::MAX - 1).to_ne_bytes()).unwrap();
+        rustix::io::write(completion.as_fd(), &(u64::MAX - 1).to_ne_bytes()).unwrap();
         state.finished.store(false, Ordering::Relaxed);
         drop(FinishedGuard {
             state: Arc::clone(&state),
@@ -1666,10 +1633,7 @@ mod tests {
             sender: None,
         });
         assert!(state.finished.load(Ordering::Acquire));
-        assert_eq!(
-            rustix::io::read(completion.as_ref(), &mut count).unwrap(),
-            8
-        );
+        assert_eq!(rustix::io::read(completion.as_fd(), &mut count).unwrap(), 8);
         assert_eq!(u64::from_ne_bytes(count), u64::MAX - 1);
     }
 

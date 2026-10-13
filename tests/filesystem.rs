@@ -323,9 +323,27 @@ fn unreadable_directory_finishes_with_observable_error_and_partial_total() {
 }
 
 fn ldu_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ldu"));
+    let binary =
+        std::env::var_os("LDU_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_ldu").into());
+    let mut command = Command::new(binary);
     command.env_remove("XDG_CONFIG_HOME").env_remove("HOME");
     command
+}
+
+#[test]
+fn cli_error_with_disconnected_stderr_keeps_failure_exit_status() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let result = ldu_command()
+        .args(["--threads", "0"])
+        .stderr(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
 }
 
 fn export_scan(path: &Path) -> std::process::Output {

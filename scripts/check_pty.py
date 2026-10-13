@@ -402,13 +402,21 @@ class Session:
                 assert self.raw.rfind(disabled) > self.raw.rfind(enabled), "mouse capture was not restored"
         return (time.perf_counter() - begin) * 1000
 
+    def hangup(self):
+        """Disconnect this session's controlling terminal without reaping its child."""
+        descriptor, self.master = self.master, None
+        os.close(descriptor)
+
     def close(self):
         if self.child.poll() is None:
             # Only this harness's ldu child is terminated on assertion failures.
             self.child.kill()
             self.child.wait()
-        termios.tcsetattr(self.slave, termios.TCSANOW, self.saved)
-        os.close(self.master)
+        # A disconnected terminal cannot accept restored attributes. Ordinary
+        # sessions still require restoration in finish() before this cleanup.
+        if self.master is not None:
+            termios.tcsetattr(self.slave, termios.TCSANOW, self.saved)
+            os.close(self.master)
         os.close(self.slave)
         self.config_home.cleanup()
 
@@ -1912,6 +1920,67 @@ def check_owned_quit_interrupts(binary, work, threads):
         finally:
             session.close()
     return metrics
+
+
+def check_owned_terminal_hangup(binary, work, threads):
+    root = work / "terminal-hangup"
+    slow = root / "active"
+    slow.mkdir(parents=True)
+    # Keep the worker active long enough to observe its queue row. Once the
+    # process is stopped, even an already-buffered completion exercises the
+    # failure path: the event loop must still poll and retire that worker.
+    for group in range(32):
+        directory = slow / f"group-{group:02d}"
+        directory.mkdir()
+        for index in range(1024):
+            (directory / f"item-{index:04d}").touch()
+    session = Session(binary, root, threads)
+    try:
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "terminal hangup fixture scan did not complete", timeout=30)
+        pause_empty_queue(session)
+        enqueue_fixture(session, "active", directory=True)
+        open_queue(session, ["active"])
+        session.key(b" ")
+        session.wait(lambda: any(state == "active" and path == "active"
+                                for state, path, _ in queue_rows(session)),
+                     "terminal hangup fixture did not expose active deletion")
+        with stopped_child(session):
+            assert slow.exists(), "terminal hangup fixture finished before its controlled stop"
+            initial_ticks = process_cpu_ticks(session.child.pid)
+            tick_rate = os.sysconf("SC_CLK_TCK") if initial_ticks is not None else None
+            started = time.monotonic()
+            session.hangup()
+            # HUP may itself continue a stopped foreground process. Do not use
+            # Popen.send_signal/poll here: wait4 must collect this child's usage.
+            try:
+                os.kill(session.child.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            deadline = started + 5
+            while True:
+                pid, status, usage = os.wait4(session.child.pid, os.WNOHANG)
+                if pid:
+                    session.child.returncode = os.waitstatus_to_exitcode(status)
+                    break
+                assert time.monotonic() < deadline, "terminal hangup left the owned child running"
+                time.sleep(0.005)
+            elapsed = time.monotonic() - started
+        assert session.child.returncode == 1, \
+            f"terminal hangup did not report its input/output failure: {session.child.returncode}"
+        # Cancellation of this local fixture should retire the worker within a
+        # few event-loop turns. The broken loop always consumed the full 1s grace.
+        assert elapsed < 0.85, f"terminal hangup waited for the full shutdown grace: {elapsed:.3f}s"
+        sample = {"case": "terminal-hangup-during-active-deletion",
+                  "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed * 1000,
+                  "input": []}
+        if initial_ticks is not None:
+            cpu_seconds = max(0, usage.ru_utime + usage.ru_stime - initial_ticks / tick_rate)
+            sample["shutdown_cpu_ms"] = cpu_seconds * 1000
+            assert cpu_seconds < 0.20, f"terminal hangup spun on failed input: {cpu_seconds:.3f}s CPU"
+        return sample
+    finally:
+        session.close()
 
 
 def check_owned_quit_completion(binary, work, threads, replacement_error=False):
@@ -3574,6 +3643,7 @@ def main():
             metrics.append(check_owned_quit_guard(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_mouse_quit(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_quit_interrupts(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_terminal_hangup(args.binary, Path(work), args.threads))
             metrics.append(check_owned_quit_completion(args.binary, Path(work), args.threads))
             metrics.append(check_owned_quit_completion(
                 args.binary, Path(work), args.threads, replacement_error=True))
@@ -3603,7 +3673,7 @@ def main():
         checks = ["initial frame", "untouched startup selection", "help response", "navigation", "resize", "q", "Ctrl-C", "SIGTERM",
                   "scan error", "terminal restoration"]
         if args.root is None:
-            checks += ["shared preview bars", "text and binary file previews", "responsive pane widths", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queued full-path deletion errors", "mouse viewport scrolling and breadcrumb navigation", "trailing header paths", "queue reorder/remove/overlap", "queued descendant markers", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "deletion completions during buffered input", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
+            checks += ["shared preview bars", "text and binary file previews", "responsive pane widths", "cached hover preview", "navigation during reordering", "modal scrolling", "tiny-terminal deletion refusal", "hidden names", "incremental fixture deletion", "paused FIFO queue", "queued full-path deletion errors", "mouse viewport scrolling and breadcrumb navigation", "trailing header paths", "queue reorder/remove/overlap", "queued descendant markers", "deletion cancellation attempt", "guarded deletion quit", "repeated Ctrl-C/SIGINT shutdown", "active-deletion terminal hangup without shutdown spin", "automatic quit after confirmed deletion", "scoped refresh totals and hardlinks", "visual keyboard/mouse selection", "normal/visual input modes", "current-directory fuzzy filter", "visual delete aliases", "pending range deletion", "held edge drag", "visual batch deletion", "confirmed FIFO during batch review", "deletion completions during buffered input", "simultaneous resize and End", "simultaneous resize and confirmation", "fragmented UTF-8 and Escape input", "SIGTERM with incomplete input"]
         if args.root is None:
             checks.append("buffered d/Enter in normal, visual and pending-range deletion with tiny-dialog guards")
             checks.append("clickable header help/queue/delete, selection clear, modal options/scrollbar, queue hover/right-click/click/drag")

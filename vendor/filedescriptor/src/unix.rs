@@ -462,7 +462,7 @@ pub fn poll_impl(pfd: &mut [pollfd], duration: Option<Duration>) -> Result<usize
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use libc::{fd_set, timeval, FD_ISSET, FD_SET, FD_SETSIZE, FD_ZERO, POLLERR, POLLIN, POLLOUT};
+    use libc::{fd_set, FD_ISSET, FD_SET, FD_SETSIZE, FD_ZERO, POLLERR, POLLIN, POLLOUT};
     use std::os::unix::io::RawFd;
 
     struct FdSet {
@@ -539,10 +539,7 @@ mod macos {
             materialize(&mut exception_set).add(item.fd)?;
         }
 
-        let mut timeout = duration.map(|d| timeval {
-            tv_sec: d.as_secs() as _,
-            tv_usec: d.subsec_micros() as _,
-        });
+        let mut timeout = duration.map(crate::select_timeout_timeval);
 
         let res = unsafe {
             libc::select(

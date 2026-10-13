@@ -33,7 +33,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal};
 use std::panic::{self, PanicHookInfo};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,40 @@ const SCROLL_MARGIN: usize = 3;
 const VISUAL_INTENT_LIMIT: usize = 128;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+// Ratatui prints cursor-restoration errors to stderr from Terminal::drop.
+// After a PTY hangup both streams may be closed, so that diagnostic can panic.
+// TerminalGuard owns restoration; suppress only the redundant cleanup writes.
+struct TerminalOutput<'a, W> {
+    writer: W,
+    cleaning_up: &'a std::cell::Cell<bool>,
+}
+
+impl<W: io::Write> io::Write for TerminalOutput<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cleaning_up.get() {
+            Ok(bytes.len())
+        } else {
+            self.writer.write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.cleaning_up.get() {
+            Ok(())
+        } else {
+            self.writer.flush()
+        }
+    }
+}
+
+struct TerminalOutputCleanup<'a>(&'a std::cell::Cell<bool>);
+
+impl Drop for TerminalOutputCleanup<'_> {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
 
 struct TerminalGuard {
     previous_hook: Option<Arc<PanicHook>>,
@@ -7202,15 +7236,6 @@ fn prioritize_deletion(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan
     }
 }
 
-fn take_interrupt(interrupts: &AtomicUsize) -> bool {
-    // The UI is the only consumer; signal callbacks only increment the count.
-    if interrupts.load(Ordering::Acquire) == 0 {
-        return false;
-    }
-    interrupts.fetch_sub(1, Ordering::AcqRel);
-    true
-}
-
 fn stop_work(app: &mut App, scanner: &ScanHandle, scopes: &[ScopedScan], queue: &mut DeleteQueue) {
     app.clear_visual_intent();
     app.deferred_delete = None;
@@ -7231,24 +7256,29 @@ pub fn run(
             "interactive browsing requires a terminal; use -o FILE to export, or -o - for stdout",
         ));
     }
-    let interrupts = Arc::new(AtomicUsize::new(0));
-    let signal_interrupts = Arc::clone(&interrupts);
-    ctrlc::set_handler(move || {
-        signal_interrupts.fetch_add(1, Ordering::Release);
-    })
-    .map_err(io::Error::other)?;
+    #[cfg(unix)]
+    let mut interrupts = crate::interrupts::Interrupts::new()?;
     let mouse = settings.mouse;
     let mut app = App::with_settings(root.clone(), size_mode, settings)?;
     let _guard = TerminalGuard::enter(mouse)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let cleaning_up = std::cell::Cell::new(false);
+    let output = TerminalOutput {
+        writer: io::stdout(),
+        cleaning_up: &cleaning_up,
+    };
+    let mut terminal = Terminal::new(CrosstermBackend::new(output))?;
+    // Declared after Terminal so every early return and unwind disables its
+    // destructor's output before TerminalGuard restores the terminal itself.
+    let output_cleanup = TerminalOutputCleanup(&cleaning_up);
     terminal.draw(|frame| app.draw(frame, false, false))?;
-    if take_interrupt(&interrupts) {
+    #[cfg(unix)]
+    if interrupts.take()? {
         return Ok(());
     }
     let scanner = scan::spawn(root, options.clone());
     app.file_anchor = Some(Arc::clone(&scanner.anchor));
     let mut queue = DeleteQueue::new()?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let mut input_waiter = crate::terminal_input::Waiter::new()?;
     let mut scopes = Vec::new();
     let scope_retirer = Retirer::<Vec<ScopedScan>>::new()?;
@@ -7323,24 +7353,45 @@ pub fn run(
             break;
         }
         prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
-        let interrupt = take_interrupt(&interrupts);
-        let input = if interrupt {
-            Ok(true)
+        let (interrupt, input) = if failure.is_some() {
+            // A disconnected input source stays ready forever. Do not poll it
+            // again or skip queue completion while cancelled workers stop.
+            let remaining = shutdown_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(INPUT_INTERVAL);
+            std::thread::sleep(INPUT_INTERVAL.min(remaining));
+            (false, Ok(false))
         } else {
-            #[cfg(target_os = "linux")]
-            let ready = input_waiter.poll(
-                input_timeout,
-                queue.completion_fd(),
-                queue.active().is_some(),
-            );
-            #[cfg(not(target_os = "linux"))]
-            // Crossterm's Unix reader skips raw and buffered input with a zero budget.
-            let ready = event::poll(input_timeout.max(Duration::from_millis(1)));
-            ready
+            #[cfg(unix)]
+            let interrupt = match interrupts.take() {
+                Ok(interrupt) => interrupt,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            #[cfg(not(unix))]
+            let interrupt = false;
+            let input = if interrupt {
+                Ok(true)
+            } else {
+                #[cfg(unix)]
+                let ready = input_waiter.poll(
+                    input_timeout,
+                    queue.completion_fd(),
+                    interrupts.as_fd(),
+                    queue.active().is_some(),
+                );
+                #[cfg(not(unix))]
+                // Crossterm's Unix reader skips raw and buffered input with a zero budget.
+                let ready = event::poll(input_timeout.max(Duration::from_millis(1)));
+                ready
+            };
+            (interrupt, input)
         };
         match input {
             Err(error) => {
-                failure = Some(error);
+                failure.get_or_insert(error);
                 continue;
             }
             Ok(true) => {
@@ -7350,7 +7401,7 @@ pub fn run(
                     match event::read() {
                         Ok(event) => event,
                         Err(error) => {
-                            failure = Some(error);
+                            failure.get_or_insert(error);
                             continue;
                         }
                     }
@@ -7390,7 +7441,7 @@ pub fn run(
                                 Ok(_) => {}
                                 Err(error) => {
                                     *reviewable = false;
-                                    failure = Some(error);
+                                    failure.get_or_insert(error);
                                     continue;
                                 }
                             }
@@ -7419,7 +7470,7 @@ pub fn run(
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
-                                    failure = Some(error);
+                                    failure.get_or_insert(error);
                                     continue;
                                 }
                             }
@@ -7559,7 +7610,7 @@ pub fn run(
                             )
                         })
                     {
-                        failure = Some(error);
+                        failure.get_or_insert(error);
                     }
                     next_frame = Instant::now() + FRAME_INTERVAL;
                 }
@@ -7618,7 +7669,9 @@ pub fn run(
                     frame_gate.dirty = true;
                     next_frame = Instant::now();
                 }
-                Err(error) => failure = Some(error),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
         let batch_status = if !quitting {
@@ -7746,7 +7799,7 @@ pub fn run(
                     )
                 })
             {
-                failure = Some(error);
+                failure.get_or_insert(error);
             }
             // A skipped frame must still move the deadline beyond the next poll.
             next_frame = Instant::now() + FRAME_INTERVAL;
@@ -7795,6 +7848,7 @@ pub fn run(
     }
     // A cancelled syscall may still be blocked. Restore the terminal without
     // joining workers; process exit ends remaining in-process detached work.
+    drop(output_cleanup);
     drop(terminal);
     drop(_guard);
     scopes.push(ScopedScan {

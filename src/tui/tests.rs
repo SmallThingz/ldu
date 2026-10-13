@@ -12864,18 +12864,6 @@ fn filter_q_is_text_during_deletion_but_ctrl_c_still_uses_the_quit_guard() {
 }
 
 #[test]
-fn counted_interrupts_remain_available_for_both_quit_steps() {
-    let pending = AtomicUsize::new(2);
-    assert!(take_interrupt(&pending));
-    assert_eq!(pending.load(Ordering::Acquire), 1);
-    assert!(take_interrupt(&pending));
-    assert!(!take_interrupt(&pending));
-    pending.fetch_add(1, Ordering::Release);
-    assert!(take_interrupt(&pending));
-    assert!(!take_interrupt(&pending));
-}
-
-#[test]
 fn filter_refresh_retains_current_query_and_clears_ancestor_fallback_state() {
     for ancestor in [false, true] {
         let mut app = browser_fixture();
@@ -13896,4 +13884,84 @@ fn quit_prompt_suspends_auto_confirmation_but_keeps_validation_results() {
             ..
         })
     ));
+}
+
+#[test]
+fn terminal_cleanup_preserves_write_failures_without_retrying_a_closed_writer() {
+    use std::cell::Cell;
+    use std::io::Write;
+
+    struct DisconnectingWriter<'a> {
+        disconnected: &'a Cell<bool>,
+        calls: &'a Cell<usize>,
+    }
+    impl Write for DisconnectingWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            if self.disconnected.get() {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "owned terminal disconnected",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.write(&[]).map(|_| ())
+        }
+    }
+
+    for unwind in [false, true] {
+        let disconnected = Cell::new(false);
+        let calls = Cell::new(0);
+        let calls_before_cleanup = Cell::new(0);
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                let cleaning_up = Cell::new(false);
+                let output = TerminalOutput {
+                    writer: DisconnectingWriter {
+                        disconnected: &disconnected,
+                        calls: &calls,
+                    },
+                    cleaning_up: &cleaning_up,
+                };
+                let mut terminal = Terminal::with_options(
+                    CrosstermBackend::new(output),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 10, 2)),
+                    },
+                )?;
+                let _cleanup = TerminalOutputCleanup(&cleaning_up);
+                terminal.hide_cursor()?;
+                assert!(
+                    calls.get() > 0,
+                    "ordinary terminal output must reach the writer"
+                );
+                disconnected.set(true);
+                let error = terminal
+                    .backend_mut()
+                    .write_all(b"failed frame")
+                    .unwrap_err();
+                calls_before_cleanup.set(calls.get());
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                if unwind {
+                    panic!("owned terminal unwind");
+                }
+                Err(error)
+            }));
+        if unwind {
+            assert!(outcome.is_err());
+        } else {
+            let error = outcome.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "owned terminal disconnected");
+        }
+        assert_eq!(
+            calls.get(),
+            calls_before_cleanup.get(),
+            "Ratatui cleanup must not retry the closed writer or trigger its stderr diagnostic"
+        );
+    }
 }
