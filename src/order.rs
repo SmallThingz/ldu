@@ -938,10 +938,12 @@ impl CacheState {
                         if self.is_removed(parent) {
                             continue;
                         }
-                        let directory = self
-                            .directories
-                            .entry(parent)
-                            .or_insert_with(|| CachedDirectory::new(self.config));
+                        let (directory, parent_created) = match self.directories.entry(parent) {
+                            Entry::Occupied(entry) => (entry.into_mut(), false),
+                            Entry::Vacant(entry) => {
+                                (entry.insert(CachedDirectory::new(self.config)), true)
+                            }
+                        };
                         let visible = self.config.show_hidden
                             || !row.name.as_encoded_bytes().starts_with(b".");
                         let order_changed = match directory.order.rows.entry(row.id) {
@@ -952,7 +954,6 @@ impl CacheState {
                                 // Names and kinds also affect filtered membership.
                                 let membership_changed =
                                     previous.name != row.name || previous.kind != row.kind;
-                                directory.membership_dirty |= membership_changed;
                                 let order_changed = membership_changed
                                     || match self.config.sort_mode {
                                         SortMode::Size => previous.size != row.size,
@@ -961,6 +962,8 @@ impl CacheState {
                                     };
                                 let previous_visible = self.config.show_hidden
                                     || !entry.get().row.name.as_encoded_bytes().starts_with(b".");
+                                directory.membership_dirty |=
+                                    membership_changed && (visible || previous_visible);
                                 directory.visible_count -= usize::from(previous_visible);
                                 directory.visible_count += usize::from(visible);
                                 directory.directory_count -= usize::from(
@@ -969,17 +972,17 @@ impl CacheState {
                                 directory.directory_count +=
                                     usize::from(visible && row.kind == NodeKind::Directory);
                                 entry.get_mut().row = row;
-                                order_changed
+                                order_changed && (visible || previous_visible)
                             }
                             Entry::Vacant(entry) => {
                                 directory.visible_count += usize::from(visible);
                                 directory.directory_count +=
                                     usize::from(visible && row.kind == NodeKind::Directory);
                                 entry.insert(RowState { row, rank: None });
-                                true
+                                visible
                             }
                         };
-                        if order_changed {
+                        if order_changed || parent_created {
                             self.mark_dirty(parent);
                         }
                     }
@@ -990,15 +993,16 @@ impl CacheState {
                     self.removed.insert(id);
                     if let Some(parent) = self.parents.get(&id).and_then(|link| link.parent)
                         && let Some(directory) = self.directories.get_mut(&parent)
+                        && let Some(removed) = directory.order.rows.remove(&id)
                     {
-                        if let Some(removed) = directory.order.rows.remove(&id) {
-                            let visible = self.config.show_hidden
-                                || !removed.row.name.as_encoded_bytes().starts_with(b".");
-                            directory.visible_count -= usize::from(visible);
-                            directory.directory_count -=
-                                usize::from(visible && removed.row.kind == NodeKind::Directory);
+                        let visible = self.config.show_hidden
+                            || !removed.row.name.as_encoded_bytes().starts_with(b".");
+                        directory.visible_count -= usize::from(visible);
+                        directory.directory_count -=
+                            usize::from(visible && removed.row.kind == NodeKind::Directory);
+                        if visible {
+                            self.mark_dirty(parent);
                         }
-                        self.mark_dirty(parent);
                     }
                     self.cleanup.push_back(id);
                     self.remove_view(id, cache);
@@ -1259,6 +1263,208 @@ mod tests {
             &cache,
         );
         (state, cache)
+    }
+
+    #[test]
+    fn hidden_children_before_parent_schedule_initial_empty_view() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Configure {
+                generation: 1,
+                config: OrderConfig {
+                    show_hidden: false,
+                    ..OrderConfig::default()
+                },
+                clear: false,
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(2), 3, ".child", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        let priorities = [AtomicU32::new(ROOT), AtomicU32::new(NodeId::MAX)];
+        while let Some(id) = state.next_dirty(&priorities) {
+            state.publish(id, &cache);
+        }
+        let child_view = Arc::clone(&cache.load_full()[&2]);
+        assert!(child_view.ids.is_empty());
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(
+                    Some(ROOT),
+                    2,
+                    ".parent",
+                    100,
+                    NodeKind::Directory,
+                )],
+            },
+            &cache,
+        );
+        while let Some(id) = state.next_dirty(&priorities) {
+            state.publish(id, &cache);
+        }
+        assert!(cache.load_full()[&ROOT].ids.is_empty());
+        assert!(Arc::ptr_eq(&child_view, &cache.load_full()[&2]));
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(2), 3, ".renamed", 999, NodeKind::File),
+                    cache_row(Some(2), 4, ".new", 1, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Remove {
+                generation: 1,
+                ids: vec![4],
+            },
+            &cache,
+        );
+        assert!(state.next_dirty(&priorities).is_none());
+        assert!(!state.directories[&2].order.dirty);
+        assert!(Arc::ptr_eq(&child_view, &cache.load_full()[&2]));
+    }
+
+    #[test]
+    fn hidden_rows_keep_metadata_warm_without_resorting_visible_views() {
+        for sort_mode in [SortMode::Size, SortMode::Items, SortMode::Name] {
+            let (mut state, cache) = cache_state();
+            let config = OrderConfig {
+                show_hidden: false,
+                sort_mode,
+                ..OrderConfig::default()
+            };
+            state.apply(
+                CacheCommand::Configure {
+                    generation: 1,
+                    config,
+                    clear: false,
+                },
+                &cache,
+            );
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![
+                        cache_row(Some(ROOT), 1, "visible", 100, NodeKind::File),
+                        cache_row(Some(ROOT), 2, ".hidden", 200, NodeKind::File),
+                    ],
+                },
+                &cache,
+            );
+            state.publish(ROOT, &cache);
+            let original = Arc::clone(&cache.load_full()[&ROOT]);
+            let mut hidden = cache_row(Some(ROOT), 2, ".renamed", 999, NodeKind::Directory);
+            hidden.row.items = 42;
+            state.apply(
+                CacheCommand::Upsert {
+                    generation: 1,
+                    rows: vec![
+                        hidden,
+                        cache_row(Some(ROOT), 3, ".new", 300, NodeKind::File),
+                    ],
+                },
+                &cache,
+            );
+            assert!(!state.directories[&ROOT].order.dirty);
+            assert!(!state.directories[&ROOT].membership_dirty);
+            assert_eq!(state.directories[&ROOT].visible_count, 1);
+            assert_eq!(state.directories[&ROOT].directory_count, 0);
+            assert_eq!(state.directories[&ROOT].order.rows[&2].row.size, 999);
+            assert_eq!(state.directories[&ROOT].order.rows[&2].row.items, 42);
+            assert!(state.directories.contains_key(&2));
+            state.apply(
+                CacheCommand::Remove {
+                    generation: 1,
+                    ids: vec![3],
+                },
+                &cache,
+            );
+            assert!(!state.directories[&ROOT].order.dirty);
+            assert!(Arc::ptr_eq(&original, &cache.load_full()[&ROOT]));
+            state.apply(
+                CacheCommand::Configure {
+                    generation: 2,
+                    config: OrderConfig {
+                        show_hidden: true,
+                        ..config
+                    },
+                    clear: false,
+                },
+                &cache,
+            );
+            state.publish(ROOT, &cache);
+            let view = &cache.load_full()[&ROOT];
+            assert_eq!(view.ids.len(), 2);
+            assert!(view.position(1).is_some() && view.position(2).is_some());
+            assert_eq!(state.directories[&ROOT].directory_count, 1);
+            assert_eq!(state.directories[&ROOT].order.rows[&2].row.size, 999);
+        }
+    }
+
+    #[test]
+    fn hidden_visible_transitions_still_invalidate_order_and_filters() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Configure {
+                generation: 1,
+                config: OrderConfig {
+                    show_hidden: false,
+                    ..OrderConfig::default()
+                },
+                clear: false,
+            },
+            &cache,
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, ".hidden", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "visible", false);
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "visible", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        assert!(state.directories[&ROOT].membership_dirty);
+        state.publish(ROOT, &cache);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [1]);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, ".hidden", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
+        assert_eq!(state.directories[&ROOT].visible_count, 0);
     }
 
     #[test]
