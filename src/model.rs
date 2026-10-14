@@ -1031,7 +1031,7 @@ impl Model {
                     self.record_error(scope, error);
                 }
                 if let Some(parent) = mapped_parent {
-                    self.add_entries(parent, generation, entries, &mut changed);
+                    self.add_entries(parent, generation, parent_live, entries, &mut changed);
                 } else {
                     if parent_live {
                         self.record_error(scope, format!("entries have unknown parent {parent}"));
@@ -1112,10 +1112,12 @@ impl Model {
         &mut self,
         parent: NodeId,
         generation: u64,
+        parent_live: bool,
         entries: Vec<Entry>,
         changed: &mut Vec<NodeId>,
     ) {
-        if !self.accepts_scan(parent, generation) {
+        // Scope-map growth and diagnostic counters do not change admission.
+        if !parent_live {
             for entry in entries {
                 self.append_tombstone(parent, generation, entry);
             }
@@ -1153,10 +1155,11 @@ impl Model {
                 continue;
             }
             let (charged, duplicate) = if let Some(group_id) = entry.hardlink_group {
+                let group = self.hardlink_index(group_id, entry.sizes);
+                let index = group.0;
                 // The charge for an earlier owner in this same batch has not yet
                 // reached the parent. Correct that local sum before updating it.
-                if let Some(&index) = self.hardlink_indices.get(&group_id)
-                    && let Some(owner) = self.hardlink_groups[index].owner
+                if let Some(owner) = self.hardlink_groups[index].owner
                     && owner >= batch_start
                     && self.is_live(owner)
                     && generation >= self.hardlink_groups[index].metadata_generation
@@ -1180,7 +1183,14 @@ impl Model {
                         changed.push(owner);
                     }
                 }
-                self.remember_hardlink(group_id, entry.id, entry.sizes, generation, true, changed)
+                self.remember_hardlink_index(
+                    group,
+                    entry.id,
+                    entry.sizes,
+                    generation,
+                    true,
+                    changed,
+                )
             } else if entry.hardlink_duplicate {
                 (Sizes::default(), true)
             } else {
@@ -1245,16 +1255,8 @@ impl Model {
         self.add_totals(parent, sizes, items, errors, overflow, changed);
     }
 
-    fn remember_hardlink(
-        &mut self,
-        group_id: NodeId,
-        id: NodeId,
-        sizes: Sizes,
-        generation: u64,
-        live: bool,
-        changed: &mut Vec<NodeId>,
-    ) -> (Sizes, bool) {
-        let (index, new_group) = match self.hardlink_indices.entry(group_id) {
+    fn hardlink_index(&mut self, group_id: NodeId, sizes: Sizes) -> (usize, bool) {
+        match self.hardlink_indices.entry(group_id) {
             HashEntry::Occupied(entry) => (*entry.get(), false),
             HashEntry::Vacant(entry) => {
                 let index = self.hardlink_groups.len();
@@ -1267,7 +1269,31 @@ impl Model {
                 });
                 (index, true)
             }
-        };
+        }
+    }
+
+    fn remember_hardlink(
+        &mut self,
+        group_id: NodeId,
+        id: NodeId,
+        sizes: Sizes,
+        generation: u64,
+        live: bool,
+        changed: &mut Vec<NodeId>,
+    ) -> (Sizes, bool) {
+        let group = self.hardlink_index(group_id, sizes);
+        self.remember_hardlink_index(group, id, sizes, generation, live, changed)
+    }
+
+    fn remember_hardlink_index(
+        &mut self,
+        (index, new_group): (usize, bool),
+        id: NodeId,
+        sizes: Sizes,
+        generation: u64,
+        live: bool,
+        changed: &mut Vec<NodeId>,
+    ) -> (Sizes, bool) {
         let owner_live = self.hardlink_groups[index]
             .owner
             .is_some_and(|owner| self.is_live(owner));
