@@ -97,7 +97,13 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&mut self) -> SortedRows {
+        self.snapshot_unless_unchanged(None)
+            .expect("initial snapshot")
+    }
+
+    fn snapshot_unless_unchanged(&mut self, previous: Option<&[NodeId]>) -> Option<SortedRows> {
         let config = self.config;
         let mut ranked: Vec<_> = self
             .rows
@@ -109,6 +115,20 @@ impl State {
         ranked.sort_unstable_by(|a, b| compare_rows(a, b, config));
         if config.sort_mode == SortMode::Size {
             stabilize_size_groups(&mut ranked, config);
+        }
+        let unchanged = previous.is_some_and(|previous| {
+            previous.len() == ranked.len()
+                && ranked
+                    .iter()
+                    .zip(previous)
+                    .all(|(state, &id)| state.row.id == id)
+        });
+        if unchanged {
+            for (rank, state) in ranked.into_iter().enumerate() {
+                state.rank = NonZeroUsize::new(rank + 1);
+            }
+            self.dirty = false;
+            return None;
         }
         let mut ids = Vec::with_capacity(ranked.len());
         let mut positions = HashMap::with_capacity(ranked.len());
@@ -122,7 +142,7 @@ impl State {
             );
         }
         self.dirty = false;
-        SortedRows { ids, positions }
+        Some(SortedRows { ids, positions })
     }
 }
 
@@ -659,6 +679,8 @@ struct CachedDirectory {
     directory_count: usize,
     visible_count: usize,
     published_has_directories: bool,
+    // Even an unchanged ID order must invalidate filtered name/kind membership.
+    membership_dirty: bool,
 }
 
 impl CachedDirectory {
@@ -673,6 +695,7 @@ impl CachedDirectory {
             directory_count: 0,
             visible_count: 0,
             published_has_directories: false,
+            membership_dirty: false,
         }
     }
 }
@@ -927,8 +950,10 @@ impl CacheState {
                                 // Snapshots contain IDs and positions only. Keep all
                                 // metadata current without rebuilding an unchanged order.
                                 // Names and kinds also affect filtered membership.
-                                let order_changed = previous.name != row.name
-                                    || previous.kind != row.kind
+                                let membership_changed =
+                                    previous.name != row.name || previous.kind != row.kind;
+                                directory.membership_dirty |= membership_changed;
+                                let order_changed = membership_changed
                                     || match self.config.sort_mode {
                                         SortMode::Size => previous.size != row.size,
                                         SortMode::Items => previous.items != row.items,
@@ -1020,17 +1045,31 @@ impl CacheState {
     }
 
     fn publish(&mut self, id: NodeId, cache: &SharedCache) {
+        let child_epoch = self.parents.get(&id).map_or(0, |link| link.child_epoch);
         let directory = self.directories.get_mut(&id).unwrap();
-        let snapshot = directory.order.snapshot();
+        let previous_ids = self
+            .published
+            .get(&id)
+            .filter(|view| {
+                view.generation == self.generation
+                    && view.child_epoch == child_epoch
+                    && !directory.membership_dirty
+            })
+            .map(|view| view.ids.as_slice());
+        let snapshot = directory.order.snapshot_unless_unchanged(previous_ids);
+        directory.published = Some(Instant::now());
+        directory.published_has_rows = directory.visible_count != 0;
+        directory.published_has_directories = directory.directory_count != 0;
+        directory.membership_dirty = false;
+        let Some(snapshot) = snapshot else {
+            return;
+        };
         let view = Arc::new(CachedSnapshot {
             generation: self.generation,
-            child_epoch: self.parents.get(&id).map_or(0, |link| link.child_epoch),
+            child_epoch,
             ids: snapshot.ids,
             positions: snapshot.positions,
         });
-        directory.published = Some(Instant::now());
-        directory.published_has_rows = !view.ids.is_empty();
-        directory.published_has_directories = directory.directory_count != 0;
         let previous = self.published.insert(id, view);
         self.publish_index(cache);
         if let Some(old) = previous {
@@ -1220,6 +1259,102 @@ mod tests {
             &cache,
         );
         (state, cache)
+    }
+
+    #[test]
+    fn stable_size_order_reuses_view_and_filter_but_updates_metadata() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![
+                    cache_row(Some(ROOT), 1, "alpha", 100, NodeKind::File),
+                    cache_row(Some(ROOT), 2, "beta", 99, NodeKind::File),
+                ],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let original_index = cache.load_full();
+        let original = Arc::clone(&original_index[&ROOT]);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "alpha", false);
+        let filtered = finish_filter(&mut filtering, &mut state, &mailbox);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 2, "beta", 101, NodeKind::File)],
+            },
+            &cache,
+        );
+        assert!(state.directories[&ROOT].order.dirty);
+        state.publish(ROOT, &cache);
+        assert!(Arc::ptr_eq(&original_index, &cache.load_full()));
+        assert!(Arc::ptr_eq(&original, &cache.load_full()[&ROOT]));
+        assert!(!state.directories[&ROOT].order.dirty);
+        assert_eq!(state.directories[&ROOT].order.rows[&2].row.size, 101);
+        assert!(Arc::ptr_eq(
+            &filtered,
+            &finish_filter(&mut filtering, &mut state, &mailbox)
+        ));
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 2, "beta", 1000, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        assert_eq!(cache.load_full()[&ROOT].ids, [2, 1]);
+        assert!(!Arc::ptr_eq(&original, &cache.load_full()[&ROOT]));
+    }
+
+    #[test]
+    fn unchanged_ids_still_invalidate_name_and_kind_filter_membership() {
+        let (mut state, cache) = cache_state();
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "alpha", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        let mailbox = FilterMailbox::new();
+        let mut filtering = FilterState::default();
+        filter_request(&mailbox, 1, "alpha", false);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [1]);
+        let original = Arc::clone(&cache.load_full()[&ROOT]);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "beta", 100, NodeKind::File)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        assert!(!Arc::ptr_eq(&original, &cache.load_full()[&ROOT]));
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
+        filter_request(&mailbox, 2, "beta", true);
+        assert!(
+            finish_filter(&mut filtering, &mut state, &mailbox)
+                .ids
+                .is_empty()
+        );
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(ROOT), 1, "beta", 100, NodeKind::Directory)],
+            },
+            &cache,
+        );
+        state.publish(ROOT, &cache);
+        assert_eq!(finish_filter(&mut filtering, &mut state, &mailbox).ids, [1]);
     }
 
     #[test]
@@ -1789,7 +1924,16 @@ mod tests {
         let view = Arc::clone(&index[&0]);
         let old_index = Arc::downgrade(&index);
         let old_view = Arc::downgrade(&view);
+        state.apply(
+            CacheCommand::Upsert {
+                generation: 1,
+                rows: vec![cache_row(Some(0), 2, "new file", 20, NodeKind::File)],
+            },
+            &cache,
+        );
         state.publish(0, &cache);
+        assert_eq!(cache.load_full()[&0].ids, [2, 1]);
+        assert_eq!(view.ids, [1]);
         drop(index);
         assert!(
             old_index.upgrade().is_some(),
