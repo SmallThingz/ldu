@@ -8161,6 +8161,25 @@ pub fn run(
     }
 }
 
+fn take_scan_entries(
+    pending: &mut Option<(NodeId, std::vec::IntoIter<Entry>)>,
+) -> Option<ScanEvent> {
+    let (parent, entries) = pending.as_mut()?;
+    if entries.len() > 128 {
+        return Some(ScanEvent::Entries {
+            parent: *parent,
+            entries: entries.by_ref().take(128).collect(),
+        });
+    }
+    // Moving an unadvanced IntoIter into collect preserves its Vec allocation.
+    // Larger publications still advance only one bounded chunk at a time.
+    let (parent, entries) = pending.take().expect("pending scan entries exist");
+    Some(ScanEvent::Entries {
+        parent,
+        entries: entries.collect(),
+    })
+}
+
 fn drain_scope(scope: &mut ScopedScan, app: &mut App, discard: bool, deadline: Instant) {
     if discard {
         scope.entries = None;
@@ -8169,14 +8188,7 @@ fn drain_scope(scope: &mut ScopedScan, app: &mut App, discard: bool, deadline: I
         if Instant::now() >= deadline {
             break;
         }
-        if let Some((parent, entries)) = scope.entries.as_mut() {
-            let event = ScanEvent::Entries {
-                parent: *parent,
-                entries: entries.by_ref().take(128).collect(),
-            };
-            if entries.len() == 0 {
-                scope.entries = None;
-            }
+        if let Some(event) = take_scan_entries(&mut scope.entries) {
             let changed = app.model.apply_scoped(scope.scope, scope.generation, event);
             app.changed(changed);
             continue;
@@ -8225,14 +8237,7 @@ fn drain(handle: &ScanHandle, app: &mut App, discard: bool) {
         if Instant::now() >= deadline {
             break;
         }
-        if let Some((parent, entries)) = app.scan_entries.as_mut() {
-            let event = ScanEvent::Entries {
-                parent: *parent,
-                entries: entries.by_ref().take(128).collect(),
-            };
-            if entries.len() == 0 {
-                app.scan_entries = None;
-            }
+        if let Some(event) = take_scan_entries(&mut app.scan_entries) {
             let changed = app.model.apply(event);
             app.changed(changed);
             continue;

@@ -15219,3 +15219,29 @@ fn selected_browser_rows_keep_names_graphs_counts_and_status_glyphs_readable() {
         }
     }
 }
+
+#[test]
+fn scan_entry_chunks_preserve_order_parent_and_small_publication_storage() {
+    for count in [0, 1, 127, 128, 129, 256, 257] {
+        let original: Vec<_> = (0..count)
+            .map(|id| entry(id, "data", NodeKind::File, 1))
+            .collect();
+        let storage = original.as_ptr();
+        let mut pending = Some((42, original.into_iter()));
+        let mut ids = Vec::new();
+        let mut chunks = 0;
+        while let Some(ScanEvent::Entries { parent, entries }) = take_scan_entries(&mut pending) {
+            assert_eq!(parent, 42);
+            assert!(entries.len() <= 128);
+            if count > 0 && count <= 128 {
+                assert_eq!(entries.as_ptr(), storage);
+            }
+            ids.extend(entries.into_iter().map(|entry| entry.id));
+            chunks += 1;
+        }
+        assert_eq!(ids, (0..count).collect::<Vec<_>>());
+        assert_eq!(chunks, (count as usize).div_ceil(128).max(1));
+        assert!(pending.is_none());
+    }
+    assert!(take_scan_entries(&mut None).is_none());
+}
