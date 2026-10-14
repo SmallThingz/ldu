@@ -425,6 +425,8 @@ enum VisualIntent {
     ScrollViewport(PendingScroll),
     Navigate(Navigation, bool),
     ToggleCurrent,
+    SelectStable(NodeId, bool),
+    SelectParent(bool),
     ToggleStable(NodeId),
     FocusStable(NodeId),
     ToggleParent,
@@ -451,10 +453,14 @@ struct QueueView {
     cancelling: bool,
     pending: usize,
     paused: bool,
+    active_target: Option<(QueueId, String)>,
+    active_progress: delete::DeleteProgress,
+    active_total: u64,
     rows: Vec<(QueueId, bool, String)>,
     selected: Option<QueueId>,
     // Endpoints are exact; the linked queue uses a midpoint when both ends are hidden.
     scroll_position: usize,
+    progress_scroll: u16,
 }
 
 struct Preview {
@@ -1192,7 +1198,14 @@ impl App {
         }
         self.changed(changed);
         self.visual.remove(id);
-        if let Some(baseline) = &mut self.mouse_baseline {
+        // The first Shift-drag still needs the pressed origin's membership.
+        // Keep that private witness until conversion; first motion removes the
+        // dead anchor immediately after restoring the baseline.
+        if let Some(baseline) = &mut self.mouse_baseline
+            && !(self.drag_mode == RangeMode::Invert
+                && !self.drag_started
+                && self.drag_anchor == Some(id))
+        {
             baseline.remove(&id);
         }
         for modal in [&mut self.modal, &mut self.previous_modal] {
@@ -1609,6 +1622,14 @@ impl App {
         }
     }
 
+    fn ensure_parent_contents(&mut self) {
+        self.select_parent_contents(false);
+        if let Some(selection) = &mut self.parent_selection {
+            // Right-click and visual entry add the group even if it was all marked.
+            selection.all_selected = false;
+        }
+    }
+
     fn cancel_parent_selection(&mut self) {
         self.parent_select_pending = false;
         self.parent_selection = None;
@@ -1913,8 +1934,45 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Up(MouseButton::Right) => {
-                    // An unmoved right-click only enters/focuses visual mode.
-                    // A moved release above completes a coalesced drag.
+                    // Mark only a completed click. A drag keeps its original
+                    // membership so entering visual mode cannot reverse it.
+                    let valid = press.valid
+                        && press.directory == self.directory
+                        && press.epoch == self.model.node(self.directory).child_epoch
+                        && press.area
+                            == match press.target {
+                                BrowserTarget::Entry(_) => self.list_area,
+                                BrowserTarget::Parent => self.parent_area,
+                            };
+                    if valid {
+                        let remove = press.modifiers.contains(KeyModifiers::CONTROL);
+                        match press.target {
+                            BrowserTarget::Entry(id) if self.visual_busy() => {
+                                self.try_enqueue_visual(VisualIntent::SelectStable(id, remove));
+                            }
+                            BrowserTarget::Entry(id)
+                                if self.eligible(id)
+                                    && self.model.node(id).parent == Some(self.directory) =>
+                            {
+                                if remove {
+                                    self.visual.deselect(id);
+                                } else {
+                                    self.visual.select(id);
+                                }
+                            }
+                            BrowserTarget::Parent if self.visual_busy() => {
+                                self.try_enqueue_visual(VisualIntent::SelectParent(remove));
+                            }
+                            BrowserTarget::Parent => {
+                                if remove {
+                                    self.select_parent_contents(true);
+                                } else {
+                                    self.ensure_parent_contents();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     self.visual
                         .retire_snapshot_and_order(im::HashSet::new(), press.view);
                     return true;
@@ -2617,7 +2675,10 @@ impl App {
                 Modal::Quit { reviewable } => match key.code {
                     KeyCode::Enter | KeyCode::Char('q') if reviewable => return Action::Quit,
                     KeyCode::Esc | KeyCode::Char('n') => self.modal = self.previous_modal.take(),
-                    _ => self.modal = Some(Modal::Quit { reviewable }),
+                    other => {
+                        scroll_key(other, &mut self.queue_view.progress_scroll);
+                        self.modal = Some(Modal::Quit { reviewable });
+                    }
                 },
                 Modal::Stopping => self.modal = Some(Modal::Stopping),
                 Modal::Enqueueing => match key.code {
@@ -2896,11 +2957,22 @@ impl App {
                 if self.visual.active() {
                     self.visual.exit();
                 } else {
-                    self.visual.enter(self.directory, None);
-                    if let Some(id) = self.selected {
-                        self.visual.reanchor(id);
-                    }
+                    self.track_selection();
+                    let current = self.selected.filter(|&id| {
+                        !self.parent_selected
+                            && self.eligible(id)
+                            && self.model.node(id).parent == Some(self.directory)
+                    });
+                    self.visual.enter(
+                        self.directory,
+                        current.filter(|_| self.pending_navigation.is_none()),
+                    );
                     self.range_requested = false;
+                    if self.pending_navigation.is_some() {
+                        self.try_enqueue_visual(VisualIntent::ToggleCurrent);
+                    } else if self.parent_selected {
+                        self.ensure_parent_contents();
+                    }
                 }
             }
             KeyCode::Esc if self.visual.active() => {
@@ -3043,10 +3115,38 @@ impl App {
     }
 
     fn sync_queue(&mut self, queue: &mut DeleteQueue, area: Rect) {
+        if self.queue_view.active_target.as_ref().map(|(id, _)| *id)
+            != queue.active().map(|entry| entry.id)
+        {
+            self.queue_view.progress_scroll = 0;
+        }
         queue.sync_marks(&mut self.queue_view.marks);
         self.queue_view.cancelling = queue.is_cancelling();
         self.queue_view.pending = queue.pending().len();
         self.queue_view.paused = queue.is_paused();
+        if let Some(entry) = queue.active() {
+            if self.queue_view.active_target.as_ref().map(|(id, _)| *id) != Some(entry.id) {
+                // Suppressed targets retain their discovered descendant counts.
+                // Resolve ancestor liveness once per job, not on every frame.
+                self.queue_view.active_total = if self.model.is_live(entry.node) {
+                    self.model.node(entry.node).items.saturating_add(1)
+                } else {
+                    0
+                };
+                self.queue_view.active_target = Some((
+                    entry.id,
+                    printable(self.report_root.join(entry.relative.as_ref()).as_os_str()),
+                ));
+            }
+        } else {
+            self.queue_view.active_target = None;
+            self.queue_view.active_total = 0;
+        }
+        self.queue_view.active_progress = queue.progress().unwrap_or_default();
+        self.queue_view.active_total = self
+            .queue_view
+            .active_total
+            .max(self.queue_view.active_progress.examined_entries);
         self.queue_view.status = if !queue.pending().is_empty() {
             format!("{} queued", queue.pending().len())
         } else if queue.active().is_some() || queue.is_updating() {
@@ -3640,18 +3740,28 @@ impl App {
 
     fn bind_visual_cursor(&mut self, id: Option<NodeId>) {
         let Some(id) = id else {
-            while matches!(
-                self.visual_intents.front(),
-                Some(VisualIntent::ToggleCurrent)
-            ) {
-                self.visual_intents.pop_front();
-            }
+            // Stable operations do not establish a new cursor. Discard dependent
+            // toggles across them, stopping at the next independent cursor intent.
+            let mut dependent = true;
+            self.visual_intents.retain(|intent| {
+                if !dependent {
+                    return true;
+                }
+                match intent {
+                    VisualIntent::ToggleCurrent => false,
+                    VisualIntent::ToggleStable(_) | VisualIntent::SelectStable(..) => true,
+                    _ => {
+                        dependent = false;
+                        true
+                    }
+                }
+            });
             return;
         };
         for intent in &mut self.visual_intents {
             match intent {
                 VisualIntent::ToggleCurrent => *intent = VisualIntent::ToggleStable(id),
-                VisualIntent::ToggleStable(_) => {}
+                VisualIntent::ToggleStable(_) | VisualIntent::SelectStable(..) => {}
                 _ => break,
             }
         }
@@ -3952,6 +4062,22 @@ impl App {
                         self.visual.toggle(id);
                     }
                 }
+                VisualIntent::SelectStable(id, remove) => {
+                    if self.eligible(id) && self.model.node(id).parent == Some(self.directory) {
+                        if remove {
+                            self.visual.deselect(id);
+                        } else {
+                            self.visual.select(id);
+                        }
+                    }
+                }
+                VisualIntent::SelectParent(remove) => {
+                    if remove {
+                        self.select_parent_contents(true);
+                    } else {
+                        self.ensure_parent_contents();
+                    }
+                }
                 VisualIntent::FocusStable(id) => self.focus_clicked_entry(id),
                 VisualIntent::ToggleParent => self.select_parent_contents(false),
                 VisualIntent::Parent(select) => {
@@ -4010,8 +4136,14 @@ impl App {
                         } else {
                             gesture.origin_selected
                         };
-                        let mode = if gesture.mode == RangeMode::Add && origin_selected {
-                            RangeMode::Remove
+                        let mode = if gesture.mode == RangeMode::Add
+                            || (gesture.dragged && gesture.mode == RangeMode::Invert)
+                        {
+                            if origin_selected {
+                                RangeMode::Remove
+                            } else {
+                                RangeMode::Add
+                            }
                         } else {
                             gesture.mode
                         };
@@ -4392,6 +4524,16 @@ impl App {
                     scroll.saturating_sub(3)
                 } else {
                     scroll.saturating_add(3).min(max)
+                };
+            }
+            Some(Modal::Quit { .. }) => {
+                let scroll = &mut self.queue_view.progress_scroll;
+                *scroll = if up {
+                    scroll.saturating_sub(3)
+                } else {
+                    scroll
+                        .saturating_add(3)
+                        .min(u16::try_from(max).unwrap_or(u16::MAX))
                 };
             }
             Some(
@@ -4861,10 +5003,13 @@ impl App {
                     && !mouse.modifiers.contains(KeyModifiers::CONTROL);
                 if shift || self.visual.active() {
                     if !self.visual.active() {
-                        let pending = self.pending_navigation.is_some();
-                        self.visual
-                            .enter(self.directory, self.selected.filter(|_| !pending));
-                        self.range_requested = pending;
+                        self.visual.enter(self.directory, None);
+                        // Shift-click keeps the current range anchor, but mode
+                        // entry must not invent a mark that makes dragging erase.
+                        if let Some(id) = self.selected {
+                            self.visual.reanchor(id);
+                        }
+                        self.range_requested = false;
                     }
                     let mode = if mouse.modifiers.contains(KeyModifiers::CONTROL) {
                         RangeMode::Remove
@@ -4967,6 +5112,13 @@ impl App {
                         .mouse_baseline
                         .take()
                         .unwrap_or_else(|| self.visual.snapshot());
+                    if self.drag_mode == RangeMode::Invert {
+                        self.drag_mode = if baseline.contains(&anchor) {
+                            RangeMode::Remove
+                        } else {
+                            RangeMode::Add
+                        };
+                    }
                     self.visual.restore_snapshot(baseline, anchor);
                     if !self.model.is_live(anchor) {
                         self.visual.remove(anchor);
@@ -6412,31 +6564,85 @@ fn draw_modal(
                 DialogButton::new(KeyCode::Enter, "Exit now", "Enter"),
                 DialogButton::new(KeyCode::Esc, "Browse", "Esc"),
             ];
-            let rows = dialog_button_rows(inner_width, &buttons);
-            let popup = centered(area, width, area.height.min(rows + 3));
+            let button_rows = dialog_button_rows(inner_width, &buttons);
+            let summary = Paragraph::new(format!(
+                "{} queued{}",
+                queue.pending,
+                if queue.paused { " · paused" } else { "" }
+            ))
+            .wrap(Wrap { trim: false });
+            let summary_rows =
+                u16::try_from(summary.line_count(inner_width.max(1))).unwrap_or(u16::MAX);
+            let target = queue
+                .active_target
+                .as_ref()
+                .map_or("Waiting for queued deletions", |(_, target)| {
+                    target.as_str()
+                });
+            let path = Paragraph::new(target).wrap(Wrap { trim: false });
+            let path_lines = path.line_count(inner_width.max(1));
+            let counts =
+                Paragraph::new(queue.active_target.as_ref().map_or_else(String::new, |_| {
+                    format!(
+                        "{} / {} known items removed",
+                        queue.active_progress.removed_entries,
+                        queue
+                            .active_total
+                            .max(queue.active_progress.examined_entries)
+                    )
+                }))
+                .wrap(Wrap { trim: false });
+            let count_rows = if queue.active_target.is_some() {
+                u16::try_from(counts.line_count(inner_width.max(1))).unwrap_or(u16::MAX)
+            } else {
+                0
+            };
+            let fixed = summary_rows
+                .saturating_add(count_rows)
+                .saturating_add(button_rows);
+            let height = u16::try_from(path_lines)
+                .unwrap_or(u16::MAX)
+                .saturating_add(fixed)
+                .saturating_add(2);
+            let popup = centered(area, width, area.height.min(18).min(height));
             mouse.popup = popup;
             *close_area = dialog_close_area(popup);
             let block = border("Finishing deletions");
             let inner = block.inner(popup);
-            *reviewable = inner.width >= 32 && inner.height > rows;
+            *reviewable = inner.width >= 32 && inner.height > fixed;
             frame.render_widget(Clear, popup);
             frame.render_widget(block, popup);
             if *reviewable {
-                frame.render_widget(
-                    Paragraph::new(if queue.status.is_empty() {
-                        "Waiting for queued deletions"
-                    } else {
-                        &queue.status
-                    })
-                    .style(style.fg(accent)),
-                    Rect::new(inner.x, inner.y, inner.width, 1),
+                let regions = split_edges(
+                    inner,
+                    Direction::Vertical,
+                    summary_rows,
+                    count_rows.saturating_add(button_rows),
                 );
-                draw_dialog_buttons(
+                let footer = split_edges(regions[2], Direction::Vertical, count_rows, 0);
+                frame.render_widget(summary.style(style.fg(accent)), regions[0]);
+                clamp_scroll(&mut queue.progress_scroll, path_lines, regions[1].height);
+                frame.render_widget(
+                    path.scroll((queue.progress_scroll, 0)).style(style),
+                    regions[1],
+                );
+                mouse.scroll(popup, path_lines, regions[1].height);
+                draw_dialog_scrollbar(
+                    frame,
+                    popup,
+                    regions[1],
+                    usize::from(queue.progress_scroll),
+                    path_lines,
+                    accent,
+                );
+                frame.render_widget(counts.style(style.fg(accent)), footer[0]);
+                draw_dialog_buttons(frame, mouse, footer[1], &buttons, style);
+                draw_dialog_scroll_controls(
                     frame,
                     mouse,
-                    Rect::new(inner.x, inner.y + 1, inner.width, rows),
-                    &buttons,
-                    style,
+                    popup,
+                    path_lines > usize::from(regions[1].height),
+                    false,
                 );
             } else {
                 draw_review_size_notice(frame, popup, inner, *close_area, style);
@@ -6651,7 +6857,7 @@ Shift+PgUp/PgDown  Extend by one page
 Enter              Select/deselect current entry
 Click / drag       Toggle / add range (marked start removes)
 Hold list edge    Scroll while dragging
-Shift-click/drag   Extend / invert range
+Shift-click/drag   Extend / add or remove
 Ctrl-click/drag    Deselect entry / range
 d / D / Delete     Confirm selected deletions
 v / V / Esc        Leave visual mode; Esc clears an active filter first";

@@ -1606,12 +1606,12 @@ def check_owned_mouse_navigation(binary, work, threads):
         row = session.screen.selected_row()
         click = f"\x1b[<0;35;{row + 1}M\x1b[<0;35;{row + 1}m".encode()
         session.key(b"v")
-        wait_visual(session, ["branch/"], [], cursor="branch/")
-        session.key(click)
         wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
+        session.key(click)
+        wait_visual(session, ["branch/"], [], cursor="branch/")
         assert fixture_directory(session, root), "visual click entered a directory"
         session.key(click)
-        wait_visual(session, ["branch/"], [], cursor="branch/")
+        wait_visual(session, ["branch/"], ["branch/"], cursor="branch/")
         assert fixture_directory(session, root), "visual click entered a directory"
         session.key(b"v")
         session.wait(lambda: path_in_header(session.screen, root),
@@ -1769,8 +1769,6 @@ def check_owned_parent_row(binary, work, threads):
         fixture_selection(session, "alpha")
         row = session.screen.selected_row()
         mouse_click(session, 35, row, button=2)
-        wait_visual(session, names, [], cursor="alpha")
-        mouse_click(session, 35, row)
         wait_visual(session, names, ["alpha"], cursor="alpha")
         mouse_click(session, 35, row, button=2)
         column = session.screen.text(header=True).rfind("1 selected")
@@ -1798,10 +1796,6 @@ def check_owned_parent_row(binary, work, threads):
         # Selecting ../ means all current-folder entries, including both the
         # hidden dotfile and entries excluded by the just-applied filter.
         session.key(b"\x1b[Hv")
-        session.wait(lambda: visual_count(session) == 0
-                     and visible_paths(session, names) == ["alpha"],
-                     "entering visual mode on ../ unexpectedly selected or revealed entries")
-        session.key(b"\r")
         session.wait(lambda: visual_count(session) == len(names)
                      and set(visible_paths(session, names)) == set(names)
                      and set(visual_paths(session, names)) == set(names)
@@ -1877,6 +1871,54 @@ def check_owned_cancellation(binary, work, threads):
                      and (any(state == "active" and path == "slow"
                               for state, path, _ in queue_rows(session)) or not slow.exists()),
                      "deletion attempt did not preserve paused waiting work")
+        progress_samples = []
+        expected_target = str(slow.resolve())
+
+        def observe_quit_progress(screen):
+            if not screen.has_modal_title("Finishing deletions"):
+                return
+            box = painted_modal_box(screen)
+            if box is None:
+                return
+            left, top, right, bottom = box
+            # Strip only the dialog's painted borders and line padding so a
+            # wrapped full target is compared without hiding path components.
+            interior = ["".join(screen.cells[row][left + 1:right]).rstrip()
+                        for row in range(top + 1, bottom)]
+            words = " ".join(" ".join(interior).split())
+            ratio = re.search(r"(\d+) / (\d+) known items removed", words)
+            if (expected_target not in "".join(interior) or ratio is None
+                    or "1 queued · paused" not in words):
+                return
+            sample = tuple(map(int, ratio.groups()))
+            # Output may arrive mid-repaint; ignore incomplete numeric rows.
+            if not (0 <= sample[0] <= sample[1] and sample[1] > 0):
+                return
+            if not progress_samples or sample != progress_samples[-1]:
+                progress_samples.append(sample)
+
+        # Reuse the broad cancellation fixture. A legitimately fast deletion
+        # may finish during the clicks; its paused successor still keeps quit
+        # review open, and deterministic unit tests cover the active layout.
+        previous_observe = session.observe
+        session.observe = observe_quit_progress
+        try:
+            mouse_click(session, session.screen.cols // 2, 0, button=2)
+            session.wait(lambda: session.screen.has_modal_title("Quit LDU?"),
+                         "active deletion header quit prompt did not open")
+            click_modal_option(session, "Yes · Enter")
+            wait_quit_warning(session, paused=True)
+            session.wait(lambda: bool(progress_samples) or not slow.exists(),
+                         "active quit progress did not show full target, queued count and known ratio")
+            if slow.exists():
+                session.wait(lambda: len(progress_samples) > 1 or not slow.exists(),
+                             "active quit progress counters did not update", timeout=15)
+            assert waiting.is_file(), "quit progress started the paused successor"
+            click_modal_option(session, "Browse · Esc")
+            session.wait(lambda: session.screen.has_modal_title("Deletion queue"),
+                         "Browse did not restore the queue after quit progress")
+        finally:
+            session.observe = previous_observe
         session.key(b"c")
         session.wait(lambda: queue_paths(session) == ["waiting"]
                      and "Resume · Space" in session.screen.words(),
@@ -1915,7 +1957,8 @@ def check_owned_cancellation(binary, work, threads):
         if cancellation_observed:
             assert slow.is_dir() and any(path.is_file() for path in slow.rglob("*"))
         return {"case": "deletion-cancellation", "first_frame_ms": session.first_frame_ms,
-                "quit_ms": elapsed, "input": [], "cancellation_observed": cancellation_observed}
+                "quit_ms": elapsed, "input": [], "cancellation_observed": cancellation_observed,
+                "quit_progress_samples": progress_samples}
     finally:
         session.close()
 
@@ -1962,7 +2005,7 @@ def check_owned_mouse_quit(binary, work, threads):
                     session.key(b"n")
                     settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                                  "mouse quit FIFO name order did not settle")
-                    session.key(b"v\r\x1b[1;2F")
+                    session.key(b"v\x1b[1;2F")
                     session.wait(lambda: visual_count(session) == len(names)
                                  and cursor_path(session, names) == names[-1],
                                  "mouse quit FIFO did not select all entries")
@@ -2148,7 +2191,7 @@ def check_owned_quit_completion(binary, work, threads, replacement_error=False):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                      "finishing-quit name ordering did not settle")
-        session.key(b"v\r\x1b[1;2F")
+        session.key(b"v\x1b[1;2F")
         session.wait(lambda: visual_count(session) == len(names)
                      and cursor_path(session, names) == names[-1],
                      "finishing-quit did not select all owned targets")
@@ -2712,13 +2755,10 @@ def wait_visual(session, names, expected, cursor=None):
 
 
 def enter_visual_mark(session, key=b"v"):
-    """Enter empty visual mode, then explicitly mark the focused entry."""
+    """Enter visual mode with the focused real entry selected."""
     session.key(key)
-    session.wait(lambda: visual_count(session) == 0 and session.screen.normal_view(),
-                 "entering visual mode unexpectedly marked the focused entry")
-    session.key(b"\r")
-    session.wait(lambda: visual_count(session) == 1,
-                 "Enter did not mark the focused entry in visual mode")
+    session.wait(lambda: visual_count(session) == 1 and session.screen.normal_view(),
+                 "entering visual mode did not mark the focused entry")
 
 
 def reset_fixture_visual(session, names):
@@ -2784,6 +2824,19 @@ def check_owned_drag_modes(binary, work, threads, include_control=True):
                 and visual_paths(session, names) == expected
                 and cursor_path(session, names) == names[index], label))
 
+        # Normal Shift-drag adds from its pressed row. The old highlighted row
+        # is an anchor for Shift-click, never a pre-existing drag selection.
+        for origin in (0, 2):
+            home_entry(session)
+            session.wait(lambda: cursor_path(session, names) == names[0],
+                         "normal Shift drag did not restore its starting highlight")
+            event(4, origin, False, [], "normal Shift press keeps membership empty")
+            event(36, 4, False, list(range(origin, 5)), "normal Shift drag adds its interval")
+            event(4, 4, True, list(range(origin, 5)), "normal Shift drag releases")
+            session.key(b"\x1b")
+            session.wait(lambda: visual_count(session) is None,
+                         "normal Shift drag selection did not clear")
+
         # A normal press alone remains a click candidate. Motion starts a
         # visual range at that pressed row, without opening its entry.
         row = session.screen.first_entry_row() + 1
@@ -2831,6 +2884,15 @@ def check_owned_drag_modes(binary, work, threads, include_control=True):
         event(0, 2, False, [0, 2, 3], "plain unmarked-origin held press after subtraction")
         event(32, 3, False, [0, 2, 3], "plain unmarked-origin drag still adds")
         event(0, 3, True, [0, 2, 3], "plain adding drag releases after subtraction")
+        # Shift-drag starts at the pressed entry and uses its selected state,
+        # while Shift-click still adds from the existing selection anchor.
+        event(4, 2, False, [0, 2, 3], "Shift selected-origin held press")
+        event(36, 3, False, [0], "Shift selected-origin drag removes")
+        event(36, 1, False, [0, 3], "Shift reversal restores baseline")
+        event(4, 1, True, [0, 3], "Shift removing drag releases")
+        event(4, 2, False, [0, 3], "Shift unselected-origin held press")
+        event(36, 3, False, [0, 2, 3], "Shift unselected-origin drag adds")
+        event(4, 3, True, [0, 2, 3], "Shift adding drag releases")
         if include_control:
             # Start on an unmarked row: subtraction must never add that row.
             event(16, 1, False, [0, 2, 3], "Ctrl held unmarked press")
@@ -2898,15 +2960,15 @@ def check_owned_visual(binary, work, threads):
         wait_visual(session, names, ["alpha", "beta", "gamma"])
         reset_fixture_visual(session, names)
         session.key(b"\x1b[<4;35;3M\x1b[<36;35;4M\x1b[<4;35;4m")
-        wait_visual(session, names, ["beta"])
+        wait_visual(session, names, [])
         reset_fixture_visual(session, names)
         # A plain drag from unmarked beta adds to the pre-press marks.
         session.key(b"\x1b[<0;35;4M\x1b[<32;35;5M\x1b[<0;35;5m")
         wait_visual(session, names, ["alpha", "beta", "gamma"])
         reset_fixture_visual(session, names)
-        # Releasing Shift before the next motion must retain inverse semantics.
+        # Releasing Shift before the next motion must retain selected-origin removal semantics.
         session.key(b"\x1b[<4;35;3M\x1b[<32;35;4M\x1b[<0;35;4m")
-        wait_visual(session, names, ["beta"])
+        wait_visual(session, names, [])
         reset_fixture_visual(session, names)
         session.key(b"\x1b[1;2B")
         wait_visual(session, names, ["alpha", "beta"])
@@ -3122,7 +3184,7 @@ def check_owned_batch_queue(binary, work, threads):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" item-00"),
                      "batch FIFO name ordering did not settle")
-        session.key(b"v\r" + b"\x1b[1;2B" * 31)
+        session.key(b"v" + b"\x1b[1;2B" * 31)
         session.wait(lambda: visual_count(session) == 32
                      and cursor_path(session, ["item-31"]) == "item-31",
                      "batch FIFO did not select exactly its 32 confirmed targets")
@@ -3141,10 +3203,10 @@ def check_owned_batch_queue(binary, work, threads):
                      "batch FIFO did not retain all 32 paused jobs")
         assert all(victim.is_file() for victim in victims), "paused FIFO changed a confirmed target"
         # Each event-loop iteration handles one key and can start at most two
-        # jobs. Queue all five keys before resuming our child, so older confirmed
+        # jobs. Queue all four keys before resuming our child, so older confirmed
         # work must remain when d opens review, regardless of deletion speed.
         with stopped_child(session):
-            keys = b" Dv\rd"
+            keys = b" Dvd"
             session.key(keys)
             session.wait(lambda: queued_input_bytes(session) == len(keys),
                          "batch FIFO keys did not enter the stopped child's PTY")
@@ -3195,7 +3257,7 @@ def check_owned_completion_input(binary, work, threads):
         session.key(b"n")
         settled_home(session, lambda: first_row(session).rstrip().endswith(" " + names[0]),
                      "completion/input name ordering did not settle")
-        session.key(b"v\r\x1b[1;2F")
+        session.key(b"v\x1b[1;2F")
         session.wait(lambda: visual_count(session) == len(names) + 1
                      and cursor_path(session, [survivor.name]) == survivor.name,
                      "completion/input did not select the full fixture")
@@ -3262,10 +3324,10 @@ def check_owned_visual_ranges(binary, work, threads):
         # sorted view before applying queued navigation. Its count plus End's
         # final cursor provide a semantic barrier without transient status text.
         session.key(b"\x1b[Hv")
-        session.wait(lambda: visual_count(session) == 0
+        session.wait(lambda: visual_count(session) == len(names)
                      and session.screen.selected_row() == 1,
-                     "large visual fixture did not enter empty visual mode on its parent row")
-        session.key(b"\r\x1b[F")
+                     "large visual fixture did not select its parent group", timeout=30)
+        session.key(b"\x1b[F")
         session.wait(lambda: visual_count(session) == len(names)
                      and cursor_path(session, names[-1:]) == names[-1],
                      "large visual fixture did not validate its complete sorted selection", timeout=30)
@@ -3862,7 +3924,7 @@ def main():
             checks.append("held normal and visual mouse rows across shrink and growth without input")
             checks.append("normal mouse click opens directories, visual click selects, scanned breadcrumbs navigate")
             checks.append("XDG/CLI colors, RGB fallback, disabled mouse, hover guard drops early Enter and expires without input")
-            checks.append("empty v/V/right-click entry, normal-left/right drag ranges, selected-origin removal, Ctrl-drag, reversal and press modifiers")
+            checks.append("selected v/V/right-click entry, normal-left/right/Shift drag ranges, selected-origin removal, Ctrl-drag, reversal and press modifiers")
             checks.append("symlink destinations without following targets, installed archive helpers, PDF and unsupported file details")
             if sys.platform.startswith("linux"):
                 checks.append("owned preview helpers and descendants stop on q, Ctrl-C and SIGTERM")

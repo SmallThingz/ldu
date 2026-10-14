@@ -2385,6 +2385,8 @@ mod tests {
         assert_eq!(failed_attempts.load(Ordering::Relaxed), 2);
         assert_eq!(removal.errors.len(), 1);
         assert_eq!(state.snapshot().removed_entries, 767);
+        // Reopening the stream does not rediscover its exhausted failed leaf.
+        assert_eq!(state.snapshot().examined_entries, 769);
         let failed_name = failed_name.lock().unwrap().clone().unwrap();
         assert_eq!(
             removal.errors[0].path,
@@ -2756,6 +2758,8 @@ mod tests {
         assert!(expected_paths.is_empty());
         assert!(!work.path().join("target/removable").exists());
         assert_eq!(state.snapshot().removed_entries, 513);
+        // Four directories and 1024 leaves, including each failed leaf once.
+        assert_eq!(state.snapshot().examined_entries, 1028);
         assert!(work.path().join("target/nested/deeper").is_dir());
     }
 
