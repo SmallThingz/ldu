@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry as HashEntry},
     ffi::OsStr,
     ops::{Index, IndexMut},
     path::{Path, PathBuf},
@@ -959,7 +959,7 @@ impl Model {
                 }
                 let charged = if kind == NodeKind::File {
                     if let Some(group) = file_identity {
-                        let charged = self.remember_hardlink(
+                        let (charged, duplicate) = self.remember_hardlink(
                             group,
                             scope,
                             sizes,
@@ -967,9 +967,7 @@ impl Model {
                             true,
                             &mut changed,
                         );
-                        self.nodes[scope as usize].hardlink_duplicate =
-                            self.hardlink_groups[self.hardlink_indices[&group]].owner
-                                != Some(scope);
+                        self.nodes[scope as usize].hardlink_duplicate = duplicate;
                         charged
                     } else {
                         sizes
@@ -1154,7 +1152,7 @@ impl Model {
                 self.append_tombstone(parent, generation, entry);
                 continue;
             }
-            let charged = if let Some(group_id) = entry.hardlink_group {
+            let (charged, duplicate) = if let Some(group_id) = entry.hardlink_group {
                 // The charge for an earlier owner in this same batch has not yet
                 // reached the parent. Correct that local sum before updating it.
                 if let Some(&index) = self.hardlink_indices.get(&group_id)
@@ -1184,18 +1182,14 @@ impl Model {
                 }
                 self.remember_hardlink(group_id, entry.id, entry.sizes, generation, true, changed)
             } else if entry.hardlink_duplicate {
-                Sizes::default()
+                (Sizes::default(), true)
             } else {
-                entry.sizes
+                (entry.sizes, false)
             };
             let mut node = Node::new(entry.name, Some(parent), entry.kind, charged);
             node.parent_epoch = self.nodes[parent as usize].child_epoch;
             node.scan_generation = generation;
-            node.hardlink_duplicate = if let Some(group_id) = entry.hardlink_group {
-                self.hardlink_groups[self.hardlink_indices[&group_id]].owner != Some(entry.id)
-            } else {
-                entry.hardlink_duplicate
-            };
+            node.hardlink_duplicate = duplicate;
             if entry.kind == NodeKind::Directory {
                 self.directories.insert(
                     entry.id,
@@ -1259,19 +1253,20 @@ impl Model {
         generation: u64,
         live: bool,
         changed: &mut Vec<NodeId>,
-    ) -> Sizes {
-        let (index, new_group) = if let Some(&index) = self.hardlink_indices.get(&group_id) {
-            (index, false)
-        } else {
-            let index = self.hardlink_groups.len();
-            self.hardlink_indices.insert(group_id, index);
-            self.hardlink_groups.push(HardlinkGroup {
-                sizes,
-                metadata_generation: 0,
-                owner: None,
-                members: None,
-            });
-            (index, true)
+    ) -> (Sizes, bool) {
+        let (index, new_group) = match self.hardlink_indices.entry(group_id) {
+            HashEntry::Occupied(entry) => (*entry.get(), false),
+            HashEntry::Vacant(entry) => {
+                let index = self.hardlink_groups.len();
+                entry.insert(index);
+                self.hardlink_groups.push(HardlinkGroup {
+                    sizes,
+                    metadata_generation: 0,
+                    owner: None,
+                    members: None,
+                });
+                (index, true)
+            }
         };
         let owner_live = self.hardlink_groups[index]
             .owner
@@ -1310,7 +1305,7 @@ impl Model {
         if group.members.is_some() && (owner_live || live) {
             self.hardlink_owners.insert(group.owner.unwrap(), index);
         }
-        charged
+        (charged, group.owner != Some(id))
     }
 
     fn replace_node_charge(
