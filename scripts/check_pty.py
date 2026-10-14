@@ -209,15 +209,21 @@ class Screen:
         return any(character in "┌┐└┘" and self.attributes[y][x][0] == 0
                    for y, row in enumerate(self.cells) for x, character in enumerate(row))
 
-    def has_modal_title(self, title):
+    def has_modal_title(self, title, warning=False):
+        # Guarded dialogs use the fixed muted-red theme backgrounds. Other
+        # callers retain black-only matching so filename glyphs stay inert.
+        accepted = {(64, 16, 16), 88, 1} if warning else {0}
         for y, row in enumerate(self.cells):
-            if not any(character in "┌┐" and self.attributes[y][x][0] == 0
-                       for x, character in enumerate(row)):
+            backgrounds = {self.attributes[y][x][0] for x, character in enumerate(row)
+                           if character in "┌┐" and self.attributes[y][x][0] in accepted}
+            if not backgrounds:
                 continue
             line = "".join(row)
             start = line.find(title)
             while start >= 0:
-                if all(style == (0, True) for style in self.attributes[y][start:start + len(title)]):
+                if any(all(style == (background, True)
+                           for style in self.attributes[y][start:start + len(title)])
+                       for background in backgrounds):
                     return True
                 start = line.find(title, start + 1)
         return False
@@ -250,6 +256,16 @@ def check_screen_widgets():
     screen.feed("\x1b[3;1H\x1b[48;5;0m┌─\x1b[1m Help \x1b[22m─┐\x1b[0m".encode())
     assert screen.has_modal_border() and not screen.normal_view(), "visible dialog border was not detected"
     assert screen.has_modal_title("Help") and not screen.has_modal_title("Notice"), "dialog title was not detected"
+    assert not screen.has_modal_title("Help", warning=True), "warning matching accepted a normal dialog"
+    for background in ("48;2;64;16;16", "48;5;88", "41"):
+        guarded = Screen(rows=3)
+        guarded.feed(("\x1b[2;1H\x1b[" + background
+                      + "m┌─\x1b[1m Delete? \x1b[22m─┐\x1b[0m").encode())
+        assert not guarded.has_modal_title("Delete?"), "normal matching accepted a warning dialog"
+        assert guarded.has_modal_title("Delete?", warning=True), "warning dialog title was not detected"
+    filename = Screen(rows=3)
+    filename.feed("\x1b[2;1H\x1b[48;5;8m\x1b[1mselected┌name Delete?\x1b[0m".encode())
+    assert not filename.has_modal_title("Delete?", warning=True), "filename was mistaken for a warning title"
 
 
 def check_printable_names():
@@ -1483,7 +1499,7 @@ def check_owned_special_previews(binary, work, threads):
 
 def check_owned_mouse_guard(binary, work, threads):
     metrics = []
-    warning = "Mouse changed selection. Check the target."
+    warning = "Mouse hover changed selection just before delete."
     for mode in ("truecolor", "indexed", "silent", "no-mouse", "no-guard"):
         root = work / ("hover-guard-" + mode)
         root.mkdir()
@@ -1545,17 +1561,22 @@ def check_owned_mouse_guard(binary, work, threads):
                     assert isinstance(background, int), "indexed warning emitted RGB"
                     assert b"38;2;" not in session.raw and b"48;2;" not in session.raw, "RGB fallback ignored terminal support"
                 session.wait(lambda: "Please wait" not in session.screen.text()
-                             and session.screen.has_modal_title("Delete?")
+                             and session.screen.has_modal_title("Delete?", warning=show_warning)
                              and "Yes · Enter" in session.screen.words(),
                              f"{mode} guard did not unlock without input")
-                assert warning not in session.screen.words(), "expired guard warning stayed visible"
+                assert (warning in session.screen.words()) == show_warning, "warning origin was lost after expiry"
+                assert (session.screen.attributes[-1][0][0] not in (None, 0)) == show_warning, "expired guard tint changed"
+                for hint in ("--mouse-debounce-warning=false", "mouse_debounce_warning=false"):
+                    assert (hint in session.screen.words()) == show_warning, "tint-disable hint missing or leaked"
                 assert all((root / name).is_file() for name in names), "early Enter deleted a target"
                 assert not any(deletion_marks(session, names).values()), "early Enter was replayed into the queue"
                 session.key(b"\r")
             expected = "alpha" if mode == "no-mouse" else "beta"
             session.wait(lambda: session.screen.normal_view()
-                         and deletion_marks(session, names) == {name: name == expected for name in names},
-                         f"{mode} fresh confirmation did not enqueue the intended target")
+                         and deletion_marks(session, names) == {name: name == expected for name in names}
+                         and session.screen.attributes[-1][0][0] in (None, 0),
+                         f"{mode} fresh confirmation did not enqueue the intended target and clear the tint")
+            assert session.screen.attributes[-1][0][0] in (None, 0), "warning tint leaked after dialog closed"
             open_queue(session, [expected])
             assert "Resume · Space" in session.screen.words(), "guard changed queue pause state"
             session.key(b" ")

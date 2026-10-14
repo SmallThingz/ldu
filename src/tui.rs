@@ -220,6 +220,7 @@ enum Modal {
         confirmed: Option<ConfirmedTarget>,
         capture: Option<Receiver<io::Result<ConfirmedTarget>>>,
         guard_until: Option<Instant>,
+        mouse_guarded: bool,
     },
 }
 impl Modal {
@@ -2669,6 +2670,7 @@ impl App {
                     confirmed,
                     capture,
                     guard_until,
+                    mouse_guarded,
                 } => {
                     let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
                     match key.code {
@@ -2701,6 +2703,7 @@ impl App {
                         confirmed,
                         capture,
                         guard_until,
+                        mouse_guarded,
                     });
                 }
                 Modal::Text {
@@ -2988,12 +2991,14 @@ impl App {
                     let path = self.model.path(id);
                     match path.strip_prefix(&self.root) {
                         Ok(relative) if !relative.as_os_str().is_empty() => {
+                            let guard_until = self.mouse_delete_guard(id, Instant::now());
                             let request = DeleteRequest {
                                 id,
                                 anchor,
                                 relative: relative.to_owned(),
                                 target: printable(path.as_os_str()),
-                                guard_until: self.mouse_delete_guard(id, Instant::now()),
+                                guard_until,
+                                mouse_guarded: guard_until.is_some(),
                             };
                             if self
                                 .capture_inflight
@@ -3011,6 +3016,7 @@ impl App {
                                     confirmed: None,
                                     capture: None,
                                     guard_until: request.guard_until,
+                                    mouse_guarded: request.mouse_guarded,
                                 });
                                 self.deferred_delete = Some(request);
                             } else {
@@ -3424,6 +3430,7 @@ impl App {
             guard_until: request
                 .guard_until
                 .filter(|deadline| Instant::now() < *deadline),
+            mouse_guarded: request.mouse_guarded,
         });
     }
 
@@ -5795,10 +5802,16 @@ impl App {
             );
         }
         if self.settings.mouse_debounce_warning
-            && matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
+            && matches!(
+                self.modal,
+                Some(Modal::Delete {
+                    mouse_guarded: true,
+                    ..
+                })
+            )
         {
             // Tint after all widgets so cleared dialogs and blank cells are covered.
-            // Ordinary frames avoid this pass entirely; the timer redraws only once.
+            // Preserve the hover warning until this confirmation closes.
             let style = Style::default()
                 .bg(self.theme.warning_background)
                 .fg(self.theme.warning_foreground);
@@ -6465,6 +6478,7 @@ fn draw_modal(
             reviewable,
             confirm_requested,
             guard_until,
+            mouse_guarded,
             ..
         } => {
             let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
@@ -6483,14 +6497,19 @@ fn draw_modal(
             let button_rows = dialog_button_rows(inner_width, &buttons);
             let target_paragraph = Paragraph::new(target.as_str()).wrap(Wrap { trim: false });
             let target_lines = target_paragraph.line_count(inner_width);
-            let prompt = Paragraph::new(if guarded && mouse.guard_warning {
-                "Mouse changed selection. Check the target.\nPermanently remove:"
+            let prompt = Paragraph::new(if *mouse_guarded && mouse.guard_warning {
+                "Mouse hover changed selection just before delete.\nDisable red tint (delay stays):\nCLI: --mouse-debounce-warning=false\nConfig: mouse_debounce_warning=false\nPermanently remove:"
             } else {
                 "Permanently remove:"
             })
             .wrap(Wrap { trim: false });
             let prompt_height = u16::try_from(prompt.line_count(inner_width)).unwrap_or(u16::MAX);
-            let height = area.height.min(14).min(
+            let height_limit = if *mouse_guarded && mouse.guard_warning {
+                24
+            } else {
+                14
+            };
+            let height = area.height.min(height_limit).min(
                 u16::try_from(target_lines)
                     .unwrap_or(u16::MAX)
                     .saturating_add(prompt_height)
@@ -6678,6 +6697,7 @@ struct DeleteRequest {
     relative: PathBuf,
     target: String,
     guard_until: Option<Instant>,
+    mouse_guarded: bool,
 }
 
 struct WaitingBatch {
