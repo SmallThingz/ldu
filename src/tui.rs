@@ -8081,10 +8081,13 @@ pub fn run(
         } else {
             INPUT_INTERVAL.min(next_frame.saturating_duration_since(Instant::now()))
         };
-        // Keep polling input between bounded productive chunks without adding
-        // one millisecond of sleep per chunk. A worker blocked on I/O or a full
-        // channel still gets the ordinary minimum wait rather than a busy loop.
-        input_timeout = if batch_status.productive
+        // Ready scanner output can be consumed on the next scan phase. Poll
+        // input between bounded chunks without sleeping for work already here.
+        // Producers without ready output and blocked ordering/admission workers
+        // retain the minimum wait below.
+        input_timeout = if scan_backlog
+            || scope_backlog
+            || batch_status.productive
             || queue_progress
             || (selection_progress && (app.visual.is_pending() || app.parent_selection_work()))
         {
