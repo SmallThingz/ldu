@@ -171,7 +171,17 @@ jobs:
         timeout-minutes: 15
         run: |
           python3 .tmp/native-macos/identity.py verify
-          python3 scripts/check_pty.py --binary "$LDU_TEST_BIN" --threads 2
+          python3 -u - "$LDU_TEST_BIN" <<'PY'
+          import faulthandler, runpy, sys
+          sys.argv = ["scripts/check_pty.py", "--binary", sys.argv[1], "--threads", "2"]
+          # Repeated stacks identify the active check and any blocked cleanup.
+          faulthandler.dump_traceback_later(60, repeat=True, exit=False)
+          print("PTY diagnostics: active case and stack every 60 seconds", file=sys.stderr, flush=True)
+          try:
+              runpy.run_path(sys.argv[0], run_name="__main__")
+          finally:
+              faulthandler.cancel_dump_traceback_later()
+          PY
           python3 .tmp/native-macos/identity.py verify
 
       - name: Run filesystem integration with packaged CLI invocations
