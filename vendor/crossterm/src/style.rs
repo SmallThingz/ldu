@@ -337,7 +337,9 @@ pub struct SetAttribute(pub Attribute);
 
 impl Command for SetAttribute {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, csi!("{}m"), self.0.sgr())
+        f.write_str(csi!(""))?;
+        self.0.write_sgr(f)?;
+        f.write_str("m")
     }
 
     #[cfg(windows)]
@@ -617,5 +619,41 @@ mod tests {
                 assert_eq!(8u16, available_color_count());
             },
         );
+    }
+
+    #[test]
+    fn attribute_commands_match_public_sgr_and_propagate_sink_errors() {
+        use crate::{style::{Attribute, SetAttribute}, Command};
+        use std::fmt;
+
+        struct Buffer {
+            bytes: [u8; 16],
+            used: usize,
+            limit: usize,
+        }
+        impl fmt::Write for Buffer {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                let end = self.used + text.len();
+                if end > self.limit {
+                    return Err(fmt::Error);
+                }
+                self.bytes[self.used..end].copy_from_slice(text.as_bytes());
+                self.used = end;
+                Ok(())
+            }
+        }
+
+        for attribute in Attribute::iterator() {
+            let expected = format!("\x1b[{}m", attribute.sgr());
+            assert!(expected.len() <= 16);
+            for limit in 0..=expected.len() {
+                let mut buffer = Buffer { bytes: [0; 16], used: 0, limit };
+                let result = SetAttribute(attribute).write_ansi(&mut buffer);
+                assert_eq!(result.is_ok(), limit == expected.len(), "{attribute:?}/{limit}");
+                if result.is_ok() {
+                    assert_eq!(&buffer.bytes[..buffer.used], expected.as_bytes());
+                }
+            }
+        }
     }
 }

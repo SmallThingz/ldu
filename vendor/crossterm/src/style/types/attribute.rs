@@ -171,6 +171,14 @@ impl Attribute {
     pub const fn bytes(self) -> u32 {
         1 << ((self as u32) + 1)
     }
+    pub(crate) fn write_sgr(self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        let index = self as usize;
+        if index > 4 && index < 9 {
+            f.write_str("4:")?;
+        }
+        write!(f, "{}", SGR[index])
+    }
+
     /// Returns the SGR attribute value.
     ///
     /// See <https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters>
