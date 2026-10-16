@@ -1204,7 +1204,9 @@ impl CacheState {
             if let Some(state) = retired.rows.next() {
                 self.removed.insert(state.row.id);
                 self.parents.remove(&state.row.id);
-                if state.row.kind == NodeKind::Directory {
+                // A refreshed directory may now be a file or symlink while
+                // its previously allocated directory cache still needs cleanup.
+                if self.directories.contains_key(&state.row.id) {
                     self.cleanup.push_back(state.row.id);
                 }
             } else {
@@ -2752,6 +2754,98 @@ mod tests {
                 && state.is_removed(5)
         );
         assert!(!state.directories.contains_key(&2) && !state.directories.contains_key(&3));
+    }
+
+    #[test]
+    fn former_directory_caches_retire_after_ancestor_refresh_or_removal() {
+        const COUNT: NodeId = (MAX_DRAIN * 2 + 3) as NodeId;
+        for kind in [NodeKind::File, NodeKind::Symlink, NodeKind::Unknown] {
+            for refresh in [false, true] {
+                let (mut state, cache) = cache_state();
+                let mut rows = vec![
+                    epoch_row(None, ROOT, 0, 0, NodeKind::Directory),
+                    epoch_row(Some(ROOT), 1, 0, 0, NodeKind::Directory),
+                    epoch_row(Some(ROOT), 2, 0, 0, NodeKind::Directory),
+                    epoch_row(Some(2), 10_000, 0, 0, NodeKind::File),
+                    epoch_row(Some(3), 20_000, 0, 0, NodeKind::File),
+                ];
+                rows.extend(
+                    (3..3 + COUNT).map(|id| epoch_row(Some(1), id, 0, 0, NodeKind::Directory)),
+                );
+                upsert_epoch(&mut state, &cache, rows);
+                for id in 0..3 + COUNT {
+                    state.publish(id, &cache);
+                }
+                let sibling = Arc::clone(&cache.load_full()[&2]);
+                let held = Arc::clone(&cache.load_full()[&3]);
+                let old_view = Arc::downgrade(&held);
+                assert_eq!(held.ids, [20_000]);
+
+                // A scoped refresh keeps each ID but can observe a replacement
+                // inode of another kind. Its old child view must remain immutable.
+                upsert_epoch(
+                    &mut state,
+                    &cache,
+                    (3..3 + COUNT)
+                        .map(|id| epoch_row(Some(1), id, 0, 1, kind))
+                        .collect(),
+                );
+                finish_cache_cleanup(&mut state, &cache);
+                assert!(state.is_removed(20_000));
+                for id in 3..3 + COUNT {
+                    assert!(!state.is_removed(id));
+                    state.publish(id, &cache);
+                    assert!(cache.load_full()[&id].ids.is_empty());
+                }
+
+                if refresh {
+                    upsert_epoch(
+                        &mut state,
+                        &cache,
+                        vec![epoch_row(Some(ROOT), 1, 0, 1, NodeKind::Directory)],
+                    );
+                } else {
+                    state.apply(
+                        CacheCommand::Remove {
+                            generation: 1,
+                            ids: vec![1],
+                        },
+                        &cache,
+                    );
+                }
+                state.cleanup(&cache);
+                assert!(
+                    state.retired_rows.front().unwrap().rows.len() >= COUNT as usize - MAX_DRAIN,
+                    "one cleanup call must retain the bounded work limit"
+                );
+                finish_cache_cleanup(&mut state, &cache);
+                for id in 3..3 + COUNT {
+                    assert!(state.is_removed(id));
+                    assert!(!state.directories.contains_key(&id));
+                    assert!(!state.parents.contains_key(&id));
+                    assert!(!cache.load_full().contains_key(&id));
+                }
+                assert_eq!(state.directories.len(), 2 + usize::from(refresh));
+                assert_eq!(state.parents.len(), 3 + usize::from(refresh));
+                assert!(!state.is_removed(2) && !state.is_removed(10_000));
+                assert!(Arc::ptr_eq(&sibling, &cache.load_full()[&2]));
+                assert_eq!(sibling.ids, [10_000]);
+                state.publish(ROOT, &cache);
+                assert!(cache.load_full()[&ROOT].positions.contains_key(&2));
+                assert_eq!(state.is_removed(1), !refresh);
+                if refresh {
+                    state.publish(1, &cache);
+                    assert!(cache.load_full()[&1].ids.is_empty());
+                } else {
+                    assert!(!cache.load_full().contains_key(&1));
+                }
+                assert_eq!(held.ids, [20_000]);
+                drop(held);
+                assert!(old_view.upgrade().is_some());
+                state.cleanup(&cache);
+                assert!(old_view.upgrade().is_none());
+            }
+        }
     }
 
     #[test]
