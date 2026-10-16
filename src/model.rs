@@ -1198,6 +1198,9 @@ impl Model {
                     // complete_ready releases a retained directory's old parent token
                     // if replacement metadata now describes a file or symlink.
                     node.complete = false;
+                    if kind != NodeKind::Directory {
+                        self.directories.remove(&scope);
+                    }
                     if was_directory
                         && kind != NodeKind::Directory
                         && let Some(parent) = parent
@@ -1932,6 +1935,28 @@ mod tests {
             });
             assert!(leaf.listing_complete(ROOT));
             assert!(!leaf.has_children(ROOT, false, true));
+
+            // Contradictory metadata must preserve an already-known child list.
+            let mut rejected = Model::new(PathBuf::from("rejected"));
+            rejected.apply(ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "known", NodeKind::File, 1, 4)],
+            });
+            rejected.apply(ScanEvent::RootInfo {
+                file_identity: None,
+                kind,
+                sizes: Sizes::default(),
+                error: None,
+            });
+            assert_eq!(rejected.node(ROOT).kind, NodeKind::Directory);
+            assert_eq!(rejected.node(ROOT).error_count, 1);
+            assert_eq!(rejected.child_count(ROOT), 1);
+            assert_eq!(rejected.children(ROOT).collect::<Vec<_>>(), vec![1]);
+            assert!(rejected.is_live(1));
+            rejected.remove(1);
+            assert!(rejected.is_removed(1));
+            assert_eq!(rejected.child_count(ROOT), 0);
+            assert!(!rejected.has_children(ROOT, false, true));
         }
     }
 
@@ -2992,6 +3017,8 @@ mod tests {
         assert!(model.node(ROOT).complete && model.finished);
         assert!(!model.cancelled);
         assert_eq!(model.node(ROOT).sizes.apparent, 67);
+        assert_eq!(model.directories[&1].sizes.apparent, 5);
+        assert_eq!(model.directories[&1].children.all, 1);
         assert_eq!(model.node(ROOT).items, 3);
         assert_eq!(model.node(2).sizes.apparent, 40);
         assert_eq!(model.node(ROOT).error_count, 0);
@@ -3716,6 +3743,7 @@ mod tests {
         done(&mut model, ROOT, 0, ROOT);
         finish(&mut model, ROOT, 0);
         model.begin_rescan(1, 1);
+        assert!(model.directories.contains_key(&1));
         model.apply_scoped(
             1,
             1,
@@ -3731,6 +3759,7 @@ mod tests {
         );
         finish(&mut model, 1, 1);
         assert_eq!(model.node(1).kind, NodeKind::Symlink);
+        assert!(!model.directories.contains_key(&1));
         assert!(model.node(ROOT).complete);
         assert!(model.has_children(ROOT, false, false));
         assert!(!model.has_children(ROOT, true, true));
@@ -3752,6 +3781,7 @@ mod tests {
         done(&mut model, ROOT, 0, ROOT);
         finish(&mut model, ROOT, 0);
         model.begin_rescan(1, 1);
+        assert!(model.directories.contains_key(&1));
         model.apply_scoped(
             1,
             1,
@@ -3769,6 +3799,7 @@ mod tests {
         assert!(model.is_live(1));
         assert_eq!(model.node(1).parent, Some(ROOT));
         assert_eq!(model.node(1).kind, NodeKind::File);
+        assert!(!model.directories.contains_key(&1));
         assert!(model.node(1).hardlink_duplicate);
         assert_eq!(model.node(1).sizes, Sizes::default());
         assert_eq!(model.node(2).sizes.apparent, 200);
@@ -3808,6 +3839,7 @@ mod tests {
             done(&mut model, ROOT, 0, ROOT);
             finish(&mut model, ROOT, 0);
             model.begin_rescan(1, 1);
+            assert!(model.directories.contains_key(&1));
             let before = model.node(ROOT).sizes;
             let changed = model.apply_scoped(
                 1,
@@ -3821,6 +3853,7 @@ mod tests {
             );
             assert_eq!(changed, vec![1]);
             assert_eq!(model.node(1).kind, NodeKind::File);
+            assert!(!model.directories.contains_key(&1));
             assert_eq!(model.node(1).sizes, Sizes::default());
             assert_eq!(model.node(1).hardlink_duplicate, file_identity.is_some());
             assert_eq!(model.node(ROOT).sizes, before);
@@ -3854,6 +3887,7 @@ mod tests {
         });
         finish(&mut model, ROOT, 0);
         assert_eq!(model.node(ROOT).kind, NodeKind::File);
+        assert!(!model.directories.contains_key(&ROOT));
         assert_eq!(model.node(ROOT).sizes.apparent, 200);
         assert_eq!(model.node(ROOT).sizes.allocated, 1024);
         assert!(!model.node(ROOT).hardlink_duplicate);
