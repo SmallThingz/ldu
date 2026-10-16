@@ -315,10 +315,54 @@ def check_printable_names():
         assert not path_in_header(screen, path.parent), "header hint truncated the directory identity"
 
 
+def own_terminal():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def check_harness_terminal_lifetime():
+    """Prove the master detects both restored and unrestored child terminal state."""
+    child_code = """import sys, termios, tty
+saved = termios.tcgetattr(0)
+tty.setraw(0, termios.TCSANOW)
+if sys.argv[1] == "restore":
+    termios.tcsetattr(0, termios.TCSANOW, saved)
+"""
+    for restore in (False, True):
+        master, slave = pty.openpty()
+        child = None
+        try:
+            saved = termios.tcgetattr(slave)
+            assert termios.tcgetattr(master) == saved, "PTY endpoints disagree on terminal attributes"
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, "restore" if restore else "leave-raw"],
+                stdin=slave, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=own_terminal,
+            )
+            assert child.wait(timeout=5) == 0, "terminal lifetime fixture failed"
+            observed = termios.tcgetattr(master)
+            if restore:
+                assert observed == saved, "master lost restored terminal attributes after child exit"
+            else:
+                assert observed != saved, "master hid unrestored terminal attributes after child exit"
+                assert not observed[3] & (termios.ICANON | termios.ECHO), "master lost raw terminal state"
+        finally:
+            try:
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+            finally:
+                try:
+                    os.close(master)
+                finally:
+                    os.close(slave)
+
+
 class Session:
     def __init__(self, binary, root, threads, env=None, extra_args=()):
         self.master, self.slave = pty.openpty()
         self.saved = termios.tcgetattr(self.slave)
+        assert termios.tcgetattr(self.master) == self.saved, "PTY endpoints disagree on terminal attributes"
         self.screen = Screen()
         self.raw = bytearray()
         self.observe = None
@@ -326,10 +370,6 @@ class Session:
         self.started = time.perf_counter()
         self.first_frame_ms = None
         self.resize(28, 100)
-
-        def own_terminal():
-            os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
         command = [local_executable(binary)]
         if threads is not None:
@@ -380,8 +420,13 @@ class Session:
                 self.pump(0)
                 if predicate():
                     return
-                attributes = termios.tcgetattr(self.slave)
-                unread = struct.unpack("I", fcntl.ioctl(self.slave, termios.FIONREAD, struct.pack("I", 0)))[0]
+                attributes = termios.tcgetattr(self.master)
+                try:
+                    unread = struct.unpack("I", fcntl.ioctl(self.slave, termios.FIONREAD, struct.pack("I", 0)))[0]
+                except OSError as exc:
+                    # A BSD session leader can revoke the slave on exit. Preserve
+                    # the original failed condition and its available diagnostics.
+                    unread = repr(exc)
                 diagnostics = {"recent_keys": self.last_keys,
                                "termios_flags": attributes[:4],
                                "canonical": bool(attributes[3] & termios.ICANON),
@@ -409,7 +454,9 @@ class Session:
         while self.pump(0):
             pass
         assert self.child.returncode == expected_exit, (self.child.returncode, expected_exit, self.screen.text())
-        assert termios.tcgetattr(self.slave) == self.saved, "terminal attributes were not restored"
+        # BSD session-leader exit can revoke every slave descriptor. The master
+        # retains the same terminal state without reopening or resetting it.
+        assert termios.tcgetattr(self.master) == self.saved, "terminal attributes were not restored"
         assert b"\x1b[?1049l" in self.raw, "alternate screen was not restored"
         for mode in (1000, 1002, 1003, 1006, 1015):
             enabled = f"\x1b[?{mode}h".encode()
@@ -424,17 +471,24 @@ class Session:
         os.close(descriptor)
 
     def close(self):
-        if self.child.poll() is None:
-            # Only this harness's ldu child is terminated on assertion failures.
-            self.child.kill()
-            self.child.wait()
-        # A disconnected terminal cannot accept restored attributes. Ordinary
-        # sessions still require restoration in finish() before this cleanup.
-        if self.master is not None:
-            termios.tcsetattr(self.slave, termios.TCSANOW, self.saved)
-            os.close(self.master)
-        os.close(self.slave)
-        self.config_home.cleanup()
+        try:
+            if self.child.poll() is None:
+                # Only this harness's ldu child is terminated on assertion failures.
+                self.child.kill()
+                self.child.wait()
+            # A disconnected terminal cannot accept restored attributes. Ordinary
+            # sessions still require restoration in finish() before this cleanup.
+            if self.master is not None:
+                termios.tcsetattr(self.master, termios.TCSANOW, self.saved)
+        finally:
+            try:
+                if self.master is not None:
+                    os.close(self.master)
+            finally:
+                try:
+                    os.close(self.slave)
+                finally:
+                    self.config_home.cleanup()
 
 
 def local_executable(binary):
@@ -3872,6 +3926,7 @@ def main():
         parser.error("max-input-ms must be a finite positive number")
     if not args.binary.is_file():
         parser.error(f"binary does not exist: {args.binary}")
+    check_harness_terminal_lifetime()
     Path(".tmp").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ldu-pty-", dir=".tmp") as work:
         root = args.root or Path(work)
