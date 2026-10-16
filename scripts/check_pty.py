@@ -2927,7 +2927,7 @@ def displayed_size(size):
 def check_snapshot_info(session, snapshot):
     apparent, allocated, items = snapshot_totals(snapshot)
     expected_sizes = f"Allocated: {displayed_size(allocated)} Apparent: {displayed_size(apparent)}"
-    expected_counts = f"Directory · {items} items · 0 errors"
+    expected_counts = f"Directory · {items} {'item' if items == 1 else 'items'} · 0 errors"
     session.key(b"i")
     # A PTY read can stop after the title or size line of the same frame.
     # Keep the complete expected body as the oracle while later rows arrive.
@@ -2979,8 +2979,8 @@ def check_snapshot_info_fragments():
     for body in ((sizes, counts, "Complete"),
                  (sizes.replace("4.0", "8.0"), counts, "Complete"),
                  (sizes.replace("1.0", "2.0"), counts, "Complete"),
-                 (sizes, "Directory · 1 items · 0 errors", "Complete"),
-                 (sizes, "Directory · 0 items · 1 errors", "Complete"),
+                 (sizes, "Directory · 1 item · 0 errors", "Complete"),
+                 (sizes, "Directory · 0 items · 1 error", "Complete"),
                  (sizes, counts, "Partial total")):
         valid = body == (sizes, counts, "Complete")
         session = FragmentedSession(*body)
@@ -3148,7 +3148,7 @@ def check_owned_refresh_after_quit(binary, work, threads):
         session.wait(lambda: session.screen.has_modal_title("Info")
                      and f"Allocated: {displayed_size(allocated)} Apparent: {displayed_size(apparent)}"
                      in session.screen.words()
-                     and f"Directory · {items} items · 0 errors" in session.screen.words()
+                     and f"Directory · {items} {'item' if items == 1 else 'items'} · 0 errors" in session.screen.words()
                      and "Complete" in session.screen.words(),
                      "restarted reconciliation did not repair survivor totals")
         session.key(b"\x1b")
@@ -3452,7 +3452,7 @@ def reset_fixture_visual(session, names):
 
 
 def batch_count(session):
-    match = re.search(r"Delete (\d+) entries in:", session.screen.words())
+    match = re.search(r"Delete (\d+) entr(?:y|ies) in:", session.screen.words())
     return int(match[1]) if match else None
 
 

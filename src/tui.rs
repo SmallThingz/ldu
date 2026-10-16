@@ -5335,13 +5335,15 @@ impl App {
         let id = self.selected.unwrap_or(self.directory);
         let node = self.model.node(id);
         let mut text = format!(
-            "{}\n\nAllocated: {}   Apparent: {}\n{:?} · {} items · {} errors\n{}",
+            "{}\n\nAllocated: {}   Apparent: {}\n{:?} · {} item{} · {} error{}\n{}",
             printable(self.model.path(id).as_os_str()),
             human_size(node.sizes.allocated),
             human_size(node.sizes.apparent),
             node.kind,
             node.items,
+            if node.items == 1 { "" } else { "s" },
             node.error_count,
+            if node.error_count == 1 { "" } else { "s" },
             if !self.model.has_partial_totals(id) {
                 "Complete"
             } else {
@@ -6412,8 +6414,12 @@ fn draw_modal(
                         usize::from(inner.width),
                     ))
                     .style(Style::default().add_modifier(Modifier::BOLD)),
-                    Line::from(format!("{} errors · {first}–{last}", report.errors.len()))
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Line::from(format!(
+                        "{} error{} · {first}–{last}",
+                        report.errors.len(),
+                        if report.errors.len() == 1 { "" } else { "s" },
+                    ))
+                    .style(Style::default().fg(Color::DarkGray)),
                 ])
                 .style(style),
                 regions[0],
@@ -6503,7 +6509,10 @@ fn draw_modal(
             }
             frame.render_widget(
                 Paragraph::new(if *ready {
-                    format!("Delete {count} entries in:")
+                    format!(
+                        "Delete {count} {} in:",
+                        if *count == 1 { "entry" } else { "entries" },
+                    )
                 } else {
                     "Delete selected entries in:".to_owned()
                 })
@@ -8481,9 +8490,10 @@ pub fn run(
         for report in &app.delete_notices {
             let _ = write!(
                 message,
-                "\n{} ({} errors)",
+                "\n{} ({} error{})",
                 report.target,
-                report.errors.len()
+                report.errors.len(),
+                if report.errors.len() == 1 { "" } else { "s" },
             );
             if let Some(error) = report.errors.first() {
                 let _ = write!(
