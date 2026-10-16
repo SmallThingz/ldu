@@ -1104,7 +1104,7 @@ fn retry_failed_unlink(
     }
     // The target's containing directory can lie outside the requested subtree.
     // Restore its permissions even after cooperative cancellation.
-    if restore_parent && let Ok(Some(original_mode)) = repaired.as_ref() {
+    let restoration_error = if restore_parent && let Ok(Some(original_mode)) = repaired.as_ref() {
         let restore_state = WorkerState::default();
         #[cfg(test)]
         let restoration = if state.fail_parent_restore.load(Ordering::Relaxed) {
@@ -1116,21 +1116,25 @@ fn retry_failed_unlink(
         let restoration = chmod_held(parent, *original_mode, &restore_state);
         let restoration =
             restoration.and_then(|()| verify_held_mode(parent, *original_mode, &restore_state));
-        restoration.map_err(|error| {
-            #[cfg(target_os = "linux")]
-            let parent_name = std::fs::read_link(descriptor_path(parent))
-                .unwrap_or_else(|_| descriptor_path(parent))
-                .display()
-                .to_string();
-            #[cfg(not(target_os = "linux"))]
-            let parent_name = "the containing directory";
-            io::Error::new(
-                error.kind(),
-                format!("could not restore permissions of {}: {error}", parent_name),
-            )
-        })?;
-    }
-    match retry {
+        restoration
+            .map_err(|error| {
+                #[cfg(target_os = "linux")]
+                let parent_name = std::fs::read_link(descriptor_path(parent))
+                    .unwrap_or_else(|_| descriptor_path(parent))
+                    .display()
+                    .to_string();
+                #[cfg(not(target_os = "linux"))]
+                let parent_name = "the containing directory";
+                io::Error::new(
+                    error.kind(),
+                    format!("could not restore permissions of {}: {error}", parent_name),
+                )
+            })
+            .err()
+    } else {
+        None
+    };
+    let retry = match retry {
         Ok(()) => Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::Interrupted
@@ -1148,6 +1152,16 @@ fn retry_failed_unlink(
             }
             Err(io::Error::new(error.kind(), message))
         }
+    };
+    // Cleanup failure must not replace the final removal/recovery diagnostic.
+    // Preserve the restoration error kind, including when removal was cancelled.
+    match (retry, restoration_error) {
+        (retry, None) => retry,
+        (Ok(()), Some(restoration)) => Err(restoration),
+        (Err(error), Some(restoration)) => Err(io::Error::new(
+            restoration.kind(),
+            format!("{error}; {restoration}"),
+        )),
     }
 }
 
@@ -3535,6 +3549,75 @@ mod tests {
                 }
                 // The injected failure intentionally leaves the recovered mode.
                 std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_and_parent_restore_failures_keep_both_diagnostics_and_removal_state() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for kind in ["file", "symlink", "directory"] {
+            for unlink_fails in [false, true] {
+                let work = fixture();
+                let parent = work.path().join("parent");
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(work.path().join("sentinel"), b"keep").unwrap();
+                let target = parent.join("target");
+                match kind {
+                    "directory" => std::fs::create_dir(&target).unwrap(),
+                    "symlink" => symlink("../sentinel", &target).unwrap(),
+                    _ => std::fs::write(&target, b"retained").unwrap(),
+                }
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+                let anchor = RootAnchor::open(work.path()).unwrap();
+                let expected = capture(&anchor, Path::new("parent/target")).unwrap();
+                let state = WorkerState::default();
+                state.fail_parent_restore.store(true, Ordering::Relaxed);
+                let attempts = Arc::new(AtomicU64::new(0));
+                let observed = Arc::clone(&attempts);
+                *state.unlink_hook.lock().unwrap() = Some(Box::new(move |name, directory| {
+                    assert_eq!(name, "target");
+                    assert_eq!(directory, kind == "directory");
+                    match observed.fetch_add(1, Ordering::Relaxed) {
+                        0 => Err(io::ErrorKind::PermissionDenied.into()),
+                        1 if unlink_fails => Err(io::Error::other("injected final unlink failure")),
+                        1 => Ok(()),
+                        _ => panic!("removal exceeded its retry limit"),
+                    }
+                }));
+                let removal =
+                    remove_expected(&anchor, Path::new("parent/target"), &state, Some(expected))
+                        .unwrap();
+                // The restoration hook intentionally leaves the repaired mode.
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(removal.outcome.is_err());
+                assert_eq!(removal.target_removed, !unlink_fails, "kind={kind}");
+                assert_eq!(attempts.load(Ordering::Relaxed), 2);
+                assert_eq!(state.snapshot().removed_entries, u64::from(!unlink_fails));
+                assert_eq!(
+                    state.snapshot().removed_directories,
+                    u64::from(!unlink_fails && kind == "directory"),
+                );
+                assert_eq!(std::fs::symlink_metadata(&target).is_ok(), unlink_fails);
+                assert_eq!(
+                    std::fs::read(work.path().join("sentinel")).unwrap(),
+                    b"keep"
+                );
+                assert_eq!(removal.errors.len(), 1);
+                let error = &removal.errors[0];
+                assert_eq!(error.path, std::path::absolute(&target).unwrap());
+                assert!(error.path.is_absolute());
+                assert!(error.message.contains("could not restore permissions"));
+                assert!(
+                    error
+                        .message
+                        .contains("injected parent restoration failure")
+                );
+                assert_eq!(
+                    error.message.contains("injected final unlink failure"),
+                    unlink_fails
+                );
             }
         }
     }
