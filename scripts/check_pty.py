@@ -15,7 +15,6 @@ import re
 import select
 import shlex
 import signal
-import shutil
 import stat
 import struct
 import subprocess
@@ -1605,6 +1604,99 @@ def check_owned_helper_shutdown(binary, work, threads):
     return metrics
 
 
+def archive_helper_capability(archive, member, kind):
+    """Check owned fixtures independently before asserting the real UI's output.
+
+    This also warms external programs on emulated guests. A setup timeout is a
+    failed qualification, never evidence that an installed helper is unsupported.
+    """
+    search = [Path(part) for part in os.environ.get("PATH", "").split(os.pathsep)
+              if Path(part).is_absolute()]
+    env = {"PATH": os.pathsep.join(map(str, search)), "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
+    attempts = []
+    # Match the product catalog, including BSD tar under either executable name.
+    for tool, names in [("bsdtar", ("bsdtar",)), ("tar", ("tar",)),
+                        ("zipinfo", ("zipinfo",)), ("unzip", ("unzip",)),
+                        ("7z", ("7zz", "7z"))]:
+        if tool == "bsdtar" or tool == "tar" and kind != "gzip":
+            arguments = ["--passphrase", "ldu-preview-no-password", "-tf", "/dev/fd/0"]
+        elif tool == "tar":
+            arguments = ["-tzf", "/dev/fd/0"]
+        elif tool == "zipinfo" and kind == "zip":
+            arguments = ["-1", "/dev/fd/0"]
+        elif tool == "unzip" and kind == "zip":
+            arguments = ["-Z1", "/dev/fd/0"]
+        elif tool == "7z":
+            arguments = ["l", "-ba", "-bd", "-mmt=1", "-sccUTF-8", "-p-", "--", "/dev/fd/0"]
+        else:
+            continue
+        executable = next((directory / name for name in names for directory in search
+                           if (directory / name).is_file()
+                           and (directory / name).stat().st_mode & 0o111), None)
+        if executable is None:
+            continue
+        gate = 'IFS= read -r ready && [ "$ready" = x ] && exec "$@" <&2 2>/dev/null'
+        with archive.open("rb") as source, tempfile.TemporaryFile(dir=".tmp") as output:
+            child = None
+            owned = False
+            previous = signal.getsignal(signal.SIGTERM)
+
+            def terminate(signum, _frame):
+                signal.signal(signum, signal.SIG_IGN)
+                raise SystemExit(128 + signum)
+
+            signal.signal(signal.SIGTERM, terminate)
+            try:
+                options = os.WEXITED | os.WNOHANG | os.WNOWAIT
+                deadline = time.monotonic() + 15
+                child = subprocess.Popen(
+                    ["/bin/sh", "-c", gate, "ldu-preview-gate", str(executable), *arguments],
+                    cwd="/", env=env, stdin=subprocess.PIPE, stdout=output,
+                    stderr=source, process_group=0,
+                )
+                owned = True
+                child.stdin.write(b"x\n")
+                child.stdin.close()
+                while True:
+                    assert time.monotonic() < deadline, f"archive capability setup timed out: {executable} {archive.name}"
+                    assert os.fstat(output.fileno()).st_size <= 65536, f"archive capability output exceeded limit: {executable}"
+                    try:
+                        status = os.waitid(os.P_PID, child.pid, options)
+                    except InterruptedError:
+                        continue
+                    except ChildProcessError:
+                        owned = False
+                        raise
+                    if status is not None:
+                        break
+                    time.sleep(0.02)
+            finally:
+                try:
+                    if child is not None:
+                        try:
+                            if child.stdin is not None:
+                                child.stdin.close()
+                        finally:
+                            if owned:
+                                try:
+                                    os.killpg(child.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                finally:
+                                    child.wait(timeout=5)
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+            assert os.fstat(output.fileno()).st_size <= 65536, f"archive capability output exceeded limit: {executable}"
+            output.seek(0)
+            listing = output.read(65536)
+        assert child.returncode >= 0, f"archive capability helper terminated by signal: {executable}: {child.returncode}"
+        attempts.append({"tool": str(executable), "status": child.returncode})
+        if child.returncode == 0:
+            assert member.encode() in listing, f"archive capability omitted {member}: {executable}: {listing!r}"
+            return {"supported": True, "attempts": attempts}
+    return {"supported": False, "attempts": attempts}
+
+
 def check_owned_special_previews(binary, work, threads):
     root = work / "special-previews"
     root.mkdir()
@@ -1632,6 +1724,14 @@ def check_owned_special_previews(binary, work, threads):
     write_preview_rar(root / "owned.rar")
     write_preview_pdf(root / "owned.pdf")
     (root / "unknown.bin").write_bytes(b"\0UNKNOWN_BINARY_PAYLOAD")
+    archive_cases = [
+        ("--owned.zip", "inside-zip.txt", "zip"),
+        ("owned.tar.gz", "inside-tar.txt", "gzip"),
+        ("owned.rar", "inside-rar.txt", "archive"),
+    ]
+    capabilities = {name: archive_helper_capability(root / name, entry, kind)
+                    for name, entry, kind in archive_cases}
+    print("Archive helper capabilities: " + json.dumps(capabilities, sort_keys=True), flush=True)
     session = Session(binary, root, threads)
     samples = []
     try:
@@ -1652,22 +1752,17 @@ def check_owned_special_previews(binary, work, threads):
             assert "LINK_FILE_CONTENT_MUST_NOT_APPEAR" not in pane()
             assert "LINK_DIRECTORY_CONTENT_MUST_NOT_APPEAR" not in pane()
             assert path_in_header(session.screen, root), "preview followed a symlink"
-        archive_cases = [
-            ("--owned.zip", "inside-zip.txt", ("bsdtar", "zipinfo", "unzip", "7zz", "7z")),
-            ("owned.tar.gz", "inside-tar.txt", ("bsdtar", "tar", "7zz", "7z")),
-            ("owned.rar", "inside-rar.txt", ("bsdtar", "7zz", "7z")),
-        ]
-        for name, entry, helpers in archive_cases:
+        for name, entry, _kind in archive_cases:
             fixture_selection(session, name)
-            if any(shutil.which(helper) for helper in helpers):
+            if capabilities[name]["supported"]:
                 samples.append(stationary_sample(
                     session, lambda: "Archive contents" in pane() and entry in pane(),
                     f"installed archive helper {name}"))
             else:
                 samples.append(stationary_sample(
-                    session, lambda: ("Size" in pane() and "Disk" in pane())
-                    or ("Archive contents" in pane() and entry in pane()),
-                    f"optional archive preview {name}"))
+                    session, lambda: "Size" in pane() and "Disk" in pane()
+                    and "Archive contents" not in pane() and entry not in pane(),
+                    f"unsupported archive details {name}"))
             assert "ARCHIVE_PAYLOAD_MUST_NOT_APPEAR" not in pane()
         fixture_selection(session, "owned.pdf")
         samples.append(stationary_sample(
@@ -1680,7 +1775,8 @@ def check_owned_special_previews(binary, work, threads):
         assert "UNKNOWN_BINARY_PAYLOAD" not in pane()
         elapsed = session.finish(key=b"q")
         result = {"case": "symlink-and-system-tool-previews", "first_frame_ms": session.first_frame_ms,
-                  "quit_ms": elapsed, "input": [], "idle": samples}
+                  "quit_ms": elapsed, "input": [], "idle": samples,
+                  "archive_helpers": capabilities}
     finally:
         session.close()
     # Availability is per process; no global PATH mutation or installed tools
