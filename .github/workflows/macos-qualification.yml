@@ -111,19 +111,32 @@ jobs:
           PY
           python3 .tmp/native-macos/identity.py record
 
-      - name: Check formatting and workspace tests
+      - name: Check formatting
+        timeout-minutes: 2
+        run: cargo +1.99.0 fmt --all -- --check
+
+      - name: Run workspace tests
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         timeout-minutes: 20
         run: |
-          cargo +1.99.0 fmt --all -- --check
-          cargo +1.99.0 test --locked --workspace --target "$LDU_TARGET"
+          python3 .tmp/native-macos/identity.py verify
+          cargo +1.99.0 test --locked --workspace --no-fail-fast --target "$LDU_TARGET"
+          python3 .tmp/native-macos/identity.py verify
 
       - name: Check Clippy
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         timeout-minutes: 15
-        run: cargo +1.99.0 clippy --locked --no-deps -p ldu --all-targets --target "$LDU_TARGET" -- -D warnings
+        run: |
+          python3 .tmp/native-macos/identity.py verify
+          cargo +1.99.0 clippy --locked --no-deps -p ldu --all-targets --target "$LDU_TARGET" -- -D warnings
+          python3 .tmp/native-macos/identity.py verify
 
       - name: Build, sign and package the native release binary
+        id: package
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
         timeout-minutes: 30
         run: |
+          python3 .tmp/native-macos/identity.py verify
           ldu_notices_dir=$(mktemp -d .tmp/native-macos/notices.XXXXXXXX)
           python3 scripts/release.py notices --target "$LDU_TARGET" --output "$ldu_notices_dir/notices.zip"
           cargo +1.99.0 rustc --locked --release --bin ldu --target "$LDU_TARGET" -- \
@@ -146,6 +159,7 @@ jobs:
           python3 .tmp/native-macos/identity.py verify
 
       - name: Smoke-test the exact packaged binary
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         timeout-minutes: 10
         run: |
           python3 .tmp/native-macos/identity.py verify
@@ -153,6 +167,7 @@ jobs:
           python3 .tmp/native-macos/identity.py verify
 
       - name: Run full PTY qualification on the packaged binary
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           python3 .tmp/native-macos/identity.py verify
@@ -160,6 +175,7 @@ jobs:
           python3 .tmp/native-macos/identity.py verify
 
       - name: Run filesystem integration with packaged CLI invocations
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         timeout-minutes: 15
         # LDU_TEST_BIN selects the packaged executable for CLI cases; API cases
         # exercise the test library built from the same frozen source.
