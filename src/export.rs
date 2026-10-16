@@ -164,6 +164,43 @@ mod tests {
         serde_json::from_slice(&output).unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_export_lossily_without_filesystem_support() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new(OsStr::from_bytes(b"/fixture-\xfe"));
+        let mut model = Model::new(root.into());
+        root_info(&mut model, NodeKind::Directory, Sizes::default());
+        let mut child = entry(
+            1,
+            "",
+            NodeKind::File,
+            Sizes {
+                apparent: 7,
+                allocated: 512,
+            },
+        );
+        child.name = OsStr::from_bytes(b"file-\xff").into();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![child],
+        });
+        model.apply(ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        });
+        model.apply(ScanEvent::Finished { cancelled: false });
+
+        let value = export(&model, root);
+        assert_eq!(value[3][0]["name"], "/fixture-�");
+        assert_eq!(value[3][1]["name"], "file-�");
+        assert_eq!(value[3][1]["asize"], 7);
+        assert_eq!(value[3][1]["dsize"], 512);
+        assert!(value[3][0].get("read_error").is_none());
+        assert!(value[3][1].get("read_error").is_none());
+    }
+
     #[test]
     fn directories_export_retained_own_sizes_even_when_totals_saturate() {
         let root = Path::new("/fixture");

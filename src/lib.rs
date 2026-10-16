@@ -15,6 +15,9 @@ mod retire;
 pub mod scan;
 pub mod selection;
 mod terminal_input;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 pub mod theme;
 pub mod tui;
 pub mod types;

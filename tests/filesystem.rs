@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use ldu::{
     backend::Backend,
     model::Model,
@@ -8,12 +10,8 @@ use ldu::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
     fs::{self, File, Permissions},
-    os::unix::{
-        ffi::OsStringExt,
-        fs::{MetadataExt, PermissionsExt, symlink},
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -177,8 +175,9 @@ fn streamed_scan_conserves_inode_totals_preserves_names_and_never_follows_symlin
     fs::hard_link(&sparse, root.join("a-fast/alias")).unwrap();
     symlink(".", root.join("cycle")).unwrap();
     symlink("missing-target", root.join("dangling")).unwrap();
-    let raw_name = OsString::from_vec(b"raw-\xff".to_vec());
-    fs::write(root.join(&raw_name), b"non UTF-8").unwrap();
+    let raw_name = support::create_name(root, b"raw-\xff", "raw-☃", |path| {
+        fs::write(path, b"non UTF-8")
+    });
     let expected = reference(root, &mut HashSet::new());
     let metadata = fs::symlink_metadata(&sparse).unwrap();
     assert!(
@@ -608,12 +607,18 @@ fn cli_normalization_keeps_final_symlinks_as_leaves() {
 #[test]
 fn headless_export_handles_non_utf8_paths_and_reports_missing_root() {
     let work = fixture();
-    let raw_root = work.path().join(OsString::from_vec(b"root-\xfe".to_vec()));
-    fs::create_dir(&raw_root).unwrap();
-    let raw_dir = raw_root.join(OsString::from_vec(b"directory-\xff".to_vec()));
-    fs::create_dir(&raw_dir).unwrap();
-    let raw_file = raw_dir.join(OsString::from_vec(b"file-\xfd".to_vec()));
-    fs::write(&raw_file, b"content").unwrap();
+    let root_name = support::create_name(work.path(), b"root-\xfe", "root-☃", |path| {
+        fs::create_dir(path)
+    });
+    let raw_root = work.path().join(root_name);
+    let directory_name =
+        support::create_name(&raw_root, b"directory-\xff", "directory-☃", |path| {
+            fs::create_dir(path)
+        });
+    let raw_dir = raw_root.join(&directory_name);
+    let file_name = support::create_name(&raw_dir, b"file-\xfd", "file-☃", |path| {
+        fs::write(path, b"content")
+    });
     let output = export_scan(&raw_root);
     assert!(
         output.status.success(),
@@ -634,12 +639,14 @@ fn headless_export_handles_non_utf8_paths_and_reports_missing_root() {
             .to_string_lossy()
             .as_ref()
     );
-    assert!(records.iter().any(|record| record["name"] == "directory-�"));
     assert!(
         records
             .iter()
-            .any(|record| record["name"] == "file-�" && record["asize"] == 7)
+            .any(|record| record["name"] == directory_name.to_string_lossy().as_ref())
     );
+    assert!(records.iter().any(|record| {
+        record["name"] == file_name.to_string_lossy().as_ref() && record["asize"] == 7
+    }));
     assert!(records.iter().all(|record| record["read_error"] != true));
 
     let output = export_scan(&work.path().join("does-not-exist"));
@@ -879,8 +886,9 @@ fn confirmed_async_deletion_removes_owned_files_trees_and_links_without_followin
     fs::write(root.join("tree/nested/leaf"), b"remove").unwrap();
     symlink("../../../outside", root.join("tree/nested/outside-link")).unwrap();
     symlink("../outside", root.join("outside-link")).unwrap();
-    let raw_name = OsString::from_vec(b"delete-\xff".to_vec());
-    fs::write(root.join(&raw_name), b"raw name").unwrap();
+    let raw_name = support::create_name(&root, b"delete-\xff", "delete-☃", |path| {
+        fs::write(path, b"raw name")
+    });
     let anchor = std::sync::Arc::new(ldu::backend::RootAnchor::open(&root).unwrap());
 
     for relative in [

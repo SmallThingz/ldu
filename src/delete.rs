@@ -2315,14 +2315,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn portable_stream_removes_wide_trees_without_following_symlinks() {
-        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        use std::os::unix::fs::symlink;
         let work = fixture();
         let target = work.path().join("target");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(work.path().join("sentinel"), b"keep").unwrap();
         symlink("../sentinel", target.join("link")).unwrap();
-        let raw = std::ffi::OsString::from_vec(vec![b'x', 0xff]);
-        std::fs::write(target.join(raw), b"remove").unwrap();
+        crate::test_support::create_name(&target, b"x\xff", "x-雪", |path| {
+            std::fs::write(path, b"remove")
+        });
         for index in 0..700 {
             std::fs::write(target.join(format!("leaf-{index}")), b"remove").unwrap();
         }
@@ -2591,13 +2592,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn buffered_tree_removal_preserves_raw_names_and_never_follows_links() {
-        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        use std::os::unix::fs::symlink;
         let work = fixture();
         std::fs::create_dir_all(work.path().join("target/child/deeper")).unwrap();
         std::fs::create_dir(work.path().join("outside")).unwrap();
         std::fs::write(work.path().join("outside/sentinel"), b"keep").unwrap();
-        let raw = std::ffi::OsString::from_vec(vec![b'x', 0xff]);
-        std::fs::write(work.path().join("target/child/deeper").join(raw), b"x").unwrap();
+        crate::test_support::create_name(
+            &work.path().join("target/child/deeper"),
+            b"x\xff",
+            "x-雪",
+            |path| std::fs::write(path, b"x"),
+        );
         symlink(
             "../../../outside",
             work.path().join("target/child/deeper/link"),

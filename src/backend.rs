@@ -934,7 +934,6 @@ pub(crate) fn native_metadata(stat: rustix::fs::Stat) -> EntryMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
     #[cfg(unix)]
     fn fixture() -> tempfile::TempDir {
@@ -1286,13 +1285,15 @@ mod tests {
     #[test]
     fn native_and_std_agree_on_raw_names_sparse_files_and_symlinks() {
         use std::collections::HashMap;
-        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+        use std::os::unix::fs::symlink;
 
         fn assert_sync<T: Sync>() {}
         assert_sync::<MetadataReader>();
         let directory = fixture();
-        let raw_name = OsString::from_vec(vec![b'f', 0xff]);
-        fs::write(directory.path().join(&raw_name), b"contents").unwrap();
+        let raw_name =
+            crate::test_support::create_name(directory.path(), b"f\xff", "f-雪", |path| {
+                fs::write(path, b"contents")
+            });
         fs::create_dir(directory.path().join("child")).unwrap();
         fs::File::create(directory.path().join("sparse"))
             .unwrap()
@@ -1661,6 +1662,7 @@ mod tests {
     #[test]
     fn long_relative_paths_use_component_fallback_without_disabling_fast_open() {
         use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        use std::ffi::OsString;
         use std::io::Write as _;
         use std::os::unix::ffi::OsStringExt;
 
