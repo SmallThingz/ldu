@@ -4079,10 +4079,14 @@ def check_owned_visual_ranges(binary, work, threads):
             session.key(keys)
             session.wait(lambda: queued_input_bytes(session) == len(keys),
                          "pending confirmation keys did not reach the stopped child's PTY")
+        session.wait(lambda: not (root / names[0]).exists(),
+                     "pending range dropped its buffered deletion confirmation", timeout=30)
+        # Admission must not wait for another key. Completing 8192 separate
+        # deletion jobs has its own finite budget, including under emulation.
         session.wait(lambda: not any(root.iterdir())
                      and session.screen.normal_view() and visual_count(session) is None
                      and "Scan complete" in session.screen.text(header=True),
-                     "pending range dropped its buffered deletion confirmation", timeout=30)
+                     "confirmed visual-range deletion did not finish all targets and settle", timeout=300)
         elapsed = session.finish(key=b"q")
         return {"case": "visual-pending-range-and-edge-drag",
                 "first_frame_ms": session.first_frame_ms, "quit_ms": elapsed, "input": []}
