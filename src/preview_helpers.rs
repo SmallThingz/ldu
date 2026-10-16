@@ -534,6 +534,59 @@ mod tests {
     }
 
     #[test]
+    fn short_reads_preserve_extensionless_tar_helper_detection() {
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            chunk: usize,
+            reads: usize,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let count = self.bytes.len().min(output.len()).min(self.chunk);
+                output[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        // A valid empty-file ustar header followed by its two end blocks.
+        // Its early NULs precede the signature, independently of chunk size.
+        let mut archive = vec![0; 1536];
+        archive[..4].copy_from_slice(b"leaf");
+        archive[100..108].copy_from_slice(b"0000644\0");
+        archive[108..116].copy_from_slice(b"0000000\0");
+        archive[116..124].copy_from_slice(b"0000000\0");
+        archive[124..136].copy_from_slice(b"00000000000\0");
+        archive[136..148].copy_from_slice(b"00000000000\0");
+        archive[148..156].fill(b' ');
+        archive[156] = b'0';
+        archive[257..263].copy_from_slice(b"ustar\0");
+        archive[263..265].copy_from_slice(b"00");
+        let checksum: u32 = archive[..512].iter().map(|&byte| u32::from(byte)).sum();
+        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        for hint in [0, 1, u64::MAX] {
+            for chunk in [1, 7, 31, 32, 128, 257, 261, 262, 4096] {
+                let mut reader = Counted {
+                    bytes: &archive,
+                    chunk,
+                    reads: 0,
+                };
+                let (bytes, truncated) =
+                    super::super::read_prefix(&mut reader, hint, || Ok(())).unwrap();
+                assert_eq!(
+                    format(&bytes, Path::new("extensionless")),
+                    Some(Format::Tar),
+                    "hint={hint}, chunk={chunk}"
+                );
+                assert!(!truncated);
+                let reads = super::super::MAGIC_LIMIT.div_ceil(chunk);
+                assert_eq!(reader.reads, reads);
+                assert_eq!(bytes.len(), archive.len().min(reads * chunk));
+            }
+        }
+    }
+
+    #[test]
     fn pdf_files_skip_helper_discovery_and_archive_extension_fallbacks() {
         std::fs::create_dir_all(".tmp").unwrap();
         let mut input = tempfile::tempfile_in(".tmp").unwrap();

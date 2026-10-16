@@ -25,6 +25,8 @@ use std::{
 };
 
 const READ_LIMIT: usize = 64 * 1024;
+// The furthest recognized signature is ustar at bytes 257..262.
+const MAGIC_LIMIT: usize = 262;
 const TEXT_LIMIT: usize = 32 * 1024;
 const LINE_LIMIT: usize = 256;
 
@@ -454,8 +456,9 @@ fn read_prefix(
         };
         bytes.extend_from_slice(&chunk[..count]);
         binary = binary || chunk[..count].contains(&0);
-        // Short reads can split image headers containing NUL before their magic.
-        if file_kind(&bytes) != "Binary" || (bytes.len() >= 32 && binary && !utf16(&bytes)) {
+        // Short reads may encounter NUL before an image or archive signature.
+        if file_kind(&bytes) != "Binary" || (bytes.len() >= MAGIC_LIMIT && binary && !utf16(&bytes))
+        {
             break;
         }
     }
@@ -723,7 +726,8 @@ mod tests {
                 assert_eq!(contents.kind, kind);
                 assert!(contents.text.is_none());
                 if chunk == 1 {
-                    assert!(reads <= 32 && len <= 32);
+                    let limit = if kind == "Binary" { MAGIC_LIMIT } else { 32 };
+                    assert!(reads <= limit && len <= limit);
                 } else {
                     assert_eq!((len, reads), (4096, 1));
                 }
