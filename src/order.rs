@@ -769,6 +769,8 @@ struct CacheState {
     retired_indices: VecDeque<Arc<PublishedCache>>,
     cleanup: VecDeque<NodeId>,
     retired_rows: VecDeque<RetiredRows>,
+    #[cfg(test)]
+    liveness_parent_checks: std::cell::Cell<usize>,
 }
 
 impl CacheState {
@@ -787,6 +789,8 @@ impl CacheState {
             retired_indices: VecDeque::new(),
             cleanup: VecDeque::new(),
             retired_rows: VecDeque::new(),
+            #[cfg(test)]
+            liveness_parent_checks: std::cell::Cell::new(0),
         }
     }
 
@@ -794,6 +798,11 @@ impl CacheState {
         if self.removed.is_empty() && !self.has_epochs {
             return false;
         }
+        // Every admitted child also belongs to its parent's cached row map,
+        // including unresolved orphan parents. Once both retirement queues
+        // drain, disconnected descendants have their own tombstones. Delayed
+        // rows still need their immediate parent and epoch witness checked.
+        let settled = self.cleanup.is_empty() && self.retired_rows.is_empty();
         loop {
             if self.removed.contains(&id) {
                 return true;
@@ -804,12 +813,18 @@ impl CacheState {
             let Some(parent) = link.parent else {
                 return false;
             };
+            #[cfg(test)]
+            self.liveness_parent_checks
+                .set(self.liveness_parent_checks.get() + 1);
             if self
                 .parents
                 .get(&parent)
                 .is_some_and(|parent| link.parent_epoch != parent.child_epoch)
             {
                 return true;
+            }
+            if settled {
+                return self.removed.contains(&parent);
             }
             id = parent;
         }
@@ -2443,6 +2458,168 @@ mod tests {
             state.cleanup(cache);
         }
         panic!("bounded cached-row cleanup did not finish");
+    }
+
+    #[test]
+    fn settled_cache_bounds_parent_checks_after_removal_and_refresh() {
+        const DEPTH: NodeId = 96;
+        for refresh in [false, true] {
+            let (mut state, cache) = cache_state();
+            let mut rows = vec![epoch_row(None, 0, 0, 0, NodeKind::Directory)];
+            rows.extend((1..=DEPTH + 1).map(|id| {
+                epoch_row(
+                    Some(id - 1),
+                    id,
+                    0,
+                    0,
+                    if id <= DEPTH {
+                        NodeKind::Directory
+                    } else {
+                        NodeKind::File
+                    },
+                )
+            }));
+            upsert_epoch(&mut state, &cache, rows);
+            if refresh {
+                upsert_epoch(
+                    &mut state,
+                    &cache,
+                    vec![epoch_row(None, 0, 0, 1, NodeKind::Directory)],
+                );
+                assert!(state.cleanup.is_empty());
+                assert!(!state.retired_rows.is_empty());
+            } else {
+                state.apply(
+                    CacheCommand::Remove {
+                        generation: 1,
+                        ids: vec![1],
+                    },
+                    &cache,
+                );
+                assert!(!state.cleanup.is_empty());
+                assert!(state.retired_rows.is_empty());
+            }
+            state.liveness_parent_checks.set(0);
+            assert!(state.is_removed(DEPTH + 1));
+            assert!(state.liveness_parent_checks.get() >= DEPTH as usize);
+
+            // A surviving branch can arrive while the old branch is retiring.
+            let fresh: Vec<_> = (200..=200 + DEPTH)
+                .map(|id| {
+                    epoch_row(
+                        Some(if id == 200 { 0 } else { id - 1 }),
+                        id,
+                        if id == 200 { u64::from(refresh) } else { 0 },
+                        0,
+                        if id < 200 + DEPTH {
+                            NodeKind::Directory
+                        } else {
+                            NodeKind::File
+                        },
+                    )
+                })
+                .collect();
+            upsert_epoch(&mut state, &cache, fresh.clone());
+            finish_cache_cleanup(&mut state, &cache);
+            state.liveness_parent_checks.set(0);
+            for _ in 0..1024 {
+                assert!(!state.is_removed(200 + DEPTH));
+                assert!(state.is_removed(DEPTH + 1));
+            }
+            assert_eq!(state.liveness_parent_checks.get(), 1024);
+
+            // Each ancestor-size update validates only the row and its parent.
+            state.liveness_parent_checks.set(0);
+            upsert_epoch(&mut state, &cache, fresh);
+            assert!(state.liveness_parent_checks.get() <= 2 * (DEPTH as usize + 1));
+        }
+    }
+
+    #[test]
+    fn settled_cache_rejects_delayed_epochs_and_preserves_fresh_child_witnesses() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 2, NodeKind::Directory),
+                epoch_row(Some(0), 1, 2, 5, NodeKind::Directory),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(Some(1), 2, 4, 0, NodeKind::File)],
+        );
+        assert!(state.removed.contains(&2));
+        assert!(!state.directories[&1].order.rows.contains_key(&2));
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(1), 3, 6, 0, NodeKind::File),
+                epoch_row(Some(0), 1, 2, 6, NodeKind::Directory),
+                epoch_row(Some(0), 1, 2, 5, NodeKind::Directory),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert!(!state.is_removed(1));
+        assert!(!state.is_removed(3));
+        state.publish(1, &cache);
+        assert_eq!(cache.load_full()[&1].ids, [3]);
+        assert_eq!(cache.load_full()[&1].child_epoch, 6);
+    }
+
+    #[test]
+    fn settled_orphan_attachment_retires_descendants_before_shortcut_resumes() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 2, NodeKind::Directory),
+                epoch_row(Some(6), 7, 0, 0, NodeKind::Directory),
+                epoch_row(Some(7), 8, 0, 0, NodeKind::File),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert!(!state.is_removed(8));
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(Some(0), 6, 1, 0, NodeKind::Directory)],
+        );
+        assert!(!state.cleanup.is_empty());
+        assert!(state.is_removed(8));
+        finish_cache_cleanup(&mut state, &cache);
+        for id in 6..=8 {
+            assert!(state.removed.contains(&id));
+            assert!(!state.parents.contains_key(&id));
+            assert!(!state.directories.contains_key(&id));
+        }
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(Some(6), 9, 99, 0, NodeKind::Directory)],
+        );
+        assert!(state.removed.contains(&9));
+        assert!(!state.parents.contains_key(&6));
+
+        // A valid late parent keeps an already-admitted fresh orphan child.
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(11), 12, 4, 0, NodeKind::File),
+                epoch_row(Some(0), 11, 2, 4, NodeKind::Directory),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert!(!state.is_removed(11));
+        assert!(!state.is_removed(12));
+        state.publish(11, &cache);
+        assert_eq!(cache.load_full()[&11].ids, [12]);
     }
 
     #[test]
