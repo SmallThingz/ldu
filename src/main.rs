@@ -142,9 +142,21 @@ fn run(args: Args) -> io::Result<bool> {
     if output.as_os_str() == "-" {
         ldu::export::write_ncdu(&model, &root, io::stdout().lock())?;
     } else {
-        output::write_file(&output, &root, root_metadata.as_ref(), |file| {
-            ldu::export::write_ncdu(&model, &root, file)
-        })?;
+        // The display path can change between the initial snapshot, scanner open,
+        // and export. Retain the identity actually observed through the scan anchor.
+        let scanned_root = handle
+            .anchor
+            .get()
+            .map(|anchor| anchor.metadata())
+            .transpose()?
+            .and_then(|metadata| metadata.identity);
+        output::write_file(
+            &output,
+            &root,
+            root_metadata.as_ref(),
+            scanned_root,
+            |file| ldu::export::write_ncdu(&model, &root, file),
+        )?;
     }
     Ok(failed)
 }

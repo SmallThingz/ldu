@@ -1,6 +1,65 @@
 //! Linux regular-file exports use atomic replacement. Other platforms and
 //! explicit streaming endpoints retain their existing opened-file semantics.
 
+use ldu::types::FileIdentity;
+use std::{fs, io, path::Path};
+
+fn is_scanned_root(metadata: &std::fs::Metadata, scanned: Option<FileIdentity>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        scanned == Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, scanned);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
+}
+
+fn check_root(
+    metadata: &fs::Metadata,
+    root: &Path,
+    initial: Option<&fs::Metadata>,
+    scanned: Option<FileIdentity>,
+) -> io::Result<()> {
+    if is_scanned_root(metadata, scanned)
+        || initial.is_some_and(|root| same_file(metadata, root))
+        || fs::metadata(root).is_ok_and(|root| same_file(metadata, &root))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export file must not replace the scan root",
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_root(
+    output: &Path,
+    root: &Path,
+    initial: Option<&fs::Metadata>,
+    scanned: Option<FileIdentity>,
+) -> io::Result<()> {
+    // Refuse a known source alias before a writable FIFO open can wait for a
+    // reader. A changing path still needs the authoritative opened-file check.
+    if let Ok(metadata) = fs::metadata(output) {
+        check_root(&metadata, root, initial, scanned)?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use atomic::write_file;
 #[cfg(not(target_os = "linux"))]
@@ -8,6 +67,9 @@ pub(crate) use streaming::write_file;
 
 #[cfg(target_os = "linux")]
 mod atomic {
+    #[cfg(test)]
+    use super::same_file;
+    use super::{FileIdentity, check_root, preflight_root};
     use std::{
         ffi::OsString,
         fs::{self, File, Metadata},
@@ -67,26 +129,9 @@ mod atomic {
         ))
     }
 
-    fn same_file(left: &Metadata, right: &Metadata) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
-
     fn same_stat(left: &Metadata, right: &rustix::fs::Stat) -> bool {
         use std::os::unix::fs::MetadataExt;
         left.dev() == right.st_dev && left.ino() == right.st_ino
-    }
-
-    fn check_root(metadata: &Metadata, root: &Path, initial: Option<&Metadata>) -> io::Result<()> {
-        if initial.is_some_and(|root| same_file(metadata, root))
-            || fs::metadata(root).is_ok_and(|root| same_file(metadata, &root))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "export file must not replace the scan root",
-            ));
-        }
-        Ok(())
     }
 
     struct Temporary {
@@ -225,14 +270,16 @@ mod atomic {
         output: &Path,
         root: &Path,
         initial: Option<&Metadata>,
+        scanned: Option<FileIdentity>,
         write: impl FnOnce(&mut File) -> io::Result<()>,
     ) -> io::Result<()> {
+        preflight_root(output, root, initial, scanned)?;
         // Preserve the OS meaning of the exact spelling, including trailing '/.'
         // and descriptor magic links. This open never creates or truncates a file.
         let previous = match fs::OpenOptions::new().write(true).open(output) {
             Ok(file) => {
                 let metadata = file.metadata()?;
-                check_root(&metadata, root, initial)?;
+                check_root(&metadata, root, initial, scanned)?;
                 if !metadata.is_file() {
                     return stream(file, write);
                 }
@@ -277,7 +324,7 @@ mod atomic {
         file.flush()?;
         if let Some(previous) = &pending.previous {
             let metadata = previous.metadata()?;
-            check_root(&metadata, root, initial)?;
+            check_root(&metadata, root, initial, scanned)?;
             preserve_metadata(previous, file, &metadata)?;
         }
         file.sync_all()?;
@@ -391,7 +438,7 @@ mod atomic {
             fs::write(&existing, b"previous complete export").unwrap();
             let before = fs::metadata(&existing).unwrap();
             for output in [&existing, &absent] {
-                let result = write_file(output, fixture.path(), None, |file| {
+                let result = write_file(output, fixture.path(), None, None, |file| {
                     file.write_all(b"incomplete replacement")?;
                     Err(io::Error::other("injected output failure"))
                 });
@@ -419,7 +466,10 @@ mod atomic {
             fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
             fs::hard_link(&output, &alias).unwrap();
             symlink(output.file_name().unwrap(), &link).unwrap();
-            write_file(&link, fixture.path(), None, |file| file.write_all(b"new")).unwrap();
+            write_file(&link, fixture.path(), None, None, |file| {
+                file.write_all(b"new")
+            })
+            .unwrap();
             assert!(
                 fs::symlink_metadata(&link)
                     .unwrap()
@@ -438,7 +488,7 @@ mod atomic {
             let new = fixture.path().join("new");
             symlink("intermediate", &dangling).unwrap();
             symlink("new", &intermediate).unwrap();
-            write_file(&dangling, fixture.path(), None, |file| {
+            write_file(&dangling, fixture.path(), None, None, |file| {
                 file.write_all(b"created")
             })
             .unwrap();
@@ -481,8 +531,10 @@ mod atomic {
             let metadata = fs::metadata(&root).unwrap();
             for output in [&root, &alias, &link] {
                 assert!(
-                    write_file(output, &root, Some(&metadata), |_| panic!("writer reached"))
-                        .is_err()
+                    write_file(output, &root, Some(&metadata), None, |_| panic!(
+                        "writer reached"
+                    ))
+                    .is_err()
                 );
                 assert_eq!(fs::read(&root).unwrap(), b"input must survive");
             }
@@ -497,7 +549,7 @@ mod atomic {
                 if existing {
                     fs::write(&output, b"previous export").unwrap();
                 }
-                let result = write_file(&output, fixture.path(), None, |file| {
+                let result = write_file(&output, fixture.path(), None, None, |file| {
                     file.write_all(b"new export")?;
                     if existing {
                         fs::remove_file(&output)?;
@@ -519,7 +571,7 @@ mod atomic {
             fs::create_dir(&parent).unwrap();
             let output = parent.join("output");
             fs::write(&output, b"old").unwrap();
-            write_file(&output, fixture.path(), None, |file| {
+            write_file(&output, fixture.path(), None, None, |file| {
                 file.write_all(b"new")?;
                 fs::rename(&parent, &retained)?;
                 fs::create_dir(&parent)?;
@@ -537,7 +589,7 @@ mod atomic {
 
         #[test]
         fn writable_devices_keep_streaming_without_truncation_or_sync() {
-            write_file(Path::new("/dev/null"), Path::new("/"), None, |file| {
+            write_file(Path::new("/dev/null"), Path::new("/"), None, None, |file| {
                 file.write_all(b"device output")
             })
             .unwrap();
@@ -564,7 +616,7 @@ mod atomic {
             let path = PathBuf::from(format!("/proc/self/fd/{}", writer.as_raw_fd()));
             let alias = fixture.path().join("pipe-alias");
             std::os::unix::fs::symlink(&path, &alias).unwrap();
-            write_file(&alias, fixture.path(), None, |file| {
+            write_file(&alias, fixture.path(), None, None, |file| {
                 file.write_all(b"pipe bytes")
             })
             .unwrap();
@@ -586,7 +638,7 @@ mod atomic {
                 if deleted {
                     fs::remove_file(&path).unwrap();
                 }
-                write_file(&endpoint, fixture.path(), None, |file| {
+                write_file(&endpoint, fixture.path(), None, None, |file| {
                     file.write_all(b"descriptor bytes")
                 })
                 .unwrap();
@@ -609,6 +661,7 @@ mod atomic {
                         &fixture.path().join(name),
                         fixture.path(),
                         None,
+                        None,
                         |_| panic!("directory spelling reached writer")
                     )
                     .is_err()
@@ -619,7 +672,7 @@ mod atomic {
             let link = fixture.path().join("link");
             std::os::unix::fs::symlink("absent/", &link).unwrap();
             assert!(
-                write_file(&link, fixture.path(), None, |_| panic!(
+                write_file(&link, fixture.path(), None, None, |_| panic!(
                     "dangling directory link reached writer"
                 ))
                 .is_err()
@@ -633,7 +686,7 @@ mod atomic {
             let output = fixture.path().join("output");
             fs::write(&output, b"old export").unwrap();
             let mut replacement = None;
-            let result = write_file(&output, fixture.path(), None, |file| {
+            let result = write_file(&output, fixture.path(), None, None, |file| {
                 file.write_all(b"new export")?;
                 let temporary = fs::read_dir(fixture.path())?
                     .map(|entry| entry.unwrap().path())
@@ -712,7 +765,10 @@ mod atomic {
                 XattrFlags::empty(),
             )
             .unwrap();
-            write_file(&output, fixture.path(), None, |file| file.write_all(b"new")).unwrap();
+            write_file(&output, fixture.path(), None, None, |file| {
+                file.write_all(b"new")
+            })
+            .unwrap();
             let new = File::open(&output).unwrap();
             let mut value = [0; 256];
             let length = fgetxattr(&new, "system.posix_acl_access", &mut value[..]).unwrap();
@@ -739,7 +795,10 @@ mod atomic {
                 Err(rustix::io::Errno::NOTSUP) => return,
                 Err(error) => panic!("cannot set fixture default ACL: {error}"),
             }
-            write_file(&output, fixture.path(), None, |file| file.write_all(b"new")).unwrap();
+            write_file(&output, fixture.path(), None, None, |file| {
+                file.write_all(b"new")
+            })
+            .unwrap();
             let new = File::open(&output).unwrap();
             let mut value = [0; 256];
             assert_eq!(
@@ -754,7 +813,10 @@ mod atomic {
             let output = fixture.path().join("output");
             fs::write(&output, b"old").unwrap();
             fs::set_permissions(&output, fs::Permissions::from_mode(0o6750)).unwrap();
-            write_file(&output, fixture.path(), None, |file| file.write_all(b"new")).unwrap();
+            write_file(&output, fixture.path(), None, None, |file| {
+                file.write_all(b"new")
+            })
+            .unwrap();
             assert_eq!(
                 fs::metadata(output).unwrap().permissions().mode() & 0o7777,
                 0o750
@@ -765,6 +827,7 @@ mod atomic {
 
 #[cfg(not(target_os = "linux"))]
 mod streaming {
+    use super::{FileIdentity, check_root, preflight_root};
     use std::{
         fs::{self, File, Metadata, OpenOptions},
         io::{self, Write},
@@ -785,18 +848,13 @@ mod streaming {
         })
     }
 
-    #[cfg(unix)]
-    fn same_file(left: &Metadata, right: &Metadata) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
-
-    #[cfg(not(unix))]
-    fn same_file(_: &Metadata, _: &Metadata) -> bool {
-        false
-    }
-
-    fn create_export(output: &Path, root: &Path, initial: Option<&Metadata>) -> io::Result<File> {
+    fn create_export(
+        output: &Path,
+        root: &Path,
+        initial: Option<&Metadata>,
+        scanned: Option<FileIdentity>,
+    ) -> io::Result<File> {
+        preflight_root(output, root, initial, scanned)?;
         let refused = || {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -816,11 +874,7 @@ mod streaming {
             .truncate(false)
             .open(output)?;
         let metadata = file.metadata()?;
-        if initial.is_some_and(|root| same_file(&metadata, root))
-            || fs::metadata(root).is_ok_and(|root| same_file(&metadata, &root))
-        {
-            return Err(refused());
-        }
+        check_root(&metadata, root, initial, scanned)?;
         if metadata.is_file() {
             file.set_len(0)?;
         }
@@ -831,10 +885,102 @@ mod streaming {
         output: &Path,
         root: &Path,
         initial: Option<&Metadata>,
+        scanned: Option<FileIdentity>,
         write: impl FnOnce(&mut File) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut file = create_export(output, root, initial)?;
+        let mut file = create_export(output, root, initial, scanned)?;
         write(&mut file)?;
         file.flush()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod root_identity_tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    #[test]
+    fn export_guard_retains_the_scanned_identity_between_path_snapshots() {
+        fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let original = fixture.path().join("original");
+        let scanned = fixture.path().join("scanned");
+        let displayed = fixture.path().join("displayed");
+        let alias = fixture.path().join("alias");
+        fs::write(&original, b"initial path object").unwrap();
+        fs::write(&scanned, b"actual scanned contents").unwrap();
+        fs::write(&displayed, b"current path object").unwrap();
+        fs::hard_link(&scanned, &alias).unwrap();
+        let initial = fs::metadata(&original).unwrap();
+        let anchor = ldu::backend::RootAnchor::open(&scanned).unwrap();
+        let identity = anchor.metadata().unwrap().identity;
+        assert!(identity.is_some());
+        assert!(!is_scanned_root(&initial, identity));
+        assert!(!is_scanned_root(
+            &fs::metadata(&displayed).unwrap(),
+            identity
+        ));
+        let outputs: Vec<PathBuf> = vec![scanned.clone(), alias];
+        #[cfg(target_os = "linux")]
+        let held = fs::File::open(&scanned).unwrap();
+        #[cfg(target_os = "linux")]
+        let outputs = {
+            use std::os::fd::AsRawFd;
+            let mut outputs = outputs;
+            outputs.push(PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd())));
+            outputs
+        };
+        for output in outputs {
+            let result = write_file(&output, &displayed, Some(&initial), identity, |_| {
+                panic!("scanned root alias reached the writer")
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&scanned).unwrap(), b"actual scanned contents");
+        }
+    }
+
+    #[test]
+    fn fifo_root_aliases_are_rejected_by_preflight_without_opening() {
+        fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::tempdir_in(".tmp").unwrap();
+        let source = fixture.path().join("source-fifo");
+        let unrelated = fixture.path().join("output-fifo");
+        let original = fixture.path().join("original");
+        let displayed = fixture.path().join("displayed");
+        fs::write(&original, b"initial path object").unwrap();
+        fs::write(&displayed, b"current path object").unwrap();
+        for fifo in [&source, &unrelated] {
+            #[cfg(not(target_vendor = "apple"))]
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                fifo,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                0,
+            )
+            .unwrap();
+            #[cfg(target_vendor = "apple")]
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .args(["-m", "600"])
+                    .arg(fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let alias = fixture.path().join("hardlink");
+        let link = fixture.path().join("symlink");
+        fs::hard_link(&source, &alias).unwrap();
+        std::os::unix::fs::symlink("source-fifo", &link).unwrap();
+        let initial = fs::metadata(original).unwrap();
+        let anchor = ldu::backend::RootAnchor::open(&source).unwrap();
+        let scanned = anchor.metadata().unwrap().identity;
+        assert!(scanned.is_some());
+        for output in [&source, &alias, &link] {
+            assert!(preflight_root(output, &displayed, Some(&initial), scanned).is_err());
+        }
+        // Explicit unrelated FIFO output remains a valid streaming destination.
+        assert!(preflight_root(&unrelated, &displayed, Some(&initial), scanned).is_ok());
     }
 }
