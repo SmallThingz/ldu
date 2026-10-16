@@ -10,7 +10,7 @@ The [release workflow](../.github/workflows/release.yml) still builds the four L
 | macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Apple system libraries |
 | FreeBSD | `x86_64-unknown-freebsd`, `aarch64-unknown-freebsd` | FreeBSD base-system libraries |
 
-Validation includes Linux runtime checks and FreeBSD 14.5 VM testing. macOS x86-64 and ARM64 have cross-build checks only; macOS execution and native signature verification remain unqualified. Final packaged binaries still require the checks below. OpenBSD, NetBSD and DragonFly source paths require their own build and runtime checks; no binaries for those systems are prepared here.
+Runtime qualification uses Linux checks, FreeBSD 14.5 VMs and the [manual native macOS workflow](../.github/workflows/macos-qualification.yml). The macOS workflow runs tests, Clippy, signature verification, package smoke checks, PTY checks and filesystem CLI checks on Intel and Apple Silicon runners; it publishes no binaries. Qualification requires a successful run tied to the source commit and packaged binary hash. A cross-build alone is not runtime evidence. OpenBSD, NetBSD and DragonFly source paths require their own build and runtime checks; no binaries for those systems are prepared here.
 
 For a development build on the host OS, run `cargo build --locked --release` and then `./target/release/ldu .`. Packaging needs the additional platform steps below.
 
