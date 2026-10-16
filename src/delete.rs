@@ -126,6 +126,8 @@ struct WorkerState {
     unlink_hook: std::sync::Mutex<Option<TestUnlinkHook>>,
     #[cfg(all(test, unix))]
     read_hook: std::sync::Mutex<Option<TestReadHook>>,
+    #[cfg(all(test, target_os = "linux"))]
+    unknown_metadata_hook: std::sync::Mutex<Option<TestReadHook>>,
 }
 
 #[cfg(all(test, unix))]
@@ -1692,6 +1694,8 @@ fn read_directory_batch(
     debug_assert!(leaves.entries.is_empty());
     leaves.enabled = leaf_unlinks_available(state);
     #[cfg(test)]
+    let force_unknown_type = state.unknown_metadata_hook.lock().unwrap().is_some();
+    #[cfg(test)]
     if let Some(hook) = state.read_hook.lock().unwrap().as_mut() {
         state.check_cancel()?;
         hook(&frame.name)?;
@@ -1742,28 +1746,26 @@ fn read_directory_batch(
                     }
                 };
                 let bytes = entry.file_name().to_bytes();
-                if bytes != b"." && bytes != b".." {
+                'entry: {
+                    if bytes == b"." || bytes == b".." {
+                        break 'entry;
+                    }
                     let name = std::ffi::OsStr::from_bytes(bytes);
                     if frame
                         .retry_skip
                         .as_ref()
                         .is_some_and(|skipped| skipped.contains(name))
                     {
-                        if entries.is_buffer_empty() {
-                            flush_leaf_unlinks(
-                                directory,
-                                leaves,
-                                state,
-                                path,
-                                errors,
-                                &mut frame.retry_skip,
-                            )?;
-                            return Ok(false);
-                        }
-                        continue;
+                        break 'entry;
                     }
                     state.examined();
                     let kind = entry.file_type();
+                    #[cfg(test)]
+                    let kind = if force_unknown_type {
+                        FileType::Unknown
+                    } else {
+                        kind
+                    };
                     let mut is_directory = kind == FileType::Directory;
                     if leaves.enabled && !is_directory && kind != FileType::Unknown {
                         leaves.push(name, entry.ino());
@@ -1806,6 +1808,14 @@ fn read_directory_batch(
                                         statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
                                     })
                                 });
+                                #[cfg(test)]
+                                let inspected = if let Some(hook) =
+                                    state.unknown_metadata_hook.lock().unwrap().as_mut()
+                                {
+                                    hook(name).and(inspected)
+                                } else {
+                                    inspected
+                                };
                                 match inspected {
                                     Ok(stat) => {
                                         is_directory = FileType::from_raw_mode(stat.st_mode)
@@ -1813,12 +1823,12 @@ fn read_directory_batch(
                                         captured = Some(FileIdentity::from_stat(&stat));
                                     }
                                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                                        continue;
+                                        break 'entry;
                                     }
                                     Err(error) => {
                                         record_error(errors, path.join(name), error)?;
                                         remember_failed_child(&mut frame.retry_skip, name);
-                                        continue;
+                                        break 'entry;
                                     }
                                 }
                             }
@@ -2418,6 +2428,133 @@ mod tests {
         assert_eq!(state.snapshot().removed_entries, 2);
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 6);
         assert!(removal.parent_metadata.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_metadata_failures_preserve_getdents_batch_boundaries() {
+        use rustix::fs::{Mode, OFlags, RawDir, open};
+        use std::os::unix::ffi::OsStrExt;
+
+        for failure in [io::ErrorKind::NotFound, io::ErrorKind::Other] {
+            let work = fixture();
+            let target = work.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            for index in 0..96 {
+                std::fs::create_dir(target.join(format!("child-{index:03}"))).unwrap();
+            }
+            // Locate an actual kernel-buffer boundary without assuming directory
+            // entry ordering. The separate descriptor leaves the worker at start.
+            let first_batch = {
+                let fd = open(
+                    &target,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap();
+                let mut buffer = Vec::<u8>::with_capacity(1024);
+                let mut entries = RawDir::new(fd.as_fd(), buffer.spare_capacity_mut());
+                let mut names = Vec::new();
+                loop {
+                    let entry = entries.next().unwrap().unwrap();
+                    let bytes = entry.file_name().to_bytes();
+                    let is_dot = bytes == b"." || bytes == b"..";
+                    if !is_dot {
+                        names.push(std::ffi::OsStr::from_bytes(bytes).to_owned());
+                    }
+                    if entries.is_buffer_empty() {
+                        assert!(!is_dot, "fixture requires a non-dot boundary record");
+                        break;
+                    }
+                }
+                names
+            };
+            assert!(first_batch.len() > 1 && first_batch.len() < 96);
+            let failed_name = first_batch.last().unwrap().clone();
+            let injected_name = failed_name.clone();
+            let state = WorkerState::default();
+            // Ordinary local filesystems usually supply d_type. This one seam
+            // gives real entries Unknown types and fails only the final record's
+            // metadata lookup, without requiring a racing filesystem fixture.
+            *state.unknown_metadata_hook.lock().unwrap() = Some(Box::new(move |name| {
+                if name == injected_name {
+                    Err(io::Error::from(failure))
+                } else {
+                    Ok(())
+                }
+            }));
+            let parent = open(
+                work.path(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let mut frame = open_checked_directory(
+                parent.as_fd(),
+                "target".into(),
+                None,
+                0,
+                &state,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let mut buffer = Vec::<u8>::with_capacity(1024);
+            let mut leaves = LeafUnlinks::default();
+            let mut errors = Vec::new();
+            assert!(
+                !read_directory_batch(
+                    &mut frame,
+                    &mut buffer,
+                    &mut leaves,
+                    &state,
+                    &target,
+                    &mut errors,
+                )
+                .unwrap()
+            );
+            assert_eq!(state.snapshot().examined_entries, first_batch.len() as u64);
+            assert_eq!(frame.pending.len(), first_batch.len() - 1);
+            let mut visited = std::collections::HashSet::new();
+            loop {
+                visited.extend(frame.pending.drain(..).map(|entry| entry.name));
+                let before = state.snapshot().examined_entries;
+                let done = read_directory_batch(
+                    &mut frame,
+                    &mut buffer,
+                    &mut leaves,
+                    &state,
+                    &target,
+                    &mut errors,
+                )
+                .unwrap();
+                // Even the shortest Linux dirent64 occupies at least 24 bytes.
+                assert!(state.snapshot().examined_entries - before <= 1024 / 24);
+                if done {
+                    assert!(frame.pending.is_empty());
+                    break;
+                }
+            }
+            assert_eq!(state.snapshot().examined_entries, 96);
+            assert_eq!(visited.len(), 95);
+            assert!(!visited.contains(&failed_name));
+            for index in 0..96 {
+                let name = std::ffi::OsString::from(format!("child-{index:03}"));
+                if name != failed_name {
+                    assert!(visited.contains(&name));
+                }
+            }
+            if failure == io::ErrorKind::NotFound {
+                assert!(errors.is_empty());
+                assert!(frame.retry_skip.is_none());
+            } else {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, target.join(&failed_name));
+                let skipped = frame.retry_skip.as_ref().unwrap();
+                assert_eq!(skipped.len(), 1);
+                assert!(skipped.contains(&failed_name));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
