@@ -1604,6 +1604,82 @@ def check_owned_helper_shutdown(binary, work, threads):
     return metrics
 
 
+def stop_archive_helper(child, exited):
+    denied = None
+    try:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            if sys.platform != "darwin" or not exited or error.errno != errno.EPERM:
+                raise
+            # XNU excludes zombies from killpg's candidates, returning EPERM
+            # for a group containing only the retained, exited leader.
+            denied = error
+    finally:
+        child.wait(timeout=5)
+    if denied is not None:
+        # Reaping removes that zombie from its group. Signal 0 only checks for
+        # existence: never send a destructive signal after releasing the PID.
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            return
+        raise denied
+
+
+def check_archive_helper_cleanup():
+    """Keep Darwin's zombie exception distinct from failed live-group cleanup."""
+    from unittest.mock import patch
+
+    for platform, exited, results, expected, wait_timeout in [
+        ("darwin", True, [errno.EPERM, errno.ESRCH], None, False),
+        ("darwin", True, [errno.EPERM, None], PermissionError, False),
+        ("darwin", True, [errno.EPERM, errno.EPERM], PermissionError, False),
+        ("darwin", False, [errno.EPERM], PermissionError, False),
+        ("darwin", True, [errno.EACCES], PermissionError, False),
+        ("linux", True, [errno.EPERM], PermissionError, False),
+        ("darwin", True, [errno.ESRCH], None, False),
+        ("darwin", True, [None], None, False),
+        ("darwin", True, [errno.EPERM], subprocess.TimeoutExpired, True),
+    ]:
+        calls = []
+        remaining = iter(results)
+
+        class Child:
+            pid = 123456
+            reaped = False
+
+            def wait(self, timeout):
+                assert timeout == 5, "archive helper cleanup lost its wait bound"
+                calls.append("wait")
+                if wait_timeout:
+                    raise subprocess.TimeoutExpired("owned helper", timeout)
+                self.reaped = True
+                return 0
+
+        child = Child()
+
+        def killpg(pid, sig):
+            assert pid == child.pid
+            assert sig == (0 if child.reaped else signal.SIGKILL), "destructive signal after reap"
+            calls.append(sig)
+            failure = next(remaining)
+            if failure is not None:
+                raise OSError(failure, "owned group")
+
+        with patch.object(sys, "platform", platform), patch.object(os, "killpg", killpg):
+            try:
+                stop_archive_helper(child, exited)
+            except Exception as error:
+                assert expected is not None and isinstance(error, expected), (platform, exited, error)
+            else:
+                assert expected is None, (platform, exited, "cleanup failure was ignored")
+        assert next(remaining, "done") == "done", "cleanup proof was skipped"
+        assert calls.count("wait") == 1, "owned helper was not reaped exactly once"
+
+
 def archive_helper_capability(archive, member, kind):
     """Check owned fixtures independently before asserting the real UI's output.
 
@@ -1639,6 +1715,7 @@ def archive_helper_capability(archive, member, kind):
         with archive.open("rb") as source, tempfile.TemporaryFile(dir=".tmp") as output:
             child = None
             owned = False
+            exited = False
             previous = signal.getsignal(signal.SIGTERM)
 
             def terminate(signum, _frame):
@@ -1668,6 +1745,7 @@ def archive_helper_capability(archive, member, kind):
                         owned = False
                         raise
                     if status is not None:
+                        exited = status.si_code == os.CLD_EXITED
                         break
                     time.sleep(0.02)
             finally:
@@ -1678,12 +1756,7 @@ def archive_helper_capability(archive, member, kind):
                                 child.stdin.close()
                         finally:
                             if owned:
-                                try:
-                                    os.killpg(child.pid, signal.SIGKILL)
-                                except ProcessLookupError:
-                                    pass
-                                finally:
-                                    child.wait(timeout=5)
+                                stop_archive_helper(child, exited)
                 finally:
                     signal.signal(signal.SIGTERM, previous)
             assert os.fstat(output.fileno()).st_size <= 65536, f"archive capability output exceeded limit: {executable}"
@@ -4239,6 +4312,7 @@ def main():
     check_harness_terminal_lifetime()
     Path(".tmp").mkdir(exist_ok=True)
     check_harness_failure_cleanup()
+    check_archive_helper_cleanup()
     with tempfile.TemporaryDirectory(prefix="ldu-pty-", dir=".tmp") as work:
         root = args.root or Path(work)
         if args.root is None:
