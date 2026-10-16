@@ -381,6 +381,8 @@ pub struct Model {
     cleanup: VecDeque<CleanupCursor>,
     #[cfg(test)]
     removal_checks: usize,
+    #[cfg(test)]
+    liveness_parent_checks: std::cell::Cell<usize>,
     scans: HashMap<u64, ScopeScan>,
     retired_scans: VecDeque<ScopeScan>,
     active_scopes: HashMap<NodeId, u64>,
@@ -415,6 +417,8 @@ impl Model {
             cleanup: VecDeque::new(),
             #[cfg(test)]
             removal_checks: 0,
+            #[cfg(test)]
+            liveness_parent_checks: std::cell::Cell::new(0),
             scans: HashMap::from([(0, ScopeScan::new(ROOT))]),
             retired_scans: VecDeque::new(),
             active_scopes: HashMap::from([(ROOT, 0)]),
@@ -480,6 +484,12 @@ impl Model {
         if !self.has_removals {
             return false;
         }
+        // Once detached-tree cleanup drains, every old payload has its own
+        // REMOVED flag (or has been reclaimed). Live rows no longer need to
+        // revisit their ancestors after each refresh or removal.
+        if self.cleanup.is_empty() {
+            return self.nodes.get(id as usize).is_none_or(Node::removed);
+        }
         let mut current = Some(id);
         while let Some(id) = current {
             let Some(node) = self.nodes.get(id as usize) else {
@@ -489,6 +499,9 @@ impl Model {
                 return true;
             }
             if let Some(parent) = node.parent {
+                #[cfg(test)]
+                self.liveness_parent_checks
+                    .set(self.liveness_parent_checks.get() + 1);
                 let Some(parent_node) = self.nodes.get(parent as usize) else {
                     return true;
                 };
@@ -3504,6 +3517,85 @@ mod tests {
         finish_removals(&mut model);
         assert!(model.finished && model.node(ROOT).complete);
         assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
+    fn settled_liveness_skips_ancestry_but_pending_cleanup_rejects_stale_descendants() {
+        const DEPTH: NodeId = 96;
+        fn add_chain(model: &mut Model, generation: u64) -> NodeId {
+            for local in 1..=DEPTH + 1 {
+                let kind = if local <= DEPTH {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                };
+                model.apply_scoped(
+                    ROOT,
+                    generation,
+                    ScanEvent::Entries {
+                        parent: local - 1,
+                        entries: vec![entry(local, "entry", kind, 1, 1)],
+                    },
+                );
+            }
+            let leaf = model.len() as NodeId - 1;
+            for local in (0..=DEPTH).rev() {
+                done(model, ROOT, generation, local);
+            }
+            finish(model, ROOT, generation);
+            leaf
+        }
+
+        let mut model = model();
+        let old = add_chain(&mut model, 0);
+        finish_removals(&mut model);
+        model.begin_rescan(ROOT, 1);
+        scoped_root(&mut model, ROOT, 1, 2);
+        assert!(!model.cleanup.is_empty());
+        assert!(
+            !model.node(old).removed(),
+            "descendant has not been cleaned yet"
+        );
+        model.liveness_parent_checks.set(0);
+        assert!(!model.is_live(old));
+        assert!(model.liveness_parent_checks.get() >= DEPTH as usize);
+
+        let current = add_chain(&mut model, 1);
+        model.liveness_parent_checks.set(0);
+        assert!(model.is_live(current));
+        assert!(model.liveness_parent_checks.get() >= DEPTH as usize);
+        finish_removals(&mut model);
+        assert!(model.cleanup.is_empty());
+        assert!(model.node(old).removed());
+        model.liveness_parent_checks.set(0);
+        for _ in 0..1024 {
+            assert!(model.is_live(current));
+            assert!(!model.is_live(old));
+            assert!(!model.is_live(NodeId::MAX));
+        }
+        assert_eq!(model.liveness_parent_checks.get(), 0);
+
+        // A suppressed scanner can still deliver assigned IDs after detachment.
+        // They are born removed, so the settled direct-node check rejects them too.
+        model.begin_rescan(ROOT, 2);
+        scoped_root(&mut model, ROOT, 2, 2);
+        model.suppress_scan(ROOT);
+        let late = model.len() as NodeId;
+        model.apply_scoped(
+            ROOT,
+            2,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![entry(1, "late", NodeKind::File, 1, 1)],
+            },
+        );
+        finish(&mut model, ROOT, 2);
+        finish_removals(&mut model);
+        assert!(model.get_node(late).is_some_and(Node::removed));
+        model.liveness_parent_checks.set(0);
+        assert!(!model.is_live(late));
+        assert!(!model.is_live(current));
+        assert_eq!(model.liveness_parent_checks.get(), 0);
     }
 
     #[test]
