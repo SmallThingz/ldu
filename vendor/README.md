@@ -15,8 +15,10 @@ files retain their upstream tests and existing native FFI code.
 The local patch changes the timeout conversion shared by Unix `poll` and Windows
 `WSAPoll`: positive fractional milliseconds round up, finite values saturate at
 `libc::c_int::MAX`, zero remains nonblocking, and `None` remains an infinite wait.
-The conversion helper and its boundary tests use safe Rust; the existing unsafe
-native calls are unchanged. macOS retains its upstream `select` implementation.
+On macOS, `select` timeouts round positive fractional microseconds up, carry
+into seconds and saturate at the largest representable finite timeout. Both
+conversion helpers and their boundary tests use safe Rust; the existing unsafe
+native calls are unchanged.
 
 This fixes idle CPU use with Crossterm's level-triggered `use-dev-tty`
 backend. Its precise timeout loop repeatedly invokes `filedescriptor::poll`
