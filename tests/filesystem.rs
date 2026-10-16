@@ -7,7 +7,7 @@ use ldu::{
     types::{NodeId, NodeKind, ROOT, ScanEvent, Sizes},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File, Permissions},
     os::unix::{
@@ -65,6 +65,7 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
     );
     let mut model = Model::new(root.to_owned());
     let mut delivered = Sizes::default();
+    let mut delivered_inodes = HashMap::new();
     let mut directories = HashSet::from([ROOT]);
     let mut done = HashSet::new();
     let mut root_received = false;
@@ -76,9 +77,16 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
             .unwrap();
         let finished = matches!(event, ScanEvent::Finished { .. });
         match &event {
-            ScanEvent::RootInfo { sizes, .. } => {
+            ScanEvent::RootInfo {
+                file_identity,
+                sizes,
+                ..
+            } => {
                 assert!(!root_received, "root metadata must be delivered once");
                 root_received = true;
+                if let Some(identity) = file_identity {
+                    delivered_inodes.insert(*identity, *sizes);
+                }
                 delivered.apparent += sizes.apparent;
                 delivered.allocated += sizes.allocated;
             }
@@ -95,10 +103,16 @@ fn scan_model(root: &Path, backend: Backend) -> Model {
                 for entry in entries {
                     assert_eq!(entry.id, next_id, "entry IDs must be contiguous and unique");
                     next_id += 1;
-                    if !entry.hardlink_duplicate {
-                        delivered.apparent += entry.sizes.apparent;
-                        delivered.allocated += entry.sizes.allocated;
-                    }
+                    // Scanner events carry raw inode sizes; the latest observation
+                    // replaces that inode's charge without counting its aliases twice.
+                    let previous = entry
+                        .hardlink_group
+                        .and_then(|identity| delivered_inodes.insert(identity, entry.sizes))
+                        .unwrap_or_default();
+                    delivered.apparent =
+                        delivered.apparent - previous.apparent + entry.sizes.apparent;
+                    delivered.allocated =
+                        delivered.allocated - previous.allocated + entry.sizes.allocated;
                     if entry.kind == NodeKind::Directory {
                         assert!(directories.insert(entry.id));
                     }

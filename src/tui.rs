@@ -842,6 +842,8 @@ struct App {
     filter_editing: bool,
     order: CachedOrderWorker,
     next_new: usize,
+    #[cfg(test)]
+    order_feed_checks: usize,
     replay_cursor: Option<usize>,
     pending: VecDeque<NodeId>,
     pending_set: HashSet<NodeId>,
@@ -956,6 +958,8 @@ impl App {
             filter_editing: false,
             order,
             next_new: 0,
+            #[cfg(test)]
+            order_feed_checks: 0,
             replay_cursor: None,
             pending: VecDeque::new(),
             pending_set: HashSet::new(),
@@ -1059,7 +1063,10 @@ impl App {
             if self.parent_select_pending
                 && let Some(selection) = &mut self.parent_selection
                 && selection.epoch == self.model.node(self.directory).child_epoch
-                && self.model.node(id).parent == Some(self.directory)
+                && self
+                    .model
+                    .get_node(id)
+                    .is_some_and(|node| node.parent == Some(self.directory))
             {
                 if !live {
                     selection.membership_revision = selection.membership_revision.wrapping_add(1);
@@ -1091,19 +1098,30 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn report_path(&self, id: NodeId) -> PathBuf {
         let path = self.model.path(id);
         path.strip_prefix(&self.root)
             .map_or(path.clone(), |relative| self.report_root.join(relative))
     }
 
-    fn delete_failed(&mut self, id: NodeId, error: &io::Error, mut errors: Vec<DeleteError>) {
+    #[cfg(test)]
+    fn delete_failed(&mut self, id: NodeId, error: &io::Error, errors: Vec<DeleteError>) {
+        self.record_delete_failure(id, error, errors, self.report_path(id));
+    }
+
+    fn record_delete_failure(
+        &mut self,
+        id: NodeId,
+        error: &io::Error,
+        mut errors: Vec<DeleteError>,
+        path: PathBuf,
+    ) {
         let message = printable(OsStr::new(&error.to_string()));
         let changed = self
             .model
             .note_error(id, format!("Delete failed: {message}"));
         self.changed(changed);
-        let path = self.report_path(id);
         if errors.is_empty() {
             errors.push(DeleteError {
                 path: path.clone(),
@@ -1146,7 +1164,9 @@ impl App {
 
     /// Apply removal and diagnostics independently; true requests survivor reconciliation.
     fn deletion_finished(&mut self, id: NodeId, result: delete::DeleteResult) -> bool {
-        let parent = self.model.node(id).parent.unwrap_or(ROOT);
+        // A queued result retains its path even after an older model generation
+        // has been reclaimed. Never apply unknown parent metadata to the root.
+        let parent = self.model.get_node(id).and_then(|node| node.parent);
         let cancelled = result
             .outcome
             .as_ref()
@@ -1161,19 +1181,23 @@ impl App {
             Ok(()) => self.deletion_succeeded(id, result.parent_metadata.is_some()),
             Err(error) => {
                 if !cancelled || !result.errors.is_empty() {
-                    // Capture the target path before removing its model entry.
-                    self.delete_failed(id, &error, result.errors);
+                    self.record_delete_failure(
+                        id,
+                        &error,
+                        result.errors,
+                        self.report_root.join(&result.relative),
+                    );
                 }
                 if result.target_removed {
                     self.deletion_succeeded(id, result.parent_metadata.is_some());
                 }
             }
         }
-        if let Some(metadata) = result.parent_metadata {
+        if let (Some(parent), Some(metadata)) = (parent, result.parent_metadata) {
             let changed = self.model.update_directory_sizes(parent, metadata.sizes);
             self.changed(changed);
         }
-        if let Some(error) = result.metadata_error {
+        if let (Some(parent), Some(error)) = (parent, result.metadata_error) {
             let changed = self.model.note_error(parent, error);
             self.changed(changed);
         }
@@ -1181,7 +1205,7 @@ impl App {
     }
 
     fn deletion_succeeded(&mut self, id: NodeId, parent_metadata_available: bool) {
-        let parent = self.model.node(id).parent;
+        let parent = self.model.get_node(id).and_then(|node| node.parent);
         self.removed(id);
         if !parent_metadata_available && let Some(parent) = parent {
             let changed = self.model.mark_metadata_uncertain(parent);
@@ -1218,7 +1242,11 @@ impl App {
         }
         if !self.model.is_live(self.directory) {
             while !self.model.is_live(self.directory) {
-                self.directory = self.model.node(self.directory).parent.unwrap_or(ROOT);
+                self.directory = self
+                    .model
+                    .get_node(self.directory)
+                    .and_then(|node| node.parent)
+                    .unwrap_or(ROOT);
             }
             self.selected = None;
             self.focus_after_selection = true;
@@ -1245,6 +1273,32 @@ impl App {
             self.prioritize_requested = true;
             self.keep_selection_visible();
         }
+    }
+
+    fn pump_model_removals(&mut self) {
+        if !self.model.has_pending_removals() {
+            return;
+        }
+        // Current navigation must leave a dead subtree before its ancestry is
+        // reclaimed. Parent-selection cursors also retain dead sibling links;
+        // advance them with their usual budget before permitting reclamation.
+        self.repair_directory();
+        if self
+            .parent_selection
+            .and_then(|selection| selection.cursor)
+            .is_some_and(|id| !self.model.is_live(id))
+        {
+            self.pump_parent_selection();
+            if self
+                .parent_selection
+                .and_then(|selection| selection.cursor)
+                .is_some_and(|id| !self.model.is_live(id))
+            {
+                return;
+            }
+        }
+        let changed = self.model.pump_removals();
+        self.changed(changed);
     }
 
     fn pump_order(&mut self) -> bool {
@@ -1280,7 +1334,26 @@ impl App {
                     break;
                 };
                 progress = true;
-                if structural || self.model.is_live(id) {
+                #[cfg(test)]
+                {
+                    self.order_feed_checks += 1;
+                }
+                if self.model.get_node(id).is_none() {
+                    // Retired generations have no payload. Skip their whole
+                    // storage spans without consuming the next retained ID.
+                    if structural {
+                        self.next_new = self
+                            .model
+                            .next_present_id(self.next_new)
+                            .map_or(self.model.len(), |id| id as usize);
+                    } else if let Some(cursor) = self.replay_cursor {
+                        self.replay_cursor = self
+                            .model
+                            .next_present_id(cursor)
+                            .map(|id| id as usize)
+                            .filter(|&cursor| cursor < self.next_new);
+                    }
+                } else if structural || self.model.is_live(id) {
                     self.unsent.push(CachedRow::from_model(
                         id,
                         &self.model,
@@ -1699,6 +1772,13 @@ impl App {
         let mut progressed = false;
         let mut budget = 256;
         while let Some(id) = selection.cursor {
+            // Normally pump_model_removals preserves this cursor until it moves.
+            // Recover safely if a caller already reclaimed its historical chunk.
+            if self.model.get_node(id).is_none() {
+                selection.cursor = self.model.first_child(self.directory);
+                progressed = true;
+                break;
+            }
             // Appended children are handled by changed(), including an append
             // after the initial tail was removed. Retained sibling links keep
             // the initial walk valid when an unvisited child disappears.
@@ -4121,8 +4201,12 @@ impl App {
                         == self.model.node(self.directory).child_epoch
                         && gesture.view.positions.contains_key(&gesture.anchor)
                         && gesture.view.positions.contains_key(&gesture.lead)
-                        && self.model.node(gesture.anchor).parent == Some(self.directory)
-                        && self.model.node(gesture.lead).parent == Some(self.directory);
+                        // Frozen positions retain dead endpoints without retaining
+                        // their model payload. Navigation/refresh cancels this queue.
+                        && (!self.model.is_live(gesture.anchor)
+                            || self.model.node(gesture.anchor).parent == Some(self.directory))
+                        && (!self.model.is_live(gesture.lead)
+                            || self.model.node(gesture.lead).parent == Some(self.directory));
                     if valid_interval
                         && (gesture.dragged
                             || gesture.mode == RangeMode::Invert
@@ -4258,7 +4342,11 @@ impl App {
             && (!self.model.is_live(self.directory)
                 || self.model.node(self.directory).kind != NodeKind::Directory)
         {
-            self.directory = self.model.node(self.directory).parent.unwrap_or(ROOT);
+            self.directory = self
+                .model
+                .get_node(self.directory)
+                .and_then(|node| node.parent)
+                .unwrap_or(ROOT);
         }
         self.selected = self.model.is_live(previous).then_some(previous);
         self.focus_after_selection |= self.selected.is_none();
@@ -7305,7 +7393,7 @@ fn pump_batch(
             BatchEvent::Failures(errors) => {
                 status.paint = true;
                 app.delete_notices.push_back(DeleteReport {
-                    target: printable(app.report_path(preparation.directory).as_os_str()),
+                    target: printable(app.report_root.join(&preparation.relative).as_os_str()),
                     errors,
                 });
             }
@@ -7325,7 +7413,7 @@ fn pump_batch(
         done = true;
     }
     if done {
-        let preparation_directory = preparation.directory;
+        let preparation_path = app.report_root.join(&preparation.relative);
         let confirmed = preparation.dispatching || preparation.confirm_pending;
         cancel_batch(app, batch, retired);
         for slot in [&mut app.modal, &mut app.previous_modal] {
@@ -7343,10 +7431,8 @@ fn pump_batch(
                         .as_ref()
                         .is_some_and(|modal| matches!(modal.underlying(), Modal::Stopping)))
             {
-                app.delete_notices.push_back(DeleteReport::single(
-                    app.report_path(preparation_directory),
-                    message,
-                ));
+                app.delete_notices
+                    .push_back(DeleteReport::single(preparation_path, message));
             } else {
                 *app.background_modal_slot() = Some(Modal::notice("Cannot delete", message));
             }
@@ -7690,12 +7776,7 @@ fn begin_refresh(
         scope: id,
         generation: *generation,
         relative: relative.to_owned(),
-        handle: scan::spawn_subtree(
-            anchor,
-            relative.to_owned(),
-            options.clone(),
-            scanner.hardlinks(),
-        ),
+        handle: scan::spawn_subtree(anchor, relative.to_owned(), options.clone()),
         entries: None,
         finished: false,
     });
@@ -8212,10 +8293,7 @@ pub fn run(
                     scopes.rotate_left(1);
                 }
             }
-            2 => {
-                let changed = app.model.pump_removals();
-                app.changed(changed);
-            }
+            2 => app.pump_model_removals(),
             _ => order_backlog = app.pump_order(),
         }
         background_phase = (background_phase + 1) % 4;

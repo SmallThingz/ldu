@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque, hash_map::Entry as HashEntry},
+    collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry as HashEntry},
     ffi::OsStr,
     ops::{Index, IndexMut},
     path::{Path, PathBuf},
@@ -7,28 +7,31 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::types::{Entry, NodeId, NodeKind, ROOT, ScanEvent, Sizes};
+use crate::types::{Entry, FileIdentity, NodeId, NodeKind, ROOT, ScanEvent, Sizes};
 pub use crate::types::{SizeMode, SortMode};
 
 const NO_NODE: NodeId = NodeId::MAX;
 const REMOVAL_CHECKS: usize = 256;
 const NODE_CHUNK: usize = 512;
+const CHUNKS_PER_PAGE: usize = 512;
 const REMOVAL_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Debug)]
 struct HardlinkGroup {
+    identity: FileIdentity,
     sizes: Sizes,
+    references: u32,
+    retiring: bool,
     metadata_generation: u64,
     owner: Option<NodeId>,
     members: Option<Box<HardlinkMembers>>,
 }
 
-// Only actual aliases allocate member state. The monotonic cursor never
-// revisits tombstoned candidates when successive owners are removed.
+// Only aliases allocate member state. Detached-node cleanup removes membership
+// directly, so refreshes cannot accumulate historical candidate IDs.
 #[derive(Debug, Default)]
 struct HardlinkMembers {
-    ids: Vec<NodeId>,
-    next: usize,
+    ids: BTreeSet<NodeId>,
     pending: bool,
 }
 
@@ -46,7 +49,6 @@ struct ScopeScan {
     ids: Vec<Vec<NodeId>>,
     len: usize,
     metadata_received: bool,
-    finished: bool,
 }
 
 impl ScopeScan {
@@ -56,7 +58,6 @@ impl ScopeScan {
             ids: vec![vec![scope]],
             len: 1,
             metadata_received: false,
-            finished: false,
         }
     }
 
@@ -85,6 +86,7 @@ pub struct Node {
     pub error_count: u64,
     pub complete: bool,
     pub hardlink_duplicate: bool,
+    hardlink_index: NodeId,
     first_child: NodeId,
     last_child: NodeId,
     next_sibling: NodeId,
@@ -105,6 +107,7 @@ impl Node {
     const METADATA_UNCERTAIN: u8 = 8;
     const SCAN_SUPPRESSED: u8 = 16;
     const LISTING_FAILED: u8 = 32;
+    const RETIRED: u8 = 64;
 
     fn new(name: Arc<OsStr>, parent: Option<NodeId>, kind: NodeKind, sizes: Sizes) -> Self {
         let complete = kind != NodeKind::Directory;
@@ -117,6 +120,7 @@ impl Node {
             error_count: 0,
             complete,
             hardlink_duplicate: false,
+            hardlink_index: NO_NODE,
             first_child: NO_NODE,
             last_child: NO_NODE,
             next_sibling: NO_NODE,
@@ -193,11 +197,34 @@ struct DirectoryInfo {
     children: ChildCounts,
 }
 
-// Fixed-size chunks keep growing scans from moving the whole model on the UI thread.
+// Two-level pages retain O(1) lookup and stable addresses while allowing whole
+// dead chunks to release their payload. IDs are monotonic and never reused.
+#[derive(Debug)]
+struct NodeChunk {
+    nodes: Vec<Node>,
+    retired: usize,
+}
+
+#[derive(Debug)]
+struct NodePage {
+    chunks: [Option<NodeChunk>; CHUNKS_PER_PAGE],
+    present: usize,
+}
+
+impl NodePage {
+    fn new() -> Self {
+        Self {
+            chunks: std::array::from_fn(|_| None),
+            present: 0,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Nodes {
-    chunks: Vec<Vec<Node>>,
+    pages: Vec<Option<Box<NodePage>>>,
     len: usize,
+    reclaim: VecDeque<usize>,
 }
 
 impl Nodes {
@@ -206,15 +233,121 @@ impl Nodes {
     }
 
     fn get(&self, index: usize) -> Option<&Node> {
-        (index < self.len).then(|| &self[index])
+        if index >= self.len {
+            return None;
+        }
+        let chunk = index / NODE_CHUNK;
+        self.pages.get(chunk / CHUNKS_PER_PAGE)?.as_ref()?.chunks[chunk % CHUNKS_PER_PAGE]
+            .as_ref()?
+            .nodes
+            .get(index % NODE_CHUNK)
+    }
+
+    // Skip absent storage in page/chunk jumps. Normal contiguous admission
+    // never needs this path; it is used when rebuilding a cache after retirement.
+    fn next_present(&self, mut index: usize) -> Option<usize> {
+        while index < self.len {
+            let chunk_index = index / NODE_CHUNK;
+            let page_index = chunk_index / CHUNKS_PER_PAGE;
+            let page = self.pages.get(page_index)?;
+            let Some(page) = page else {
+                index = (page_index + 1).checked_mul(CHUNKS_PER_PAGE * NODE_CHUNK)?;
+                continue;
+            };
+            if let Some(chunk) = &page.chunks[chunk_index % CHUNKS_PER_PAGE] {
+                return (index % NODE_CHUNK < chunk.nodes.len()).then_some(index);
+            }
+            index = (chunk_index + 1).checked_mul(NODE_CHUNK)?;
+        }
+        None
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut Node> {
+        if index >= self.len {
+            return None;
+        }
+        let chunk = index / NODE_CHUNK;
+        self.pages
+            .get_mut(chunk / CHUNKS_PER_PAGE)?
+            .as_mut()?
+            .chunks[chunk % CHUNKS_PER_PAGE]
+            .as_mut()?
+            .nodes
+            .get_mut(index % NODE_CHUNK)
     }
 
     fn push(&mut self, node: Node) {
-        if self.len.is_multiple_of(NODE_CHUNK) {
-            self.chunks.push(Vec::with_capacity(NODE_CHUNK));
+        let index = self.len / NODE_CHUNK;
+        let page_index = index / CHUNKS_PER_PAGE;
+        if self.pages.len() <= page_index {
+            self.pages.push(None);
         }
-        self.chunks.last_mut().unwrap().push(node);
+        let page = self.pages[page_index].get_or_insert_with(|| Box::new(NodePage::new()));
+        let chunk = page.chunks[index % CHUNKS_PER_PAGE].get_or_insert_with(|| {
+            page.present += 1;
+            NodeChunk {
+                nodes: Vec::with_capacity(NODE_CHUNK),
+                retired: 0,
+            }
+        });
+        chunk.retired += usize::from(node.flags & Node::RETIRED != 0);
+        chunk.nodes.push(node);
         self.len += 1;
+        if chunk.nodes.len() == NODE_CHUNK && chunk.retired == NODE_CHUNK {
+            self.reclaim.push_back(index);
+        }
+    }
+
+    fn retire(&mut self, id: NodeId) {
+        let index = id as usize;
+        let chunk_index = index / NODE_CHUNK;
+        let Some(page) = self
+            .pages
+            .get_mut(chunk_index / CHUNKS_PER_PAGE)
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        let Some(chunk) = page.chunks[chunk_index % CHUNKS_PER_PAGE].as_mut() else {
+            return;
+        };
+        let node = &mut chunk.nodes[index % NODE_CHUNK];
+        if node.flags & Node::RETIRED != 0 {
+            return;
+        }
+        node.flags |= Node::RETIRED;
+        chunk.retired += 1;
+        if chunk.nodes.len() == NODE_CHUNK && chunk.retired == NODE_CHUNK {
+            self.reclaim.push_back(chunk_index);
+        }
+    }
+
+    // Only call after all cleanup cursors have drained. Those cursors can still
+    // traverse an already retired sibling while retiring another detached tree.
+    fn reclaim_one(&mut self) {
+        let Some(index) = self.reclaim.pop_front() else {
+            return;
+        };
+        let page_index = index / CHUNKS_PER_PAGE;
+        let Some(page) = self.pages[page_index].as_mut() else {
+            return;
+        };
+        if page.chunks[index % CHUNKS_PER_PAGE].take().is_some() {
+            page.present -= 1;
+        }
+        if page.present == 0 {
+            self.pages[page_index] = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_slots(&self) -> usize {
+        self.pages
+            .iter()
+            .flatten()
+            .flat_map(|page| page.chunks.iter().flatten())
+            .map(|chunk| chunk.nodes.len())
+            .sum()
     }
 }
 
@@ -222,13 +355,13 @@ impl Index<usize> for Nodes {
     type Output = Node;
 
     fn index(&self, index: usize) -> &Node {
-        &self.chunks[index / NODE_CHUNK][index % NODE_CHUNK]
+        self.get(index).expect("node payload is present")
     }
 }
 
 impl IndexMut<usize> for Nodes {
     fn index_mut(&mut self, index: usize) -> &mut Node {
-        &mut self.chunks[index / NODE_CHUNK][index % NODE_CHUNK]
+        self.get_mut(index).expect("node payload is present")
     }
 }
 
@@ -239,14 +372,17 @@ pub struct Model {
     has_removals: bool,
     tombstone_name: Arc<OsStr>,
     directories: HashMap<NodeId, DirectoryInfo>,
-    hardlink_indices: HashMap<NodeId, usize>,
+    hardlink_indices: HashMap<FileIdentity, usize>,
     hardlink_groups: Vec<HardlinkGroup>,
-    hardlink_owners: HashMap<NodeId, usize>,
+    free_hardlink_groups: Vec<usize>,
+    deferred_hardlinks: BTreeSet<(u64, usize)>,
+    oldest_active_generation: Option<u64>,
     removals: VecDeque<usize>,
     cleanup: VecDeque<CleanupCursor>,
     #[cfg(test)]
     removal_checks: usize,
     scans: HashMap<u64, ScopeScan>,
+    retired_scans: VecDeque<ScopeScan>,
     active_scopes: HashMap<NodeId, u64>,
     generation: u64,
     last_error_id: Option<NodeId>,
@@ -272,12 +408,15 @@ impl Model {
             directories: HashMap::new(),
             hardlink_indices: HashMap::new(),
             hardlink_groups: Vec::new(),
-            hardlink_owners: HashMap::new(),
+            free_hardlink_groups: Vec::new(),
+            deferred_hardlinks: BTreeSet::new(),
+            oldest_active_generation: Some(0),
             removals: VecDeque::new(),
             cleanup: VecDeque::new(),
             #[cfg(test)]
             removal_checks: 0,
             scans: HashMap::from([(0, ScopeScan::new(ROOT))]),
+            retired_scans: VecDeque::new(),
             active_scopes: HashMap::from([(ROOT, 0)]),
             generation: 0,
             last_error_id: None,
@@ -292,6 +431,7 @@ impl Model {
         self.revision
     }
 
+    /// Number of IDs issued, including retired IDs; not a live-node count.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -300,6 +440,21 @@ impl Model {
         false
     }
 
+    /// Return a retained payload, which may already be removed. Check is_live
+    /// before using it as a current entry. Retired IDs are never reused.
+    pub fn get_node(&self, id: NodeId) -> Option<&Node> {
+        self.nodes.get(id as usize)
+    }
+
+    /// First issued ID at or after `start` whose payload is still retained.
+    /// Missing pages/chunks are skipped without walking historical IDs.
+    pub fn next_present_id(&self, start: usize) -> Option<NodeId> {
+        self.nodes
+            .next_present(start)
+            .and_then(|id| NodeId::try_from(id).ok())
+    }
+
+    /// Return an addressable payload. Use is_live or get_node for historical IDs.
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id as usize]
     }
@@ -316,7 +471,8 @@ impl Model {
         }
     }
 
-    /// Removed descendants remain addressable, but do not participate in totals or views.
+    /// Removed descendants do not participate in totals or views. Their payloads
+    /// may be reclaimed after bounded cleanup.
     pub fn is_removed(&self, id: NodeId) -> bool {
         if id as usize >= self.nodes.len() {
             return true;
@@ -485,6 +641,7 @@ impl Model {
         self.generation = generation;
         self.scans.insert(generation, ScopeScan::new(id));
         self.active_scopes.insert(id, generation);
+        self.oldest_active_generation = self.active_scopes.values().copied().min();
         self.has_removals = true;
         self.finished = false;
         self.cancelled = self.nodes[ROOT as usize].suppressed_subtrees != 0;
@@ -616,6 +773,15 @@ impl Model {
                 self.repair_hardlink(index, &mut changed);
             } else if !self.cleanup.is_empty() {
                 self.pump_cleanup();
+            } else if self.has_ready_hardlink_retirement() {
+                self.pump_hardlink_retirement();
+            } else if let Some(scan) = self.retired_scans.front_mut() {
+                // Free one small local-ID chunk per budgeted step.
+                if scan.ids.pop().is_none() {
+                    self.retired_scans.pop_front();
+                }
+            } else if !self.nodes.reclaim.is_empty() {
+                self.nodes.reclaim_one();
             } else {
                 break;
             }
@@ -638,20 +804,15 @@ impl Model {
             self.finish_hardlink_repair(index);
             return;
         }
-        if let Some(previous) = self.hardlink_groups[index].owner.take() {
-            self.hardlink_owners.remove(&previous);
-        }
+        self.hardlink_groups[index].owner = None;
         let members = self.hardlink_groups[index].members.as_mut().unwrap();
-        let Some(&id) = members.ids.get(members.next) else {
-            self.hardlink_groups[index].owner = None;
+        let Some(id) = members.ids.pop_first() else {
             self.finish_hardlink_repair(index);
             return;
         };
-        members.next += 1;
         if self.is_live(id) {
             let sizes = self.hardlink_groups[index].sizes;
             self.hardlink_groups[index].owner = Some(id);
-            self.hardlink_owners.insert(id, index);
             self.nodes[id as usize].hardlink_duplicate = false;
             self.add_totals(id, sizes, 0, 0, false, changed);
             self.finish_hardlink_repair(index);
@@ -659,16 +820,111 @@ impl Model {
     }
 
     fn finish_hardlink_repair(&mut self, index: usize) {
-        self.hardlink_groups[index]
-            .members
-            .as_mut()
-            .unwrap()
-            .pending = false;
+        let group = &mut self.hardlink_groups[index];
+        let members = group.members.as_mut().unwrap();
+        members.pending = false;
+        if members.ids.is_empty() {
+            group.members = None;
+        }
         self.removals.pop_front();
+        if group.references == 0 {
+            self.release_hardlink_group(index);
+        }
+    }
+
+    fn release_hardlink_group(&mut self, index: usize) {
+        let group = &mut self.hardlink_groups[index];
+        debug_assert_eq!(group.references, 0);
+        debug_assert!(
+            group
+                .members
+                .as_ref()
+                .is_none_or(|members| !members.pending)
+        );
+        // An older active scan may still publish a live alias with stale sizes.
+        // Preserve the newer metadata until every such scan has finished intake.
+        if group.retiring {
+            return;
+        }
+        if self
+            .oldest_active_generation
+            .is_some_and(|oldest| oldest < group.metadata_generation)
+        {
+            group.retiring = true;
+            self.deferred_hardlinks
+                .insert((group.metadata_generation, index));
+            return;
+        }
+        self.hardlink_indices.remove(&group.identity);
+        group.owner = None;
+        group.members = None;
+        self.free_hardlink_groups.push(index);
+    }
+
+    /// One compact node witness lets cleanup retire singleton owners and aliases
+    /// without another per-file hash table. Detached nodes retain their reference
+    /// until cleanup; their group slots cannot be reused before then.
+    fn forget_hardlink(&mut self, id: NodeId) {
+        let index = std::mem::replace(&mut self.nodes[id as usize].hardlink_index, NO_NODE);
+        if index == NO_NODE {
+            return;
+        }
+        let index = index as usize;
+        let group = &mut self.hardlink_groups[index];
+        group.references -= 1;
+        let owner_removed = group.owner == Some(id);
+        if owner_removed {
+            group.owner = None;
+        }
+        if let Some(members) = &mut group.members {
+            members.ids.remove(&id);
+            if owner_removed && !members.ids.is_empty() && !members.pending {
+                members.pending = true;
+                self.removals.push_back(index);
+            }
+            if members.ids.is_empty() && !members.pending {
+                group.members = None;
+            }
+        }
+        if group.references == 0
+            && group
+                .members
+                .as_ref()
+                .is_none_or(|members| !members.pending)
+        {
+            self.release_hardlink_group(index);
+        }
+    }
+
+    fn has_ready_hardlink_retirement(&self) -> bool {
+        self.deferred_hardlinks
+            .first()
+            .is_some_and(|&(generation, _)| {
+                self.oldest_active_generation
+                    .is_none_or(|oldest| oldest >= generation)
+            })
+    }
+
+    fn pump_hardlink_retirement(&mut self) {
+        let (_, index) = self.deferred_hardlinks.pop_first().unwrap();
+        let group = &mut self.hardlink_groups[index];
+        group.retiring = false;
+        if group.references == 0
+            && group
+                .members
+                .as_ref()
+                .is_none_or(|members| !members.pending)
+        {
+            self.release_hardlink_group(index);
+        }
     }
 
     pub fn has_pending_removals(&self) -> bool {
-        !self.removals.is_empty() || !self.cleanup.is_empty()
+        !self.removals.is_empty()
+            || !self.cleanup.is_empty()
+            || self.has_ready_hardlink_retirement()
+            || !self.retired_scans.is_empty()
+            || !self.nodes.reclaim.is_empty()
     }
 
     fn schedule_cleanup(&mut self, next: NodeId, siblings: bool) {
@@ -680,7 +936,9 @@ impl Model {
     fn pump_cleanup(&mut self) {
         let mut cursor = self.cleanup.pop_front().unwrap();
         let id = cursor.next;
-        let node = &self.nodes[id as usize];
+        let Some(node) = self.nodes.get(id as usize) else {
+            return;
+        };
         let children = node.first_child;
         let next = node.next_sibling;
         // A refresh detaches a whole sibling chain; an individual removal
@@ -695,17 +953,12 @@ impl Model {
                 siblings: true,
             });
         }
-        if let Some(index) = self.hardlink_owners.remove(&id) {
-            let members = self.hardlink_groups[index].members.as_mut().unwrap();
-            if !members.pending {
-                members.pending = true;
-                self.removals.push_back(index);
-            }
-        }
+        self.forget_hardlink(id);
         let node = &mut self.nodes[id as usize];
         node.flags |= Node::REMOVED;
         node.name = Arc::clone(&self.tombstone_name);
         self.directories.remove(&id);
+        self.nodes.retire(id);
     }
 
     /// Refresh one surviving directory's own inode bytes after a deletion.
@@ -749,7 +1002,7 @@ impl Model {
         if self
             .scans
             .get(&generation)
-            .is_none_or(|scan| scan.scope != scope || scan.finished)
+            .is_none_or(|scan| scan.scope != scope)
             || !self.accepts_scan(scope, generation)
         {
             return Vec::new();
@@ -839,6 +1092,7 @@ impl Model {
         }
     }
 
+    /// Reconstruct the path of a live entry; historical IDs may lack ancestry.
     pub fn path(&self, id: NodeId) -> PathBuf {
         let mut names = Vec::new();
         let mut current = id;
@@ -901,23 +1155,6 @@ impl Model {
             return changed;
         }
         let scope_live = self.accepts_scan(scope, generation);
-        if scan.finished {
-            let event_live = match &event {
-                ScanEvent::RootInfo { .. } => scope_live,
-                ScanEvent::Entries { parent, .. } => scan
-                    .get(*parent)
-                    .map_or(scope_live, |id| self.accepts_scan(id, generation)),
-                ScanEvent::DirectoryDone { id, .. } => scan
-                    .get(*id)
-                    .map_or(scope_live, |id| self.accepts_scan(id, generation)),
-                ScanEvent::Finished { .. } => false,
-            };
-            if event_live {
-                self.record_error(scope, "received scan data after completion".into());
-                self.revision = self.revision.wrapping_add(1);
-            }
-            return changed;
-        }
         self.revision = self.revision.wrapping_add(1);
         match event {
             ScanEvent::RootInfo {
@@ -959,14 +1196,15 @@ impl Model {
                 }
                 let charged = if kind == NodeKind::File {
                     if let Some(group) = file_identity {
-                        let (charged, duplicate) = self.remember_hardlink(
-                            group,
+                        let index = self.hardlink_index(group, sizes);
+                        let (charged, duplicate) = self.remember_hardlink_index(
+                            index,
                             scope,
                             sizes,
                             generation,
-                            true,
                             &mut changed,
                         );
+                        self.nodes[scope as usize].hardlink_index = index as NodeId;
                         self.nodes[scope as usize].hardlink_duplicate = duplicate;
                         charged
                     } else {
@@ -1059,13 +1297,17 @@ impl Model {
                 self.complete_ready(id);
             }
             ScanEvent::Finished { cancelled } => {
-                self.scans.get_mut(&generation).unwrap().finished = true;
+                // Terminal delivery closes this local-ID namespace. Later data
+                // for a completed generation is ignored just like any retired scan.
+                let scan = self.scans.remove(&generation).unwrap();
+                self.retired_scans.push_back(scan);
                 if self.active_scopes.get(&scope) == Some(&generation) {
                     self.active_scopes.remove(&scope);
                 }
                 if scope_live {
                     self.cancelled |= cancelled;
                 }
+                self.oldest_active_generation = self.active_scopes.values().copied().min();
                 self.finished = self.active_scopes.is_empty();
                 if self.finished {
                     if self.nodes[ROOT as usize].suppressed_subtrees != 0 {
@@ -1085,24 +1327,19 @@ impl Model {
         if entry.id as usize != self.nodes.len() || entry.id == NO_NODE {
             return;
         }
-        if let Some(group_id) = entry.hardlink_group {
-            self.remember_hardlink(
-                group_id,
-                entry.id,
-                entry.sizes,
-                generation,
-                false,
-                &mut Vec::new(),
-            );
-        }
+        // Discarded scan rows own no charge or alias state. A later live event
+        // for the same filesystem identity will create or join its group then.
         let mut node = Node::new(
             Arc::clone(&self.tombstone_name),
             Some(parent),
             NodeKind::Unknown,
             Sizes::default(),
         );
-        node.flags |= Node::REMOVED;
-        node.parent_epoch = self.nodes[parent as usize].child_epoch;
+        node.flags |= Node::REMOVED | Node::RETIRED;
+        node.parent_epoch = self
+            .nodes
+            .get(parent as usize)
+            .map_or(0, |node| node.child_epoch);
         node.scan_generation = generation;
         self.has_removals = true;
         self.nodes.push(node);
@@ -1154,9 +1391,11 @@ impl Model {
                 self.append_tombstone(parent, generation, entry);
                 continue;
             }
+            let mut hardlink_index = NO_NODE;
             let (charged, duplicate) = if let Some(group_id) = entry.hardlink_group {
                 let group = self.hardlink_index(group_id, entry.sizes);
-                let index = group.0;
+                hardlink_index = group as NodeId;
+                let index = group;
                 // The charge for an earlier owner in this same batch has not yet
                 // reached the parent. Correct that local sum before updating it.
                 if let Some(owner) = self.hardlink_groups[index].owner
@@ -1183,16 +1422,7 @@ impl Model {
                         changed.push(owner);
                     }
                 }
-                self.remember_hardlink_index(
-                    group,
-                    entry.id,
-                    entry.sizes,
-                    generation,
-                    true,
-                    changed,
-                )
-            } else if entry.hardlink_duplicate {
-                (Sizes::default(), true)
+                self.remember_hardlink_index(group, entry.id, entry.sizes, generation, changed)
             } else {
                 (entry.sizes, false)
             };
@@ -1200,6 +1430,7 @@ impl Model {
             node.parent_epoch = self.nodes[parent as usize].child_epoch;
             node.scan_generation = generation;
             node.hardlink_duplicate = duplicate;
+            node.hardlink_index = hardlink_index;
             if entry.kind == NodeKind::Directory {
                 self.directories.insert(
                     entry.id,
@@ -1255,51 +1486,46 @@ impl Model {
         self.add_totals(parent, sizes, items, errors, overflow, changed);
     }
 
-    fn hardlink_index(&mut self, group_id: NodeId, sizes: Sizes) -> (usize, bool) {
-        match self.hardlink_indices.entry(group_id) {
-            HashEntry::Occupied(entry) => (*entry.get(), false),
+    fn hardlink_index(&mut self, identity: FileIdentity, sizes: Sizes) -> usize {
+        match self.hardlink_indices.entry(identity) {
+            HashEntry::Occupied(entry) => *entry.get(),
             HashEntry::Vacant(entry) => {
-                let index = self.hardlink_groups.len();
-                entry.insert(index);
-                self.hardlink_groups.push(HardlinkGroup {
+                let group = HardlinkGroup {
+                    identity,
                     sizes,
+                    references: 0,
+                    retiring: false,
                     metadata_generation: 0,
                     owner: None,
                     members: None,
-                });
-                (index, true)
+                };
+                let index = if let Some(index) = self.free_hardlink_groups.pop() {
+                    self.hardlink_groups[index] = group;
+                    index
+                } else {
+                    let index = self.hardlink_groups.len();
+                    self.hardlink_groups.push(group);
+                    index
+                };
+                entry.insert(index);
+                index
             }
         }
     }
 
-    fn remember_hardlink(
-        &mut self,
-        group_id: NodeId,
-        id: NodeId,
-        sizes: Sizes,
-        generation: u64,
-        live: bool,
-        changed: &mut Vec<NodeId>,
-    ) -> (Sizes, bool) {
-        let group = self.hardlink_index(group_id, sizes);
-        self.remember_hardlink_index(group, id, sizes, generation, live, changed)
-    }
-
     fn remember_hardlink_index(
         &mut self,
-        (index, new_group): (usize, bool),
+        index: usize,
         id: NodeId,
         sizes: Sizes,
         generation: u64,
-        live: bool,
         changed: &mut Vec<NodeId>,
     ) -> (Sizes, bool) {
         let owner_live = self.hardlink_groups[index]
             .owner
             .is_some_and(|owner| self.is_live(owner));
-        // A delayed alias in an untouched older scan remains a valid row,
-        // but cannot replace metadata already observed by a newer refresh.
-        if live && generation >= self.hardlink_groups[index].metadata_generation {
+        // An older scan's live alias cannot overwrite newer observed metadata.
+        if generation >= self.hardlink_groups[index].metadata_generation {
             let old = self.hardlink_groups[index].sizes;
             if owner_live && old != sizes {
                 let owner = self.hardlink_groups[index].owner.unwrap();
@@ -1309,29 +1535,21 @@ impl Model {
             self.hardlink_groups[index].metadata_generation = generation;
         }
         let group = &mut self.hardlink_groups[index];
-        // The initial member is already stored as owner. Once tombstoned it
-        // can never return, so repair only needs later aliases. Ordinary files
-        // allocate neither member state nor entries in the repair owner index.
-        if !new_group {
+        group.references = group
+            .references
+            .checked_add(1)
+            .expect("live references fit node IDs");
+        if owner_live {
             group
                 .members
                 .get_or_insert_with(Default::default)
                 .ids
-                .push(id);
-        }
-        let charged = if live && !owner_live {
-            if let Some(previous) = group.owner {
-                self.hardlink_owners.remove(&previous);
-            }
-            group.owner = Some(id);
-            group.sizes
+                .insert(id);
+            (Sizes::default(), true)
         } else {
-            Sizes::default()
-        };
-        if group.members.is_some() && (owner_live || live) {
-            self.hardlink_owners.insert(group.owner.unwrap(), index);
+            group.owner = Some(id);
+            (group.sizes, false)
         }
-        (charged, group.owner != Some(id))
     }
 
     fn replace_node_charge(
@@ -1487,7 +1705,6 @@ mod tests {
                 apparent,
                 allocated,
             },
-            hardlink_duplicate: false,
             hardlink_group: None,
             error: None,
         }
@@ -1593,7 +1810,16 @@ mod tests {
                 .map(|id| entry(id, &format!("file-{id}"), NodeKind::File, 1, 4))
                 .collect(),
         });
-        assert_eq!(model.nodes.chunks.len(), 4);
+        assert_eq!(
+            model
+                .nodes
+                .pages
+                .iter()
+                .flatten()
+                .map(|page| page.present)
+                .sum::<usize>(),
+            4
+        );
         assert_eq!(model.node(ROOT) as *const Node, root_address);
         assert!(model.nodes.get(model.len()).is_none());
         assert!(!model.is_live(model.len() as NodeId));
@@ -1787,17 +2013,12 @@ mod tests {
     #[test]
     fn duplicates_errors_and_cancellation_preserve_known_totals() {
         let mut model = model();
-        let mut duplicate = entry(2, "link", NodeKind::File, 100, 512);
-        duplicate.hardlink_duplicate = true;
+        let duplicate = linked(2, "link", 7);
         let mut unreadable = entry(3, "unreadable", NodeKind::Unknown, 0, 0);
         unreadable.error = Some("metadata denied".into());
         model.apply(ScanEvent::Entries {
             parent: ROOT,
-            entries: vec![
-                entry(1, "original", NodeKind::File, 100, 512),
-                duplicate,
-                unreadable,
-            ],
+            entries: vec![linked(1, "original", 7), duplicate, unreadable],
         });
         assert_eq!(
             model.node(ROOT).sizes,
@@ -2203,8 +2424,7 @@ mod tests {
 
     fn linked(id: NodeId, name: &str, group: NodeId) -> Entry {
         let mut value = entry(id, name, NodeKind::File, 100, 512);
-        value.hardlink_group = Some(group);
-        value.hardlink_duplicate = id != group;
+        value.hardlink_group = Some((1, u64::from(group)));
         value
     }
 
@@ -2250,8 +2470,15 @@ mod tests {
         assert!(!model.has_partial_totals(ROOT));
         assert_eq!(model.node(ROOT).items, u64::from(GROUPS * ALIASES));
         assert_eq!(model.node(ROOT).sizes.apparent, 2 + u64::from(GROUPS) * 100);
-        assert_eq!(model.hardlink_owners.len(), GROUPS as usize);
+        assert_eq!(model.hardlink_indices.len(), GROUPS as usize);
         assert_eq!(model.removal_checks, 0);
+        let retirement_steps = model
+            .retired_scans
+            .iter()
+            .map(|scan| scan.ids.len() + 1)
+            .sum::<usize>();
+        finish_removals(&mut model);
+        assert_eq!(model.removal_checks, retirement_steps);
         assert_removal_work_stays_settled(&mut model);
     }
 
@@ -2328,8 +2555,15 @@ mod tests {
         assert!(model.finished && model.node(ROOT).complete);
         assert!(model.has_pending_removals());
 
-        // Count detached nodes and ownership repairs, independently of timing.
-        let expected_checks = GROUPS as usize * 2;
+        // Count detached nodes and ownership repairs, plus bounded scope/chunk
+        // reclamation. No unrelated live file or group may add work.
+        let core_checks = GROUPS as usize * 2;
+        let scope_checks = model
+            .retired_scans
+            .iter()
+            .map(|scan| scan.ids.len() + 1)
+            .sum::<usize>();
+        let expected_checks = core_checks + scope_checks + old_ids.len().div_ceil(NODE_CHUNK);
         for _ in 0..=expected_checks {
             if !model.has_pending_removals() {
                 break;
@@ -2339,7 +2573,7 @@ mod tests {
             assert!(model.removal_checks - checks <= REMOVAL_CHECKS);
             assert!(model.removal_checks <= expected_checks);
         }
-        assert_eq!(model.removal_checks, expected_checks);
+        assert!((core_checks + scope_checks..=expected_checks).contains(&model.removal_checks));
         assert!(!model.has_pending_removals());
         assert!(!model.has_partial_totals(ROOT));
         assert_eq!(model.node(ROOT).items, u64::from(GROUPS) + 18);
@@ -2351,7 +2585,7 @@ mod tests {
             }
         );
         for id in old_ids {
-            assert!(model.node(id).name.is_empty());
+            assert!(model.get_node(id).is_none_or(|node| node.name.is_empty()));
         }
         for id in aliases {
             assert_eq!(model.node(id).name.as_ref(), OsStr::new("survivor"));
@@ -2371,7 +2605,12 @@ mod tests {
             parent: ROOT,
             entries: (1..=4096).map(|id| linked(id, "ordinary", id)).collect(),
         });
-        assert!(model.hardlink_owners.is_empty());
+        assert!(
+            model
+                .hardlink_groups
+                .iter()
+                .all(|group| group.members.is_none())
+        );
         for id in 1..=512 {
             let checks = model.removal_checks;
             model.remove(id);
@@ -2382,7 +2621,12 @@ mod tests {
         assert_eq!(model.node(ROOT).items, 4096 - 512);
         assert_eq!(model.node(513).name.as_ref(), OsStr::new("ordinary"));
         assert_eq!(model.node(4096).name.as_ref(), OsStr::new("ordinary"));
-        assert!(model.hardlink_owners.is_empty());
+        assert!(
+            model
+                .hardlink_groups
+                .iter()
+                .all(|group| group.members.is_none())
+        );
     }
 
     #[test]
@@ -2426,8 +2670,14 @@ mod tests {
             model.remove(id);
             finish_removals(&mut model);
         }
+        // 1024 detached nodes, 1023 ownership promotions, one reclaimed chunk.
         assert_eq!(model.removal_checks, 2048);
-        assert!(model.hardlink_owners.is_empty());
+        assert!(
+            model
+                .hardlink_groups
+                .iter()
+                .all(|group| group.members.is_none())
+        );
         assert_eq!(
             model.node(ROOT).sizes,
             Sizes {
@@ -2455,8 +2705,10 @@ mod tests {
         model.remove(3);
         finish_removals(&mut model);
         assert_eq!(model.node(2).sizes.apparent, 100);
-        assert_eq!(model.hardlink_owners.len(), 1);
-        assert!(model.hardlink_owners.contains_key(&2));
+        assert_eq!(model.hardlink_indices.len(), 1);
+        let index = model.node(2).hardlink_index as usize;
+        assert_eq!(model.hardlink_groups[index].owner, Some(2));
+        assert_eq!(model.hardlink_groups[index].references, 1);
         assert_eq!(model.node(ROOT).sizes.apparent, 102);
         assert_eq!(model.node(ROOT).items, 1);
     }
@@ -3255,6 +3507,113 @@ mod tests {
     }
 
     #[test]
+    fn sparse_pages_release_payloads_and_skip_history_without_reusing_ids() {
+        let mut nodes = Nodes::default();
+        let empty: Arc<OsStr> = Arc::from(OsStr::new(""));
+        nodes.push(Node::new(
+            Arc::clone(&empty),
+            None,
+            NodeKind::Directory,
+            Sizes::default(),
+        ));
+        let root_address = nodes.get(0).unwrap() as *const Node;
+        let page_slots = NODE_CHUNK * CHUNKS_PER_PAGE;
+        // Reclaim each full chunk as it arrives: this exercises a complete
+        // second page while retaining only the root chunk and one incoming chunk.
+        for _ in 1..page_slots * 2 {
+            let mut node = Node::new(
+                Arc::clone(&empty),
+                None,
+                NodeKind::Unknown,
+                Sizes::default(),
+            );
+            node.flags |= Node::REMOVED | Node::RETIRED;
+            nodes.push(node);
+            while !nodes.reclaim.is_empty() {
+                nodes.reclaim_one();
+            }
+        }
+        assert_eq!(nodes.pages.len(), 2);
+        assert!(nodes.pages[0].is_some());
+        assert!(nodes.pages[1].is_none());
+        assert_eq!(nodes.retained_slots(), NODE_CHUNK);
+        assert_eq!(nodes.get(0).unwrap() as *const Node, root_address);
+        assert!(nodes.get(page_slots).is_none());
+        assert_eq!(nodes.next_present(0), Some(0));
+        assert_eq!(nodes.next_present(NODE_CHUNK - 1), Some(NODE_CHUNK - 1));
+        assert_eq!(nodes.next_present(NODE_CHUNK), None);
+        assert_eq!(nodes.next_present(usize::MAX), None);
+
+        let fresh = nodes.len();
+        nodes.push(Node::new(
+            empty,
+            Some(ROOT),
+            NodeKind::File,
+            Sizes::default(),
+        ));
+        assert_eq!(fresh, page_slots * 2);
+        assert!(nodes.pages[2].is_some());
+        assert_eq!(nodes.next_present(NODE_CHUNK), Some(fresh));
+        assert_eq!(nodes.next_present(page_slots), Some(fresh));
+        assert_eq!(nodes.next_present(fresh), Some(fresh));
+        assert_eq!(nodes.next_present(fresh + 1), None);
+        assert_eq!(nodes.get(0).unwrap() as *const Node, root_address);
+        assert!(nodes.get(page_slots).is_none());
+    }
+
+    #[test]
+    fn repeated_completed_refresh_reclaims_node_payloads_and_scope_maps() {
+        let mut model = model();
+        const COUNT: u32 = 2048;
+        let mut previous_ids = Vec::new();
+        for generation in 0..32 {
+            if generation != 0 {
+                model.begin_rescan(ROOT, generation);
+                scoped_root(&mut model, ROOT, generation, 2);
+            }
+            model.apply_scoped(
+                ROOT,
+                generation,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: (1..=COUNT)
+                        .map(|id| entry(id, "file", NodeKind::File, 1, 4))
+                        .collect(),
+                },
+            );
+            let current_ids = model.children(ROOT).collect::<Vec<_>>();
+            done(&mut model, ROOT, generation, ROOT);
+            finish(&mut model, ROOT, generation);
+            finish_removals(&mut model);
+            assert!(model.scans.is_empty());
+            assert!(model.retired_scans.is_empty());
+            assert!(!model.has_pending_removals());
+            assert_eq!(model.child_count(ROOT), COUNT as usize);
+            assert!(model.node(ROOT).complete);
+            assert!(
+                model.nodes.retained_slots() <= COUNT as usize + 2 * NODE_CHUNK,
+                "retired payload grew across refresh {generation}"
+            );
+            for &id in &previous_ids {
+                assert!(!model.is_live(id), "old ID was reused");
+            }
+            if generation > 1 {
+                assert!(model.get_node(COUNT).is_none());
+            }
+            previous_ids = current_ids;
+        }
+        assert!(model.len() > model.nodes.retained_slots() * 10);
+        // A late completed-scan event must not reallocate retired payloads.
+        let retained = model.nodes.retained_slots();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(COUNT + 1, "late", NodeKind::File, 99, 99)],
+        });
+        assert_eq!(model.nodes.retained_slots(), retained);
+        assert_eq!(model.node(ROOT).error_count, 0);
+    }
+
+    #[test]
     fn replacement_symlink_finishes_retained_target_and_updates_directory_witness() {
         let mut model = model();
         model.apply(ScanEvent::Entries {
@@ -3305,7 +3664,7 @@ mod tests {
             1,
             1,
             ScanEvent::RootInfo {
-                file_identity: Some(77),
+                file_identity: Some((1, 77)),
                 kind: NodeKind::File,
                 sizes: Sizes {
                     apparent: 200,
@@ -3338,7 +3697,7 @@ mod tests {
         for (file_identity, sizes) in [
             (None, Sizes::default()),
             (
-                Some(77),
+                Some((1, 77)),
                 Sizes {
                     apparent: 100,
                     allocated: 512,
@@ -3393,7 +3752,7 @@ mod tests {
     fn initial_regular_file_root_with_canonical_identity_keeps_its_full_charge() {
         let mut model = Model::new(PathBuf::from("fixture-file"));
         model.apply(ScanEvent::RootInfo {
-            file_identity: Some(77),
+            file_identity: Some((1, 77)),
             kind: NodeKind::File,
             sizes: Sizes {
                 apparent: 200,
@@ -3442,7 +3801,7 @@ mod tests {
             parent: ROOT,
             entries: vec![linked(1, "single", 77)],
         });
-        let index = model.hardlink_indices[&77];
+        let index = model.hardlink_indices[&(1, 77)];
         assert!(model.hardlink_groups[index].members.is_none());
         model.apply(ScanEvent::Entries {
             parent: ROOT,
@@ -3450,13 +3809,264 @@ mod tests {
         });
         assert_eq!(
             model.hardlink_groups[index].members.as_ref().unwrap().ids,
-            vec![2]
+            BTreeSet::from([2])
         );
         model.remove(1);
         finish_removals(&mut model);
         assert_eq!(model.node(2).sizes.apparent, 100);
         assert!(!model.node(2).hardlink_duplicate);
         assert_eq!(model.node(ROOT).sizes.apparent, 102);
+    }
+
+    #[test]
+    fn repeated_refresh_retires_hardlink_members_and_reuses_group_storage() {
+        for churn in [false, true] {
+            let mut model = model();
+            model.apply(ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![linked(1, "file", 77)],
+            });
+            done(&mut model, ROOT, 0, ROOT);
+            finish(&mut model, ROOT, 0);
+            finish_removals(&mut model);
+            for generation in 1..=256 {
+                model.begin_rescan(ROOT, generation);
+                scoped_root(&mut model, ROOT, generation, 2);
+                let identity = if churn { 77 + generation as NodeId } else { 77 };
+                model.apply_scoped(
+                    ROOT,
+                    generation,
+                    ScanEvent::Entries {
+                        parent: ROOT,
+                        entries: vec![linked(1, "file", identity)],
+                    },
+                );
+                done(&mut model, ROOT, generation, ROOT);
+                finish(&mut model, ROOT, generation);
+                finish_removals(&mut model);
+                assert_eq!(model.hardlink_indices.len(), 1);
+                assert!(model.hardlink_groups.len() <= 2);
+                let index = model.hardlink_indices[&(1, u64::from(identity))];
+                assert_eq!(model.hardlink_groups[index].references, 1);
+                assert!(model.hardlink_groups[index].members.is_none());
+                assert!(model.deferred_hardlinks.is_empty());
+                assert_eq!(model.node(ROOT).sizes.apparent, 102);
+                assert_eq!(model.node(ROOT).items, 1);
+                assert_removal_work_stays_settled(&mut model);
+            }
+        }
+    }
+
+    #[test]
+    fn refreshing_aliases_retires_members_without_disturbing_an_untouched_owner() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                linked(1, "outside", 77),
+                entry(2, "branch", NodeKind::Directory, 0, 0),
+            ],
+        });
+        done(&mut model, ROOT, 0, 2);
+        done(&mut model, ROOT, 0, ROOT);
+        finish(&mut model, ROOT, 0);
+        finish_removals(&mut model);
+        for generation in 1..=256 {
+            model.begin_rescan(2, generation);
+            scoped_root(&mut model, 2, generation, 0);
+            model.apply_scoped(
+                2,
+                generation,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: vec![linked(1, "alias", 77)],
+                },
+            );
+            done(&mut model, 2, generation, ROOT);
+            finish(&mut model, 2, generation);
+            finish_removals(&mut model);
+            let index = model.hardlink_indices[&(1, 77)];
+            let group = &model.hardlink_groups[index];
+            assert_eq!(group.owner, Some(1));
+            assert_eq!(group.references, 2);
+            assert_eq!(group.members.as_ref().unwrap().ids.len(), 1);
+            assert_eq!(model.node(1).sizes.apparent, 100);
+            assert_eq!(model.node(ROOT).sizes.apparent, 102);
+        }
+        model.remove(1);
+        finish_removals(&mut model);
+        let alias = model.children(2).next().unwrap();
+        assert_eq!(model.node(alias).sizes.apparent, 100);
+        assert!(!model.node(alias).hardlink_duplicate);
+        assert!(
+            model.hardlink_groups[model.node(alias).hardlink_index as usize]
+                .members
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn zero_owner_gap_preserves_newer_metadata_for_an_unfinished_older_scan() {
+        for delayed_alias in [false, true] {
+            let mut model = model();
+            model.apply(ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![
+                    entry(1, "refresh", NodeKind::Directory, 0, 0),
+                    entry(2, "older", NodeKind::Directory, 0, 0),
+                ],
+            });
+            done(&mut model, ROOT, 0, 1);
+            done(&mut model, ROOT, 0, ROOT);
+            model.begin_rescan(1, 1);
+            scoped_root(&mut model, 1, 1, 0);
+            let mut fresh = linked(1, "fresh", 77);
+            fresh.sizes = Sizes {
+                apparent: 200,
+                allocated: 1024,
+            };
+            model.apply_scoped(
+                1,
+                1,
+                ScanEvent::Entries {
+                    parent: ROOT,
+                    entries: vec![fresh],
+                },
+            );
+            done(&mut model, 1, 1, ROOT);
+            finish(&mut model, 1, 1);
+            let fresh = model.children(1).next().unwrap();
+            model.remove(fresh);
+            finish_removals(&mut model);
+            assert_eq!(model.deferred_hardlinks.len(), 1);
+            assert_eq!(model.hardlink_indices.len(), 1);
+            assert_removal_work_stays_settled(&mut model);
+
+            if !delayed_alias {
+                done(&mut model, ROOT, 0, 2);
+                finish(&mut model, ROOT, 0);
+                finish_removals(&mut model);
+                assert!(model.hardlink_indices.is_empty());
+                assert!(model.deferred_hardlinks.is_empty());
+                assert_eq!(model.free_hardlink_groups.len(), 1);
+                assert_removal_work_stays_settled(&mut model);
+                continue;
+            }
+
+            model.apply(ScanEvent::Entries {
+                parent: 2,
+                entries: vec![linked(3, "delayed", 77)],
+            });
+            let delayed = model.children(2).next().unwrap();
+            assert_eq!(model.node(delayed).sizes.apparent, 200);
+            assert_eq!(model.node(delayed).sizes.allocated, 1024);
+            assert!(!model.node(delayed).hardlink_duplicate);
+            done(&mut model, ROOT, 0, 2);
+            finish(&mut model, ROOT, 0);
+            finish_removals(&mut model);
+            assert!(model.deferred_hardlinks.is_empty());
+            assert_eq!(model.node(delayed).sizes.apparent, 200);
+            model.remove(delayed);
+            finish_removals(&mut model);
+            assert!(model.hardlink_indices.is_empty());
+            assert_eq!(model.free_hardlink_groups.len(), 1);
+        }
+    }
+
+    #[test]
+    fn deferred_retirement_rechecks_metadata_after_a_group_rejoins() {
+        let mut model = model();
+        model.apply(ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![
+                entry(1, "refresh", NodeKind::Directory, 0, 0),
+                entry(2, "older", NodeKind::Directory, 0, 0),
+                entry(3, "intermediate", NodeKind::Directory, 0, 0),
+            ],
+        });
+        done(&mut model, ROOT, 0, 1);
+        done(&mut model, ROOT, 0, 3);
+        done(&mut model, ROOT, 0, ROOT);
+        model.begin_rescan(1, 1);
+        scoped_root(&mut model, 1, 1, 0);
+        model.apply_scoped(
+            1,
+            1,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![linked(1, "first", 77)],
+            },
+        );
+        done(&mut model, 1, 1, ROOT);
+        finish(&mut model, 1, 1);
+        let first = model.children(1).next().unwrap();
+        model.remove(first);
+        finish_removals(&mut model);
+        let index = model.hardlink_indices[&(1, 77)];
+        assert_eq!(model.deferred_hardlinks, BTreeSet::from([(1, index)]));
+
+        model.begin_rescan(3, 2);
+        scoped_root(&mut model, 3, 2, 0);
+        model.begin_rescan(1, 3);
+        scoped_root(&mut model, 1, 3, 0);
+        let mut newer = linked(1, "newer", 77);
+        newer.sizes = Sizes {
+            apparent: 300,
+            allocated: 1024,
+        };
+        model.apply_scoped(
+            1,
+            3,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![newer],
+            },
+        );
+        done(&mut model, 1, 3, ROOT);
+        finish(&mut model, 1, 3);
+        let newer = model.children(1).next().unwrap();
+        assert_eq!(model.node(newer).sizes.apparent, 300);
+        model.remove(newer);
+        finish_removals(&mut model);
+        assert_eq!(model.deferred_hardlinks, BTreeSet::from([(1, index)]));
+
+        done(&mut model, ROOT, 0, 2);
+        finish(&mut model, ROOT, 0);
+        finish_removals(&mut model);
+        assert_eq!(model.oldest_active_generation, Some(2));
+        assert_eq!(model.deferred_hardlinks, BTreeSet::from([(3, index)]));
+        assert!(model.free_hardlink_groups.is_empty());
+        assert_removal_work_stays_settled(&mut model);
+        model.apply_scoped(
+            3,
+            2,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![linked(1, "unrelated", 88)],
+            },
+        );
+        assert_ne!(model.hardlink_indices[&(1, 88)], index);
+        done(&mut model, 3, 2, ROOT);
+        finish(&mut model, 3, 2);
+        finish_removals(&mut model);
+        assert!(!model.hardlink_indices.contains_key(&(1, 77)));
+        assert!(model.deferred_hardlinks.is_empty());
+        assert_eq!(model.free_hardlink_groups, vec![index]);
+        model.begin_rescan(1, 4);
+        scoped_root(&mut model, 1, 4, 0);
+        model.apply_scoped(
+            1,
+            4,
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: vec![linked(1, "reused", 99)],
+            },
+        );
+        assert_eq!(model.hardlink_indices[&(1, 99)], index);
+        done(&mut model, 1, 4, ROOT);
+        finish(&mut model, 1, 4);
+        finish_removals(&mut model);
+        assert_removal_work_stays_settled(&mut model);
     }
 
     #[test]

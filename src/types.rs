@@ -1,6 +1,8 @@
 use std::{ffi::OsStr, sync::Arc};
 
 pub type NodeId = u32;
+/// Filesystem identity carried by bounded scan events; the model owns deduplication.
+pub type FileIdentity = (u64, u64);
 pub const ROOT: NodeId = 0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,16 +42,15 @@ pub struct Entry {
     pub name: Arc<OsStr>,
     pub kind: NodeKind,
     pub sizes: Sizes,
-    pub hardlink_duplicate: bool,
-    pub hardlink_group: Option<NodeId>,
+    pub hardlink_group: Option<FileIdentity>,
     pub error: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum ScanEvent {
     RootInfo {
-        /// Opaque canonical hardlink group for a regular-file scan root.
-        file_identity: Option<NodeId>,
+        /// Device/inode identity for a regular-file scan root.
+        file_identity: Option<FileIdentity>,
         kind: NodeKind,
         sizes: Sizes,
         error: Option<String>,

@@ -153,7 +153,6 @@ mod tests {
             name: OsStr::new(name).into(),
             kind,
             sizes,
-            hardlink_duplicate: false,
             hardlink_group: None,
             error: None,
         }

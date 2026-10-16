@@ -7,7 +7,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
     ffi::OsStr,
     io,
     num::NonZeroUsize,
@@ -711,12 +711,56 @@ struct RetiredRows {
     rows: std::collections::hash_map::IntoValues<NodeId, RowState>,
 }
 
+// Node IDs are never reused within a scan generation. Remember retired IDs as
+// merged intervals, so repeated refreshes retain ranges rather than every old
+// parent record. Insertion touches only adjacent ranges and stays bounded.
+#[derive(Default)]
+struct RetiredIds {
+    ranges: BTreeMap<NodeId, NodeId>,
+}
+
+impl RetiredIds {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    fn contains(&self, id: &NodeId) -> bool {
+        self.ranges
+            .range(..=*id)
+            .next_back()
+            .is_some_and(|(_, end)| id <= end)
+    }
+
+    fn insert(&mut self, id: NodeId) {
+        let (mut start, mut end) = (id, id);
+        if let Some((&previous_start, &previous_end)) = self.ranges.range(..=id).next_back() {
+            if id <= previous_end {
+                return;
+            }
+            if previous_end.checked_add(1) == Some(id) {
+                start = previous_start;
+            }
+        }
+        if let Some((&next_start, &next_end)) = self.ranges.range(id..).next()
+            && id.checked_add(1) == Some(next_start)
+        {
+            end = next_end;
+            self.ranges.remove(&next_start);
+        }
+        self.ranges.insert(start, end);
+    }
+}
+
 struct CacheState {
     generation: u64,
     config: OrderConfig,
     directories: HashMap<NodeId, CachedDirectory>,
     parents: HashMap<NodeId, CachedParent>,
-    removed: HashSet<NodeId>,
+    removed: RetiredIds,
     has_epochs: bool,
     dirty: VecDeque<NodeId>,
     dirty_set: HashSet<NodeId>,
@@ -734,7 +778,7 @@ impl CacheState {
             config: OrderConfig::default(),
             directories: HashMap::new(),
             parents: HashMap::new(),
-            removed: HashSet::new(),
+            removed: RetiredIds::default(),
             has_epochs: false,
             dirty: VecDeque::new(),
             dirty_set: HashSet::new(),
@@ -769,6 +813,17 @@ impl CacheState {
             }
             id = parent;
         }
+    }
+
+    fn reject_row(&mut self, id: NodeId, cache: &SharedCache) {
+        // Keep a compact witness before unlinking a dead parent. Descendants
+        // and delayed updates can then reject it without its old ancestry.
+        self.removed.insert(id);
+        self.parents.remove(&id);
+        if self.directories.contains_key(&id) {
+            self.cleanup.push_back(id);
+        }
+        self.remove_view(id, cache);
     }
 
     fn retire_directory(&mut self, directory: CachedDirectory) {
@@ -878,6 +933,15 @@ impl CacheState {
                     mut row,
                 } in rows
                 {
+                    if self.removed.contains(&row.id) {
+                        continue;
+                    }
+                    // Do not recreate a reclaimed parent while applying a late
+                    // child's epoch witness. Its descendants are retired too.
+                    if parent.is_some_and(|parent| self.removed.contains(&parent)) {
+                        self.reject_row(row.id, cache);
+                        continue;
+                    }
                     self.has_epochs |= parent_epoch != 0 || child_epoch != 0;
                     let previous_epoch = self.parents.get(&row.id).map(|parent| parent.child_epoch);
                     if previous_epoch.is_some_and(|previous| previous > child_epoch) {
@@ -914,10 +978,7 @@ impl CacheState {
                     }
                     if self.is_removed(row.id) {
                         // A late parent can connect an earlier orphan view to a tombstone.
-                        if self.directories.contains_key(&row.id) {
-                            self.cleanup.push_back(row.id);
-                        }
-                        self.remove_view(row.id, cache);
+                        self.reject_row(row.id, cache);
                         continue;
                     }
                     if previous_epoch.unwrap_or(0) != child_epoch {
@@ -1109,6 +1170,8 @@ impl CacheState {
             let Some(id) = self.cleanup.pop_front() else {
                 break;
             };
+            self.removed.insert(id);
+            self.parents.remove(&id);
             self.dirty_set.remove(&id);
             if let Some(directory) = self.directories.remove(&id) {
                 self.retire_directory(directory);
@@ -1124,6 +1187,8 @@ impl CacheState {
                 break;
             };
             if let Some(state) = retired.rows.next() {
+                self.removed.insert(state.row.id);
+                self.parents.remove(&state.row.id);
                 if state.row.kind == NodeKind::Directory {
                     self.cleanup.push_back(state.row.id);
                 }
@@ -2530,6 +2595,138 @@ mod tests {
         finish_cache_cleanup(&mut state, &cache);
         assert!(state.retired_rows.is_empty());
         assert!(!state.is_removed(0));
+    }
+
+    #[test]
+    fn retired_id_ranges_merge_neighbors_without_overflow_or_live_gaps() {
+        let mut ids = RetiredIds::default();
+        assert!(ids.is_empty());
+        for id in [2, 4, 6, 3, 5, 1, 1, 0] {
+            ids.insert(id);
+        }
+        assert_eq!(ids.ranges, BTreeMap::from([(0, 6)]));
+        for id in 0..=6 {
+            assert!(ids.contains(&id));
+        }
+        assert!(!ids.contains(&7));
+        for id in [NodeId::MAX, NodeId::MAX - 2, NodeId::MAX - 1, NodeId::MAX] {
+            ids.insert(id);
+        }
+        assert_eq!(
+            ids.ranges,
+            BTreeMap::from([(0, 6), (NodeId::MAX - 2, NodeId::MAX)])
+        );
+        assert!(!ids.contains(&(NodeId::MAX - 3)));
+        ids.clear();
+        assert!(ids.is_empty());
+        assert!(!ids.contains(&0));
+    }
+
+    #[test]
+    fn repeated_refresh_reclaims_parent_history_and_compacts_retired_ids() {
+        const WIDTH: NodeId = 1152;
+        const ROUNDS: NodeId = 32;
+        let (mut state, cache) = cache_state();
+        for epoch in 0..ROUNDS {
+            let first = epoch * WIDTH + 1;
+            let mut rows = vec![epoch_row(None, 0, 0, u64::from(epoch), NodeKind::Directory)];
+            rows.extend(
+                (first..first + WIDTH)
+                    .map(|id| epoch_row(Some(0), id, u64::from(epoch), 0, NodeKind::File)),
+            );
+            upsert_epoch(&mut state, &cache, rows);
+            finish_cache_cleanup(&mut state, &cache);
+            assert_eq!(state.parents.len(), WIDTH as usize + 1);
+            assert_eq!(state.removed.ranges.len(), usize::from(epoch != 0));
+            assert!(state.parents.capacity() <= WIDTH as usize * 8);
+            state.publish(0, &cache);
+            assert_eq!(cache.load_full()[&0].ids.len(), WIDTH as usize);
+        }
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(
+                None,
+                0,
+                0,
+                u64::from(ROUNDS),
+                NodeKind::Directory,
+            )],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert_eq!(state.parents.len(), 1);
+        assert_eq!(state.removed.ranges, BTreeMap::from([(1, ROUNDS * WIDTH)]));
+
+        // Old known rows and never-delivered old rows cannot rebuild parent
+        // history. An old scope update must not retire the surviving root.
+        let delayed = ROUNDS * WIDTH + 1;
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(0), 1, 0, 0, NodeKind::File),
+                epoch_row(Some(0), WIDTH + 1, 1, 0, NodeKind::File),
+                epoch_row(Some(0), delayed, 0, 0, NodeKind::Directory),
+                epoch_row(None, 0, 0, 0, NodeKind::Directory),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert_eq!(state.parents.len(), 1);
+        assert_eq!(state.removed.ranges, BTreeMap::from([(1, delayed)]));
+        assert!(!state.is_removed(0));
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![epoch_row(
+                Some(0),
+                delayed + 1,
+                u64::from(ROUNDS),
+                0,
+                NodeKind::File,
+            )],
+        );
+        state.publish(0, &cache);
+        assert_eq!(cache.load_full()[&0].ids, vec![delayed + 1]);
+        assert_eq!(state.parents.len(), 2);
+    }
+
+    #[test]
+    fn pruned_ancestors_still_reject_late_children_with_newer_epoch_witnesses() {
+        let (mut state, cache) = cache_state();
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(None, 0, 0, 0, NodeKind::Directory),
+                epoch_row(Some(0), 1, 0, 0, NodeKind::Directory),
+                epoch_row(Some(1), 2, 0, 0, NodeKind::Directory),
+                epoch_row(Some(2), 3, 0, 0, NodeKind::File),
+            ],
+        );
+        state.apply(
+            CacheCommand::Remove {
+                generation: 1,
+                ids: vec![1],
+            },
+            &cache,
+        );
+        state.cleanup(&cache);
+        assert!(!state.parents.contains_key(&1));
+        assert!(state.is_removed(3));
+        upsert_epoch(
+            &mut state,
+            &cache,
+            vec![
+                epoch_row(Some(1), 4, 99, 0, NodeKind::Directory),
+                epoch_row(Some(4), 5, 99, 0, NodeKind::File),
+            ],
+        );
+        finish_cache_cleanup(&mut state, &cache);
+        assert_eq!(state.parents.len(), 1);
+        assert_eq!(state.removed.ranges, BTreeMap::from([(1, 5)]));
+        assert_eq!(state.directories.len(), 1);
+        state.publish(0, &cache);
+        assert!(cache.load_full()[&0].ids.is_empty());
     }
 
     fn filter_request(mailbox: &FilterMailbox, revision: u64, query: &str, directories_only: bool) {

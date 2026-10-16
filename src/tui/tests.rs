@@ -1142,7 +1142,6 @@ fn entry(id: NodeId, name: &str, kind: NodeKind, bytes: u64) -> crate::types::En
             apparent: bytes,
             allocated: bytes,
         },
-        hardlink_duplicate: false,
         hardlink_group: None,
         error: None,
     }
@@ -2411,6 +2410,8 @@ fn finished_frame_fixture(root: PathBuf) -> App {
         },
     );
     apply(&mut app, ScanEvent::Finished { cancelled: false });
+    // Finished schedules bounded scope-map retirement on the background phase.
+    drain_ui_removals(&mut app);
     app.started = true;
     app.baseline_finished = true;
     wait_cache(&mut app, ROOT, &[1]);
@@ -2468,6 +2469,8 @@ fn settled_frames_stop_after_scan_and_static_visual_input() {
 }
 
 fn assert_root_repairs_stay_settled(app: &mut App) {
+    // Drain only setup teardown before checking that later idle turns stay idle.
+    drain_ui_removals(app);
     assert_eq!(app.directory, ROOT);
     assert!(!app.frame_work());
     app.prioritize_requested = false;
@@ -16105,4 +16108,256 @@ fn rejected_cursor_binding_preserves_stable_intents_and_later_navigation() {
         app.visual_intents.pop_front(),
         Some(VisualIntent::ToggleCurrent)
     ));
+}
+
+fn drain_ui_removals(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.model.has_pending_removals() {
+        app.pump_model_removals();
+        assert!(Instant::now() < deadline, "model cleanup did not converge");
+    }
+}
+
+#[test]
+fn frozen_gesture_keeps_direction_after_its_origin_chunk_is_reclaimed() {
+    for origin_selected in [false, true] {
+        let mut app = navigation_fixture(1536, 1537..=1537);
+        app.visual.enter(ROOT, Some(100));
+        if origin_selected {
+            for id in [513, 1024, 1025] {
+                app.visual.select(id);
+            }
+        }
+        app.enqueue_visual(VisualIntent::Mouse(PendingMouse {
+            anchor: 513,
+            lead: 1025,
+            dragged: true,
+            released: true,
+            origin_selected,
+            mode: RangeMode::Add,
+            edge: 0,
+            view: Arc::clone(&app.view),
+            offset: 0,
+        }));
+        for id in 512..1024 {
+            app.removed(id);
+        }
+        drain_ui_removals(&mut app);
+        assert!(app.model.get_node(513).is_none());
+        finish_visual(&mut app);
+        assert!(app.visual.contains(100));
+        assert!(!app.visual.contains(513));
+        for id in [1024, 1025] {
+            assert_eq!(app.visual.contains(id), !origin_selected);
+        }
+        assert_eq!(app.visual.len(), if origin_selected { 1 } else { 3 });
+    }
+}
+
+#[test]
+fn parent_selection_advances_dead_cursor_before_reclaiming_its_sibling_links() {
+    let mut app = navigation_fixture(1536, 1537..=1537);
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    app.select_parent_contents(false);
+    app.pump_parent_selection();
+    app.pump_parent_selection();
+    assert_eq!(app.parent_selection.unwrap().cursor, Some(513));
+    let checked = app.parent_select_checks;
+    for id in 512..1024 {
+        app.removed(id);
+    }
+    app.pump_model_removals();
+    assert!(app.model.get_node(513).is_some());
+    assert_eq!(app.parent_selection.unwrap().cursor, Some(769));
+    drain_ui_removals(&mut app);
+    assert!(app.model.get_node(513).is_none());
+    assert_eq!(app.parent_select_checks - checked, 512);
+    let survivors: Vec<_> = (1..=1536).filter(|id| !(512..1024).contains(id)).collect();
+    wait_cache(&mut app, ROOT, &survivors);
+    finish_visual(&mut app);
+    assert_eq!(app.visual.len(), survivors.len());
+    assert!(survivors.iter().all(|&id| app.visual.contains(id)));
+}
+
+#[test]
+fn cleanup_repairs_nested_navigation_before_reclaiming_ancestry() {
+    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+    let mut roots = vec![entry(1, "survivor", NodeKind::Directory, 0)];
+    roots.extend((2..512).map(|id| entry(id, "filler", NodeKind::File, 1)));
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: roots,
+        },
+    );
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: 1,
+            entries: vec![entry(512, "gone", NodeKind::Directory, 0)],
+        },
+    );
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: 512,
+            entries: vec![entry(513, "inner", NodeKind::Directory, 0)],
+        },
+    );
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: 513,
+            entries: (514..1024)
+                .map(|id| entry(id, "child", NodeKind::File, 1))
+                .collect(),
+        },
+    );
+    app.directory = 513;
+    app.selected = Some(514);
+    app.visual.enter(513, Some(514));
+    // Exercise the background path, before App::removed has repaired focus.
+    let changed = app.model.remove(512);
+    app.changed(changed);
+    drain_ui_removals(&mut app);
+    assert_eq!(app.directory, 1);
+    assert_eq!(app.visual.directory(), 1);
+    assert!(!app.visual.active());
+    assert!(app.model.get_node(512).is_none());
+    assert!(app.model.get_node(513).is_none());
+    let revision = app.model.revision();
+    app.pump_model_removals();
+    assert_eq!(app.model.revision(), revision);
+    assert_eq!(app.directory, 1);
+}
+
+#[test]
+fn reclaimed_targets_keep_full_failure_paths_without_retargeting_parent_metadata() {
+    for target_removed in [false, true] {
+        let mut app = navigation_fixture(1536, 1537..=1537);
+        for id in 512..1024 {
+            app.removed(id);
+        }
+        drain_ui_removals(&mut app);
+        assert!(app.model.get_node(513).is_none());
+        let total = app.size(ROOT);
+        let relative = PathBuf::from("old-parent/old-target");
+        let target = app.report_root.join(&relative);
+        app.deletion_finished(
+            513,
+            delete::DeleteResult {
+                relative,
+                target_removed,
+                outcome: Err(io::Error::other("late removal failure")),
+                errors: Vec::new(),
+                progress: delete::DeleteProgress::default(),
+                parent_metadata: Some(delete::ParentMetadata {
+                    relative: PathBuf::from("old-parent"),
+                    sizes: crate::types::Sizes {
+                        apparent: 999999,
+                        allocated: 999999,
+                    },
+                }),
+                metadata_error: Some("late parent metadata failure".to_owned()),
+            },
+        );
+        let report = app.delete_notices.back().unwrap();
+        assert_eq!(report.target, printable(target.as_os_str()));
+        assert_eq!(report.errors[0].path, target);
+        assert_eq!(app.size(ROOT), total);
+        assert_eq!(app.model.node(ROOT).error_count, 0);
+        // The ordering feed may still be behind the now-reclaimed stable IDs.
+        app.next_new = 512;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.next_new < app.model.len() {
+            app.pump_order();
+            assert!(
+                Instant::now() < deadline,
+                "structural feed did not converge"
+            );
+        }
+    }
+}
+
+#[test]
+fn sparse_order_feed_skips_retired_refresh_chunks_and_preserves_current_rows() {
+    let mut app = App::new(PathBuf::from("fixture"), SizeMode::Allocated).unwrap();
+    // Keep admission behind several complete refresh generations. Only the
+    // root's partial chunk and the final three children should retain payloads.
+    for generation in 0..=8 {
+        if generation != 0 {
+            let changed = app.model.begin_rescan(ROOT, generation);
+            app.changed(changed);
+        }
+        let count = if generation == 8 { 3 } else { 1024 };
+        for event in [
+            ScanEvent::RootInfo {
+                file_identity: None,
+                kind: NodeKind::Directory,
+                sizes: crate::types::Sizes::default(),
+                error: None,
+            },
+            ScanEvent::Entries {
+                parent: ROOT,
+                entries: (1..=count)
+                    .map(|id| entry(id, &format!("entry-{id:04}"), NodeKind::File, 1))
+                    .collect(),
+            },
+            ScanEvent::DirectoryDone {
+                id: ROOT,
+                error: None,
+            },
+            ScanEvent::Finished { cancelled: false },
+        ] {
+            let changed = app.model.apply_scoped(ROOT, generation, event);
+            app.changed(changed);
+        }
+        drain_ui_removals(&mut app);
+    }
+    assert!(app.model.get_node(512).is_none());
+    assert!(app.model.get_node(4096).is_none());
+    assert_eq!(app.model.child_count(ROOT), 3);
+    let expected: Vec<_> = ((app.model.len() - 3)..app.model.len())
+        .map(|id| id as NodeId)
+        .collect();
+    assert_eq!(app.next_new, 0);
+    app.order_feed_checks = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.next_new < app.model.len() || !app.unsent.is_empty() {
+        app.pump_order();
+        assert!(
+            Instant::now() < deadline,
+            "sparse structural feed did not converge"
+        );
+    }
+    wait_cache(&mut app, ROOT, &expected);
+    assert!(
+        app.order_feed_checks < 1024,
+        "structural work must follow retained chunks, not every historical ID"
+    );
+    assert_eq!(app.next_new, app.model.len());
+
+    // A later overflow replay may start inside the same absent history. It
+    // must reach live rows while remaining inside the admitted prefix.
+    let prefix = app.next_new;
+    let checked = app.order_feed_checks;
+    app.replay_cursor = Some(512);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.replay_cursor.is_some() || !app.unsent.is_empty() {
+        app.pump_order();
+        assert!(Instant::now() < deadline, "sparse replay did not converge");
+    }
+    wait_cache(&mut app, ROOT, &expected);
+    assert_eq!(app.next_new, prefix);
+    assert!(
+        app.order_feed_checks - checked <= 8,
+        "replay must skip absent chunks without revisiting their historical IDs"
+    );
 }
