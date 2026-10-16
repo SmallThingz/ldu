@@ -1,0 +1,174 @@
+name: Native macOS qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Native ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            machine: x86_64
+            python_arch: x64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            machine: arm64
+            python_arch: arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      CARGO_TERM_COLOR: always
+      LDU_TARGET: ${{ matrix.target }}
+      LDU_NATIVE_MACHINE: ${{ matrix.machine }}
+
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Verify native runner and install Rust 1.99.0
+        timeout-minutes: 10
+        run: |
+          python3 - <<'PY'
+          import os, platform, subprocess, sys
+          assert sys.version_info >= (3, 11)
+          assert platform.system() == "Darwin"
+          assert platform.machine() == os.environ["LDU_NATIVE_MACHINE"]
+          translated = subprocess.run(["sysctl", "-in", "sysctl.proc_translated"],
+                                      capture_output=True, text=True, timeout=10)
+          assert translated.stdout.strip() != "1", "Rosetta execution is not native qualification"
+          assert os.geteuid() != 0, "Permission regressions require an unprivileged runner"
+          print(platform.platform(), sys.version, flush=True)
+          PY
+          printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain 1.99.0 "$LDU_TARGET"
+          rustc +1.99.0 -Vv
+          test "$(rustc +1.99.0 -Vv | sed -n 's/^host: //p')" = "$LDU_TARGET"
+
+      - name: Record source identity
+        id: identity
+        timeout-minutes: 2
+        run: |
+          mkdir -p .tmp/native-macos
+          cat > .tmp/native-macos/identity.py <<'PY'
+          import hashlib, json, os, subprocess, sys
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(["git", *args], timeout=30)
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          def source():
+              head = git("rev-parse", "HEAD").decode().strip()
+              assert head == os.environ["GITHUB_SHA"]
+              assert not git("status", "--porcelain", "--untracked-files=all")
+              files = []
+              for name in sorted(set(git("ls-files", "-co", "--exclude-standard", "-z").decode().split("\0")) - {""}):
+                  path = Path(name)
+                  files.append({"path": name, "symlink": os.readlink(path)} if path.is_symlink()
+                               else {"path": name, "sha256": digest(path),
+                                     "executable": bool(path.stat().st_mode & 0o111)})
+              encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+              return {"head": head, "inventory_sha256": hashlib.sha256(encoded).hexdigest(), "files": files}
+          current = source()
+          stored = Path(".tmp/native-macos/source.json")
+          if sys.argv[1] == "record":
+              with stored.open("x") as output:
+                  json.dump(current, output, sort_keys=True)
+          else:
+              assert current == json.loads(stored.read_text()), "Source changed during qualification"
+              artifact = Path(".tmp/native-macos/artifact.json")
+              if artifact.exists():
+                  expected = json.loads(artifact.read_text())
+                  assert digest(Path(expected["binary"])) == expected["sha256"], "Packaged binary changed"
+                  print("FINAL_BINARY " + json.dumps(expected, sort_keys=True), flush=True)
+          print("SOURCE_IDENTITY " + json.dumps({key: value for key, value in current.items() if key != "files"}, sort_keys=True), flush=True)
+          PY
+          python3 .tmp/native-macos/identity.py record
+
+      - name: Check formatting and workspace tests
+        timeout-minutes: 20
+        run: |
+          cargo +1.99.0 fmt --all -- --check
+          cargo +1.99.0 test --locked --workspace --target "$LDU_TARGET"
+
+      - name: Check Clippy
+        timeout-minutes: 15
+        run: cargo +1.99.0 clippy --locked --no-deps -p ldu --all-targets --target "$LDU_TARGET" -- -D warnings
+
+      - name: Build, sign and package the native release binary
+        timeout-minutes: 30
+        run: |
+          ldu_notices_dir=$(mktemp -d .tmp/native-macos/notices.XXXXXXXX)
+          python3 scripts/release.py notices --target "$LDU_TARGET" --output "$ldu_notices_dir/notices.zip"
+          cargo +1.99.0 rustc --locked --release --bin ldu --target "$LDU_TARGET" -- \
+            -C "link-arg=-Wl,-sectcreate,__TEXT,__ldu_notices,$ldu_notices_dir/notices.zip"
+          codesign --force --sign - "target/$LDU_TARGET/release/ldu"
+          codesign --verify --strict "target/$LDU_TARGET/release/ldu"
+          python3 scripts/release.py package --target "$LDU_TARGET" --output .tmp/native-macos/bin
+          python3 - <<'PY'
+          import hashlib, json, os, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          binary = Path(f'.tmp/native-macos/bin/ldu-v{version}-{os.environ["LDU_TARGET"]}').resolve()
+          record = {"binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    "target": os.environ["LDU_TARGET"], "source_commit": os.environ["GITHUB_SHA"]}
+          Path(".tmp/native-macos/artifact.json").write_text(json.dumps(record, sort_keys=True))
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"LDU_TEST_BIN={binary}\n")
+          print("PACKAGED_BINARY " + json.dumps(record, sort_keys=True), flush=True)
+          PY
+          python3 .tmp/native-macos/identity.py verify
+
+      - name: Smoke-test the exact packaged binary
+        timeout-minutes: 10
+        run: |
+          python3 .tmp/native-macos/identity.py verify
+          python3 scripts/release.py smoke --target "$LDU_TARGET" --binary "$LDU_TEST_BIN"
+          python3 .tmp/native-macos/identity.py verify
+
+      - name: Run full PTY qualification on the packaged binary
+        timeout-minutes: 15
+        run: |
+          python3 .tmp/native-macos/identity.py verify
+          python3 scripts/check_pty.py --binary "$LDU_TEST_BIN" --threads 2
+          python3 .tmp/native-macos/identity.py verify
+
+      - name: Run filesystem integration with packaged CLI invocations
+        timeout-minutes: 15
+        # LDU_TEST_BIN selects the packaged executable for CLI cases; API cases
+        # exercise the test library built from the same frozen source.
+        run: |
+          python3 .tmp/native-macos/identity.py verify
+          cargo +1.99.0 test --locked --test filesystem --target "$LDU_TARGET"
+          python3 .tmp/native-macos/identity.py verify
+
+      - name: Verify source and packaged identity after all checks
+        if: always() && steps.identity.outcome == 'success'
+        timeout-minutes: 2
+        run: python3 .tmp/native-macos/identity.py verify
