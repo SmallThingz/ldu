@@ -829,7 +829,7 @@ mod atomic {
 mod streaming {
     use super::{FileIdentity, check_root, preflight_root};
     use std::{
-        fs::{self, File, Metadata, OpenOptions},
+        fs::{File, Metadata, OpenOptions},
         io::{self, Write},
         path::{Path, PathBuf},
     };
