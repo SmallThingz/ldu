@@ -1,3 +1,5 @@
+mod output;
+
 use clap::Parser;
 use ldu::{
     backend::Backend,
@@ -8,9 +10,9 @@ use ldu::{
     types::{ROOT, SizeMode},
 };
 use std::{
-    fs::{self, File, Metadata, OpenOptions},
+    fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 #[derive(Parser)]
@@ -127,7 +129,7 @@ fn run(args: Args) -> io::Result<bool> {
     };
     // Only file output needs this identity snapshot. The file is opened after
     // scanning so a newly created export does not scan its own growing bytes.
-    let root_metadata = (output != Path::new("-"))
+    let root_metadata = (output.as_os_str() != "-")
         .then(|| fs::metadata(&root).ok())
         .flatten();
     let mut model = Model::new(root.clone());
@@ -137,70 +139,14 @@ fn run(args: Args) -> io::Result<bool> {
     }
     let node = model.node(ROOT);
     let failed = node.error_count != 0 || model.cancelled || !model.finished;
-    if output == Path::new("-") {
+    if output.as_os_str() == "-" {
         ldu::export::write_ncdu(&model, &root, io::stdout().lock())?;
     } else {
-        let file = create_export(&output, &root, root_metadata.as_ref())?;
-        ldu::export::write_ncdu(&model, &root, file)?;
+        output::write_file(&output, &root, root_metadata.as_ref(), |file| {
+            ldu::export::write_ncdu(&model, &root, file)
+        })?;
     }
     Ok(failed)
-}
-
-// Resolve existing aliases and also compare destinations whose leaf is absent.
-fn destination(path: &Path) -> io::Result<PathBuf> {
-    path.canonicalize().or_else(|_| {
-        let absolute = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        match (absolute.parent(), absolute.file_name()) {
-            (Some(parent), Some(name)) => Ok(parent.canonicalize()?.join(name)),
-            _ => Ok(absolute),
-        }
-    })
-}
-
-#[cfg(unix)]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file(_: &Metadata, _: &Metadata) -> bool {
-    false
-}
-
-fn create_export(output: &Path, root: &Path, initial: Option<&Metadata>) -> io::Result<File> {
-    let refused = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "export file must not replace the scan root",
-        )
-    };
-    if let (Ok(output), Ok(root)) = (destination(output), destination(root))
-        && output == root
-    {
-        return Err(refused());
-    }
-    // Check the opened file before truncating it: pathname-only checks miss
-    // hardlinks, and following an output symlink must not truncate the root.
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(output)?;
-    let metadata = file.metadata()?;
-    if initial.is_some_and(|root| same_file(&metadata, root))
-        || fs::metadata(root).is_ok_and(|root| same_file(&metadata, &root))
-    {
-        return Err(refused());
-    }
-    if metadata.is_file() {
-        file.set_len(0)?;
-    }
-    Ok(file)
 }
 
 fn main() {
@@ -219,14 +165,7 @@ fn main() {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
-
-    #[cfg(unix)]
-    #[test]
-    fn export_accepts_a_writable_device_without_truncating_it() {
-        let root = Path::new("/");
-        let file = create_export(Path::new("/dev/null"), root, None).unwrap();
-        ldu::export::write_ncdu(&Model::new(root.into()), root, file).unwrap();
-    }
+    use std::path::Path;
 
     #[test]
     fn ncdu_export_flags_and_thread_aliases_parse() {

@@ -36,7 +36,9 @@ Hidden entries are visible initially. Hiding dotfiles changes the listing, not t
 
 The export uses ncdu’s version 1.2 JSON format and can be opened with `ncdu -f`. It contains the full scanned hierarchy and each entry’s counted sizes; hardlink aliases already excluded from LDU’s totals carry zero bytes. LDU does not export inode or device metadata. Non-UTF-8 names use replacement characters, as in the earlier JSON output. Incomplete entries have `read_error: true`, and an incomplete scan returns a nonzero exit status.
 
-JSON includes both apparent and allocated sizes. A file or symlink root is wrapped in a parent-directory record with zero sizes. Export exit status is 0 for a completed scan, 2 for scan errors, cancellation or an incomplete scan, and 1 for setup or output failure. Non-UTF-8 names remain intact internally. Run `ldu --help` for the complete command syntax.
+On Linux, ordinary export files are replaced after the new JSON is fully written and synced. Output symlinks retain their link and update the resolved target; other hardlink aliases keep the previous contents. Replacement requires a writable parent directory and permission to preserve the existing owner and access policy. Errors before replacement preserve an existing export. An interrupted process can leave a hidden `.ldu-export-*` temporary file. Devices, pipes and descriptor endpoints receive streaming output. Other platforms retain opened-file streaming output; a write failure can leave a partial export.
+
+JSON includes both apparent and allocated sizes. A file or symlink root is wrapped in a parent-directory record with zero sizes. Export exit status is 0 for a completed scan, 2 for scan errors, internal scan cancellation or an incomplete scan, and 1 for setup or output failure. Process signals retain the shell’s usual termination status, such as 130 for SIGINT. Non-UTF-8 names remain intact internally. Run `ldu --help` for the complete command syntax.
 
 ## Configuration
 

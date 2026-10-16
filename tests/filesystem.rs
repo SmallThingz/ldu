@@ -685,6 +685,62 @@ fn export_file_matches_stdout_and_does_not_write_json_to_stdout() {
 }
 
 #[test]
+fn only_an_exact_dash_export_argument_selects_stdout() {
+    let work = fixture();
+    let directory = fs::canonicalize(work.path()).unwrap();
+    let root = directory.join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("leaf"), b"payload").unwrap();
+    // Resolve any test binary override before changing the child working directory.
+    let original = ldu_command();
+    let binary = std::path::absolute(Path::new(original.get_program())).unwrap();
+    let dash_file = directory.join("-");
+    for existing in [false, true] {
+        if existing {
+            fs::write(&dash_file, b"preserve this file").unwrap();
+        }
+        for argument in ["--output=-/", "--output=-/."] {
+            let result = Command::new(&binary)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("HOME")
+                .current_dir(&directory)
+                .args(["-0", "--threads", "2", argument])
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert!(!result.status.success(), "accepted {argument}");
+            assert!(result.stdout.is_empty(), "treated {argument} as stdout");
+            if existing {
+                assert_eq!(fs::read(&dash_file).unwrap(), b"preserve this file");
+            } else {
+                assert!(!dash_file.exists(), "created a file for {argument}");
+            }
+        }
+    }
+    let result = Command::new(binary)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .current_dir(&directory)
+        .args(["-0", "--threads", "2", "--output=./-"])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(dash_file).unwrap()).unwrap();
+    assert!(
+        ncdu_records(&document[3])
+            .iter()
+            .any(|record| record["name"] == "leaf")
+    );
+}
+
+#[test]
 fn export_output_cannot_truncate_the_input_file_or_its_aliases() {
     let work = fixture();
     let input = work.path().join("input");
@@ -1043,4 +1099,54 @@ fn config_errors_preserve_exports_and_do_not_block_help_or_version() {
             .iter()
             .any(|record| record["name"] == "leaf")
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn headless_export_accepts_its_first_temporary_candidate_as_the_output_name() {
+    let work = fixture();
+    let root = work.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("leaf"), b"payload").unwrap();
+    // A new process starts the temporary counter at zero. exec retains the
+    // shell PID, so this exercises the candidate collision deterministically.
+    let result = std::process::Command::new("sh")
+        .args([
+            "-c",
+            r#"exec "$1" -0 --threads 2 --backend native -o "$2/.ldu-export-$$-0" "$3""#,
+            "ldu-export-fixture",
+        ])
+        .arg(env!("CARGO_BIN_EXE_ldu"))
+        .arg(work.path())
+        .arg(&root)
+        .env(
+            "XDG_CONFIG_HOME",
+            std::env::current_dir()
+                .unwrap()
+                .join(work.path())
+                .join("config"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let outputs = fs::read_dir(work.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".ldu-export-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 1);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&outputs[0]).unwrap()).unwrap();
+    assert_eq!(document[0], 1);
+    assert_eq!(document[1], 2);
+    assert_eq!(document[3][1]["name"], "leaf");
 }
