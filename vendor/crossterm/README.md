@@ -13,6 +13,10 @@ Unix terminal-size queries return the existing ioctl result, including errors.
 They never launch `tput`, so redraws and shutdown cannot wait for an external
 size helper.
 
+ANSI color commands emit no bytes when `NO_COLOR` disables color output.
+This preserves bold and other text attributes; explicit `ResetColor` still
+resets the style.
+
 All library sources, unit tests and doctests are retained. Examples and their
 async runtimes are omitted; only library-test dependencies remain. Existing
 upstream ignored tests are unchanged. `cargo test --workspace` includes this

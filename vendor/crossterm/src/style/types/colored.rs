@@ -363,4 +363,62 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn test_color_commands_preserve_noncolor_attributes_when_disabled() {
+        use crate::{
+            style::{Attribute, Colors, ResetColor, SetAttribute, SetBackgroundColor, SetColors,
+                SetForegroundColor, SetUnderlineColor},
+            Command,
+        };
+        use std::fmt;
+
+        struct RejectWrites;
+        impl fmt::Write for RejectWrites {
+            fn write_str(&mut self, _: &str) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+
+        fn check(command: impl Command, enabled: &str) {
+            Colored::set_ansi_color_disabled(true);
+            let mut output = String::new();
+            SetAttribute(Attribute::Bold).write_ansi(&mut output).unwrap();
+            command.write_ansi(&mut output).unwrap();
+            SetAttribute(Attribute::Underlined).write_ansi(&mut output).unwrap();
+            assert_eq!(output, "\x1b[1m\x1b[4m");
+            assert!(command.write_ansi(&mut RejectWrites).is_ok());
+
+            Colored::set_ansi_color_disabled(false);
+            output.clear();
+            command.write_ansi(&mut output).unwrap();
+            assert_eq!(output, enabled);
+            assert_eq!(command.write_ansi(&mut RejectWrites).is_ok(), enabled.is_empty());
+        }
+
+        let _guard = color_test_guard();
+        for (color, foreground, background, underline) in [
+            (Color::Red, "\x1b[38;5;9m", "\x1b[48;5;9m", "\x1b[58;5;9m"),
+            (Color::Rgb { r: 1, g: 2, b: 3 }, "\x1b[38;2;1;2;3m",
+                "\x1b[48;2;1;2;3m", "\x1b[58;2;1;2;3m"),
+            (Color::Reset, "\x1b[39m", "\x1b[49m", "\x1b[59m"),
+        ] {
+            check(SetForegroundColor(color), foreground);
+            check(SetBackgroundColor(color), background);
+            check(SetUnderlineColor(color), underline);
+        }
+        for (colors, enabled) in [
+            (Colors::new(Color::Red, Color::Blue), "\x1b[38;5;9;48;5;12m"),
+            (Colors::new(Color::Reset, Color::Reset), "\x1b[39;49m"),
+            (Colors { foreground: Some(Color::Red), background: None }, "\x1b[38;5;9m"),
+            (Colors { foreground: None, background: Some(Color::Blue) }, "\x1b[48;5;12m"),
+            (Colors { foreground: None, background: None }, ""),
+        ] {
+            check(SetColors(colors), enabled);
+        }
+        Colored::set_ansi_color_disabled(true);
+        let mut reset = String::new();
+        ResetColor.write_ansi(&mut reset).unwrap();
+        assert_eq!(reset, "\x1b[0m", "explicit reset remains an explicit command");
+    }
 }

@@ -21,6 +21,7 @@
     "Serialize color-state unit tests, restore memoized state and NO_COLOR after each test, and exercise the background-color roundtrip constructor.",
     "Write ANSI attribute parameters directly to the existing formatter while preserving the public sgr() String API; test every attribute and sink-error boundary.",
     "Resolve a standalone Escape retained at a full Unix TTY read boundary only after a successful empty-input probe; preserve queued events and available continuations, with source-reader regressions.",
-    "Propagate Unix terminal-size ioctl errors instead of launching synchronous tput helpers; remove the obsolete resize-reader comments."
+    "Propagate Unix terminal-size ioctl errors instead of launching synchronous tput helpers; remove the obsolete resize-reader comments.",
+    "Suppress complete ANSI color commands when NO_COLOR disables colors so non-color attributes survive; preserve explicit resets and test enabled/disabled output and sink errors."
   ]
 }
