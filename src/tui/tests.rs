@@ -479,9 +479,9 @@ fn guarded_delete_discards_early_confirmation_before_or_after_capture_arrives() 
                         ..
                     })
                 ));
-                assert!(!app.expire_delete_guard(until - Duration::from_millis(1)));
-                assert!(app.expire_delete_guard(until));
-                assert!(!app.expire_delete_guard(until));
+                assert!(!app.expire_delete_guard(until - Duration::from_millis(1), false));
+                assert!(app.expire_delete_guard(until, false));
+                assert!(!app.expire_delete_guard(until, false));
                 assert!(app.delete_guard_deadline().is_none());
                 if !capture_before_expiry {
                     sender.send(Ok(test_confirmed_target())).unwrap();
@@ -516,7 +516,7 @@ fn expired_hover_guard_keeps_fresh_confirmation_while_capture_finishes() {
         None,
         false,
     );
-    assert!(app.expire_delete_guard(until));
+    assert!(app.expire_delete_guard(until, false));
     terminal
         .draw(|frame| app.draw(frame, false, false))
         .unwrap();
@@ -630,7 +630,7 @@ fn quit_question_keeps_guard_with_target_without_blocking_quit_or_retaining_ente
                 ),
                 Action::Continue
             ));
-            assert!(app.expire_delete_guard(until));
+            assert!(app.expire_delete_guard(until, false));
             assert!(matches!(app.take_ready_confirmation(), Action::Continue));
             terminal
                 .draw(|frame| app.draw(frame, false, false))
@@ -894,7 +894,7 @@ fn guarded_warning_tints_blank_cells_and_popup_and_can_be_suppressed() {
                 app.theme.warning_dialog_background
             );
         }
-        assert!(app.expire_delete_guard(until));
+        assert!(app.expire_delete_guard(until, false));
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -956,7 +956,7 @@ fn mouse_press_during_guard_cannot_confirm_when_released_after_expiry() {
         // Locate the eventual affirmative choice, then also exercise a stale
         // hitbox whose guarded frame has not been painted yet.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
-        app.expire_delete_guard(until);
+        app.expire_delete_guard(until, false);
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -982,7 +982,7 @@ fn mouse_press_during_guard_cannot_confirm_when_released_after_expiry() {
             app.modal_option_mouse(down, false),
             Some(Action::Delete(..))
         ));
-        assert!(app.expire_delete_guard(until));
+        assert!(app.expire_delete_guard(until, false));
         terminal
             .draw(|frame| app.draw(frame, false, false))
             .unwrap();
@@ -15510,7 +15510,7 @@ fn expired_hover_warning_survives_suspended_quit_confirmation() {
     let until = Instant::now() + Duration::from_secs(60);
     let _sender = guarded_delete_capture(&mut app, until);
     app.request_quit_confirmation();
-    assert!(!app.expire_delete_guard(until));
+    assert!(!app.expire_delete_guard(until, false));
     assert!(app.delete_guard_deadline().is_none());
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
     assert!(matches!(
@@ -15558,7 +15558,7 @@ fn deferred_hover_warning_survives_expiry_before_identity_capture_starts() {
         false,
     );
     let until = app.delete_guard_deadline().unwrap();
-    assert!(app.expire_delete_guard(until));
+    assert!(app.expire_delete_guard(until, false));
     let request = app.deferred_delete.as_ref().unwrap();
     assert!(request.guard_until.is_none() && request.mouse_guarded);
     busy.store(true, Ordering::Release);
@@ -15600,7 +15600,7 @@ fn hover_warning_explains_tint_controls_with_wrapped_target_and_pinned_choices()
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
         for expired in [false, true] {
             if expired {
-                assert!(app.expire_delete_guard(until));
+                assert!(app.expire_delete_guard(until, false));
             }
             terminal
                 .draw(|frame| app.draw(frame, false, false))
@@ -16360,4 +16360,137 @@ fn sparse_order_feed_skips_retired_refresh_chunks_and_preserves_current_rows() {
         app.order_feed_checks - checked <= 8,
         "replay must skip absent chunks without revisiting their historical IDs"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn elapsed_hover_guard_discards_buffered_confirmation_until_input_drains() {
+    for capture_ready in [false, true] {
+        for code in [KeyCode::Enter, KeyCode::Char('y')] {
+            let mut app = browser_fixture();
+            let until = Instant::now() - Duration::from_millis(1);
+            let sender = guarded_delete_capture(&mut app, until);
+            if capture_ready {
+                sender.send(Ok(test_confirmed_target())).unwrap();
+                app.pump_confirmation();
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(rendered(&terminal).contains("Please wait"));
+            assert!(
+                !app.dialog_mouse
+                    .options
+                    .iter()
+                    .flatten()
+                    .any(|option| option.key.code == KeyCode::Enter)
+            );
+            // More than one admission batch must remain locked, even though the
+            // wall-clock deadline elapsed before these inputs were handled.
+            for _ in 0..257 {
+                assert!(!app.expire_delete_guard(Instant::now(), true));
+                assert!(matches!(
+                    app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false),
+                    Action::Continue
+                ));
+                assert!(!app.confirmation_ready());
+                assert!(matches!(
+                    app.modal,
+                    Some(Modal::Delete {
+                        confirm_requested: false,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(app.delete_guard_deadline(), Some(until));
+            assert!(app.expire_delete_guard(Instant::now(), false));
+            assert!(app.delete_guard_deadline().is_none());
+            if !capture_ready {
+                sender.send(Ok(test_confirmed_target())).unwrap();
+                app.pump_confirmation();
+            }
+            // A capture result delivered only after unlock must not replay an
+            // early confirmation that was hidden behind pending identity work.
+            assert!(matches!(app.take_ready_confirmation(), Action::Continue));
+            terminal
+                .draw(|frame| app.draw(frame, false, false))
+                .unwrap();
+            assert!(!rendered(&terminal).contains("Please wait"));
+            assert!(matches!(
+                app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false),
+                Action::Delete(2, _, _, _)
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn elapsed_hover_guard_does_not_delay_cancellation() {
+    for code in [KeyCode::Esc, KeyCode::Char('n')] {
+        let mut app = browser_fixture();
+        let until = Instant::now() - Duration::from_millis(1);
+        let _sender = guarded_delete_capture(&mut app, until);
+        assert!(!app.expire_delete_guard(Instant::now(), true));
+        assert!(matches!(
+            app.key(KeyEvent::new(code, KeyModifiers::NONE), None, false),
+            Action::Continue
+        ));
+        assert!(app.modal.is_none());
+        assert!(app.deferred_delete.is_none());
+        assert!(app.delete_guard_deadline().is_none());
+    }
+    let mut app = browser_fixture();
+    let _sender = guarded_delete_capture(&mut app, Instant::now() - Duration::from_millis(1));
+    assert!(!app.expire_delete_guard(Instant::now(), true));
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            None,
+            false
+        ),
+        Action::Quit
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_delayed_capture_retains_elapsed_hover_guard_until_input_drains() {
+    let fixture = filesystem_fixture();
+    std::fs::write(fixture.path().join("root-file"), b"target").unwrap();
+    let mut app = browser_fixture_at(fixture.path().to_path_buf());
+    let until = Instant::now() - Duration::from_millis(1);
+    app.deferred_delete = Some(DeleteRequest {
+        id: 2,
+        anchor: Arc::new(RootAnchor::open(fixture.path()).unwrap()),
+        relative: PathBuf::from("root-file"),
+        target: printable(fixture.path().join("root-file").as_os_str()),
+        guard_until: Some(until),
+        mouse_guarded: true,
+    });
+    assert_eq!(app.delete_guard_deadline(), Some(until));
+    assert!(!app.expire_delete_guard(Instant::now(), true));
+    app.pump_confirmation();
+    assert!(app.deferred_delete.is_none());
+    assert_eq!(app.delete_guard_deadline(), Some(until));
+    assert!(matches!(
+        app.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            false
+        ),
+        Action::Continue
+    ));
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Delete {
+            confirm_requested: false,
+            ..
+        })
+    ));
+    assert!(app.expire_delete_guard(Instant::now(), false));
+    assert!(app.delete_guard_deadline().is_none());
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
+    assert!(app.modal.is_none());
 }

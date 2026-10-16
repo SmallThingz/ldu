@@ -1994,6 +1994,103 @@ def check_owned_special_previews(binary, work, threads):
     return result
 
 
+def check_owned_buffered_mouse_guard(binary, work, threads):
+    """An early confirmation stays early when the owned child stalls past expiry."""
+    root = work / "buffered-hover-guard"
+    root.mkdir()
+    names = ["alpha", "beta"]
+    for name in names:
+        (root / name).write_bytes(b"buffered guard fixture")
+    hold_ms = 2000
+    session = Session(binary, root, threads, extra_args=[
+        "--mouse-debounce-ms", "60000",
+        "--mouse-debounce-delay-ms", str(hold_ms),
+        "--mouse-debounce-warning=false",
+    ])
+    try:
+        session.resize(28, 160)
+        session.wait(lambda: path_in_header(session.screen, root),
+                     "buffered guard fixture scan did not finish")
+        pause_empty_queue(session)
+        fixture_selection(session, "alpha")
+        beta_row = next(row for row in range(session.screen.first_entry_row(), session.screen.rows)
+                        if session.screen.main_line(row).rstrip().endswith(" beta"))
+        session.key(f"\x1b[<35;35;{beta_row + 1}M".encode())
+        session.wait(lambda: session.screen.selected_row() == beta_row,
+                     "buffered guard hover did not change the target")
+        opened_at = time.monotonic()
+        session.key(b"d")
+        session.wait(lambda: session.screen.has_modal_title("Delete?")
+                     and "Please wait" in session.screen.words(),
+                     "buffered guard setup did not observe the locked dialog", timeout=5)
+        observed_at = time.monotonic()
+        keys = b"\ry\r"
+        with stopped_child(session):
+            assert queued_input_bytes(session) == 0, "buffered guard setup retained earlier input"
+            session.key(keys)
+            queued_at = time.monotonic()
+            # Guard creation follows the d write. This proves these keys were
+            # queued before even the earliest possible deadline, rather than
+            # silently testing a fresh confirmation on a slow host.
+            assert queued_at < opened_at + hold_ms / 1000, (
+                "buffered guard setup missed its early-input window",
+                {"open_to_observed_ms": (observed_at - opened_at) * 1000,
+                 "open_to_queued_ms": (queued_at - opened_at) * 1000,
+                 "hold_ms": hold_ms},
+            )
+            session.wait(lambda: queued_input_bytes(session) == len(keys),
+                         "early confirmation burst did not reach the stopped child's PTY")
+            # The first locked paint follows guard creation. Holding the child
+            # until this later bound passes guarantees expiry before it can
+            # read the early keys, just as a stalled terminal paint can do.
+            expired_at = observed_at + hold_ms / 1000
+            session.wait(lambda: time.monotonic() >= expired_at,
+                         "controlled guard stall did not cross its deadline",
+                         timeout=hold_ms / 1000 + 5)
+            assert queued_input_bytes(session) == len(keys), "stopped child consumed early input"
+
+        unlocked = lambda: (session.screen.has_modal_title("Delete?")
+                            and "Please wait" not in session.screen.words()
+                            and "Yes · Enter" in session.screen.words()
+                            and "Cancel · Esc" in session.screen.words())
+        session.wait(lambda: unlocked() or any(deletion_marks(session, names).values()),
+                     "buffered guard did not settle after the controlled stall")
+        assert unlocked(), "early buffered confirmation was accepted after the guard deadline"
+        assert queued_input_bytes(session) == 0, "guard unlocked before draining early input"
+        assert deletion_marks(session, names) == dict.fromkeys(names, False), \
+            "early buffered confirmation entered the paused queue"
+        assert all((root / name).is_file() for name in names), \
+            "early buffered confirmation removed an owned file"
+        # Pending identity capture can briefly paint an unlocked dialog before
+        # a wrongly retained early confirmation dispatches. Send no fresh input
+        # during this observation; the state-level regression also holds and
+        # releases capture explicitly, without relying on this time interval.
+        observation_deadline = time.monotonic() + 2
+        while time.monotonic() < observation_deadline:
+            session.pump(min(0.1, max(0, observation_deadline - time.monotonic())))
+            assert session.child.poll() is None, "buffered guard exited during observation"
+            assert unlocked() and not any(deletion_marks(session, names).values()), \
+                "early confirmation was retained until identity capture completed"
+            assert all((root / name).is_file() for name in names), \
+                "early confirmation removed a file without fresh input"
+        session.key(b"\r")
+        session.wait(lambda: session.screen.normal_view()
+                     and deletion_marks(session, names) == {"alpha": False, "beta": True},
+                     "fresh confirmation after the guard fence did not enqueue beta")
+        open_queue(session, ["beta"])
+        assert "Resume · Space" in session.screen.words(), "guard fence changed queue pause"
+        session.key(b" ")
+        session.wait(lambda: not (root / "beta").exists() and not queue_paths(session),
+                     "freshly confirmed buffered-guard target did not finish")
+        assert (root / "alpha").is_file(), "guard fence changed the intended target"
+        close_queue(session)
+        elapsed = session.finish(key=b"q")
+        return {"case": "buffered-mouse-guard-expiry", "first_frame_ms": session.first_frame_ms,
+                "quit_ms": elapsed, "input": [], "controlled_hold_ms": hold_ms}
+    finally:
+        session.close()
+
+
 def check_owned_mouse_guard(binary, work, threads):
     metrics = []
     warning = "Mouse hover changed selection just before delete."
@@ -4466,6 +4563,7 @@ def main():
             metrics.extend(check_owned_helper_shutdown(args.binary, Path(work), args.threads))
             metrics.append(check_owned_special_previews(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_mouse_guard(args.binary, Path(work), args.threads))
+            metrics.append(check_owned_buffered_mouse_guard(args.binary, Path(work), args.threads))
             metrics.append(check_owned_mouse_navigation(args.binary, Path(work), args.threads))
             metrics.append(check_owned_mouse_header(args.binary, Path(work), args.threads))
             metrics.append(check_owned_parent_row(args.binary, Path(work), args.threads))

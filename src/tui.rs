@@ -219,6 +219,7 @@ enum Modal {
         confirm_requested: bool,
         confirmed: Option<ConfirmedTarget>,
         capture: Option<Receiver<io::Result<ConfirmedTarget>>>,
+        // Earliest unlock time; keep the guard until buffered terminal input drains.
         guard_until: Option<Instant>,
         mouse_guarded: bool,
     },
@@ -2504,10 +2505,21 @@ impl App {
                 Modal::Delete { guard_until, .. } => *guard_until,
                 _ => None,
             })
+            .chain(
+                self.deferred_delete
+                    .as_ref()
+                    .and_then(|request| request.guard_until),
+            )
             .min()
     }
 
-    fn expire_delete_guard(&mut self, now: Instant) -> bool {
+    fn expire_delete_guard(&mut self, now: Instant, input_ready: bool) -> bool {
+        // A slow paint or suspended process can leave early confirmation in
+        // crossterm's parser after the deadline. Route that input while locked;
+        // only an empty terminal-input boundary permits a fresh confirmation.
+        if input_ready {
+            return false;
+        }
         if let Some(request) = self.deferred_delete.as_mut()
             && request.guard_until.is_some_and(|deadline| now >= deadline)
         {
@@ -2813,7 +2825,7 @@ impl App {
                     guard_until,
                     mouse_guarded,
                 } => {
-                    let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
+                    let guarded = guard_until.is_some();
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Enter if guarded => {
                             // Drop early input. Async identity completion must never replay it.
@@ -3607,9 +3619,7 @@ impl App {
             confirm_requested,
             confirmed: None,
             capture: Some(capture),
-            guard_until: request
-                .guard_until
-                .filter(|deadline| Instant::now() < *deadline),
+            guard_until: request.guard_until,
             mouse_guarded: request.mouse_guarded,
         });
     }
@@ -3636,8 +3646,13 @@ impl App {
     }
 
     fn confirmation_ready(&self) -> bool {
-        if matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
-        {
+        if matches!(
+            self.modal,
+            Some(Modal::Delete {
+                guard_until: Some(_),
+                ..
+            })
+        ) {
             return false;
         }
         matches!(
@@ -4554,7 +4569,13 @@ impl App {
         if let Some(option) = hit {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 if matches!(option.key.code, KeyCode::Enter | KeyCode::Char('y'))
-                    && matches!(self.modal, Some(Modal::Delete { guard_until: Some(deadline), .. }) if Instant::now() < deadline)
+                    && matches!(
+                        self.modal,
+                        Some(Modal::Delete {
+                            guard_until: Some(_),
+                            ..
+                        })
+                    )
                 {
                     // Never carry a press begun during the hold across its deadline.
                     return Some(Action::Continue);
@@ -6775,7 +6796,7 @@ fn draw_modal(
             mouse_guarded,
             ..
         } => {
-            let guarded = guard_until.is_some_and(|deadline| Instant::now() < deadline);
+            let guarded = guard_until.is_some();
             let buttons = [
                 if guarded {
                     DialogButton {
@@ -7865,9 +7886,31 @@ pub fn run(
     let mut order_backlog = true;
     let mut input_timeout = Duration::from_millis(1);
     'events: loop {
-        if app.expire_delete_guard(Instant::now()) {
-            frame_gate.dirty = true;
-            next_frame = Instant::now();
+        let guard_now = Instant::now();
+        if failure.is_none()
+            && app
+                .delete_guard_deadline()
+                .is_some_and(|deadline| guard_now >= deadline)
+        {
+            // Observe the terminal and both reader buffers without consuming
+            // input. Ready events keep their normal path below, including
+            // immediate cancellation and signals. Ordinary poll(false) cannot
+            // establish this boundary after a timeout or a filtered event.
+            #[cfg(unix)]
+            let input_idle = event::input_is_idle();
+            #[cfg(not(unix))]
+            let input_idle = event::poll(Duration::from_millis(1)).map(|ready| !ready);
+            match input_idle {
+                Ok(idle) => {
+                    if app.expire_delete_guard(guard_now, !idle) {
+                        frame_gate.dirty = true;
+                        next_frame = Instant::now();
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
         frame_gate.observe_refreshing(!scopes.is_empty() || !refresh_requests.is_empty());
         frame_gate.observe_activity(
@@ -8407,8 +8450,13 @@ pub fn run(
         } else {
             timeout.max(Duration::from_millis(1))
         };
-        if let Some(deadline) = app.delete_guard_deadline() {
-            input_timeout = input_timeout.min(deadline.saturating_duration_since(Instant::now()));
+        let now = Instant::now();
+        if let Some(deadline) = app.delete_guard_deadline()
+            && deadline > now
+        {
+            // An expired guard can still await a fragmented input sequence.
+            // Keep normal readiness waits then, rather than polling at zero.
+            input_timeout = input_timeout.min(deadline.duration_since(now));
         }
     }
     // External helpers must stop before App is retired off-thread. Signalling
