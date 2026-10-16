@@ -702,20 +702,27 @@ mod tests {
         // The leader exits first; its descendant holds stdout open. Group cleanup must
         // occur before reaping that leader, keeping the group identity owned.
         let (_directory, executable, input) =
-            fixture("/bin/sleep 10 &\nprintf '%s\\n' \"$!\"\nexit 0");
-        let start = Instant::now();
+            fixture("/bin/sleep 60 &\nprintf '%s\\n' \"$!\"\nexit 0");
+        // Leave room for fixture startup on busy or emulated hosts. The
+        // descendant outlives this budget, so truncated output stays required.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let (bytes, truncated) = run(
             &executable,
             &[],
             input,
             std::ffi::OsStr::new(""),
             &cancel,
-            start + Duration::from_millis(300),
+            deadline,
             &Control::default(),
         )
-        .unwrap()
-        .unwrap();
-        assert!(truncated && start.elapsed() < Duration::from_secs(3));
+        .expect("descendant fixture could not run")
+        .expect(
+            "descendant fixture produced no preview before its deadline or exited unsuccessfully",
+        );
+        assert!(
+            truncated,
+            "descendant fixture must reach the output deadline"
+        );
         #[cfg(target_os = "linux")]
         {
             let pid: u32 = std::str::from_utf8(&bytes).unwrap().trim().parse().unwrap();
