@@ -692,6 +692,71 @@ fn export_file_matches_stdout_and_does_not_write_json_to_stdout() {
 }
 
 #[test]
+fn descriptor_export_preserves_pipe_output_and_rewinds_regular_files() {
+    use std::io::{Seek, Write};
+    use std::process::Stdio;
+
+    // Some BSD installations do not mount the descriptor filesystem.
+    if !Path::new("/dev/fd").is_dir() {
+        return;
+    }
+    let work = fixture();
+    let root = work.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("leaf"), b"payload").unwrap();
+    let check_document = |bytes: &[u8]| {
+        let document: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(document[0], 1);
+        assert_eq!(document[1], 2);
+        assert!(
+            ncdu_records(&document[3])
+                .iter()
+                .any(|record| record["name"] == "leaf" && record["asize"] == 7)
+        );
+    };
+    let path = work.path().join("scan.ncdu");
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    held.write_all(b"previous output leaves a nonzero offset")
+        .unwrap();
+    assert!(held.stream_position().unwrap() > 0);
+
+    // try_clone and the child's stdout redirection preserve the open-file offset.
+    // Darwin and default FreeBSD /dev/fd opens duplicate that description;
+    // Linux and FreeBSD nodup mounts reopen it at zero instead.
+    let result = ldu_command()
+        .args(["-0", "-o", "/dev/fd/1", "--threads", "2"])
+        .arg(&root)
+        .stdout(Stdio::from(held.try_clone().unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    check_document(&fs::read(path).unwrap());
+
+    // Descriptor output must also accept nonseekable pipes without truncating.
+    let result = ldu_command()
+        .args(["-0", "-o", "/dev/fd/1", "--threads", "2"])
+        .arg(&root)
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    check_document(&result.stdout);
+}
+
+#[test]
 fn only_an_exact_dash_export_argument_selects_stdout() {
     let work = fixture();
     let directory = fs::canonicalize(work.path()).unwrap();

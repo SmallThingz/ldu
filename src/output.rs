@@ -830,7 +830,7 @@ mod streaming {
     use super::{FileIdentity, check_root, preflight_root};
     use std::{
         fs::{File, Metadata, OpenOptions},
-        io::{self, Write},
+        io::{self, Seek, Write},
         path::{Path, PathBuf},
     };
     // Resolve existing aliases and also compare destinations whose leaf is absent.
@@ -868,7 +868,7 @@ mod streaming {
         }
         // Check the opened file before truncating it: pathname-only checks miss
         // hardlinks, and following an output symlink must not truncate the root.
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
@@ -876,6 +876,8 @@ mod streaming {
         let metadata = file.metadata()?;
         check_root(&metadata, root, initial, scanned)?;
         if metadata.is_file() {
+            // Descriptor paths can share a pre-existing open-file offset.
+            file.rewind()?;
             file.set_len(0)?;
         }
         Ok(file)
