@@ -67,8 +67,8 @@ pub struct RootAnchor {
     path: PathBuf,
     #[cfg(unix)]
     fd: rustix::fd::OwnedFd,
-    // Platforms without O_PATH retain a snapshot for a non-directory root. Such
-    // a root cannot be traversed, so its parent descriptor is never used as it.
+    // Platforms without O_PATH retain the parent and initial leaf metadata.
+    // Regular leaves refresh by identity; no leaf is opened or traversed.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
     leaf: Option<EntryMetadata>,
     #[cfg(target_os = "linux")]
@@ -153,6 +153,34 @@ impl RootAnchor {
         {
             #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
             if let Some(metadata) = self.leaf {
+                // A regular root may change in place. Refresh through its held
+                // parent only while the name still identifies that same inode.
+                // Opening even with O_EVTONLY could touch a replacement device.
+                if metadata.kind == NodeKind::File
+                    && let Some(name) = self.path.file_name()
+                {
+                    loop {
+                        match rustix::fs::statat(
+                            &self.fd,
+                            name,
+                            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                        ) {
+                            Ok(stat) => {
+                                let current = native_metadata(stat);
+                                if current.kind == metadata.kind
+                                    && current.identity == metadata.identity
+                                {
+                                    return Ok(current);
+                                }
+                                break;
+                            }
+                            Err(rustix::io::Errno::INTR) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                // Renamed, replaced or unavailable leaves retain their initial
+                // snapshot. Never substitute metadata from a different object.
                 return Ok(metadata);
             }
             loop {
@@ -1094,6 +1122,57 @@ mod tests {
             let anchor = RootAnchor::open(&directory.path().join(name)).unwrap();
             assert_eq!(anchor.metadata().unwrap().kind, kind);
             assert!(anchor.open_directory(Path::new("")).is_err());
+            assert!(anchor.open_parent(Path::new("child")).is_err());
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+    #[test]
+    fn portable_regular_root_refreshes_metadata_without_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = fixture();
+        let root = directory.path().join("file");
+        fs::write(&root, b"before").unwrap();
+        let writer = fs::OpenOptions::new().write(true).open(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o0)).unwrap();
+        let anchor = RootAnchor::open(&root).unwrap();
+        let initial = anchor.metadata().unwrap();
+        assert_eq!(initial.sizes.apparent, 6);
+        writer.set_len(4097).unwrap();
+        let refreshed = anchor.metadata().unwrap();
+        assert_eq!(refreshed.kind, NodeKind::File);
+        assert_eq!(refreshed.identity, initial.identity);
+        assert_eq!(refreshed.sizes.apparent, 4097);
+        assert!(anchor.open_directory(Path::new("")).is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
+    #[test]
+    fn portable_replaced_leaf_keeps_its_initial_metadata_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let directory = fixture();
+        let root = directory.path().join("file");
+        let saved = directory.path().join("saved");
+        fs::write(&root, b"before").unwrap();
+        let anchor = RootAnchor::open(&root).unwrap();
+        let initial = anchor.metadata().unwrap();
+        fs::rename(&root, &saved).unwrap();
+        fs::write(&saved, b"changed after rename").unwrap();
+        fs::write(&root, b"replacement").unwrap();
+        for replacement in 0..3 {
+            if replacement != 0 {
+                fs::remove_file(&root).unwrap();
+                if replacement == 1 {
+                    symlink("saved", &root).unwrap();
+                }
+            }
+            let observed = anchor.metadata().unwrap();
+            assert_eq!(observed.kind, initial.kind);
+            assert_eq!(observed.identity, initial.identity);
+            assert_eq!(observed.sizes, initial.sizes);
             assert!(anchor.open_parent(Path::new("child")).is_err());
         }
     }

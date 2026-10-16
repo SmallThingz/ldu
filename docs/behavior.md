@@ -163,6 +163,8 @@ On non-Unix platforms, allocated size is approximated by apparent size and hard 
 
 Unix backends keep directory reads, metadata, deletion and previews anchored to the opened root descriptor. Symlink ancestors in the supplied root path are rejected; a final symlink is measured as a leaf. File previews use the held scan root rather than reopening its display path. These checks preserve the anchor when a pathname changes; they do not make a changing filesystem an atomic snapshot.
 
+On macOS and BSD systems without `O_PATH`, non-directory roots retain their parent descriptor and initial metadata without opening the leaf. A regular file's metadata refreshes only while its original name still identifies the same inode. If that name is renamed, replaced or unavailable, LDU keeps the initial snapshot; it cannot observe later changes to the moved file. Symlinks and special files keep their initial metadata.
+
 On Linux, the native backend uses Rustix for buffered directory reads. `auto` falls back to standard directory enumeration only when native enumeration is unsupported, before emitting entries. Metadata remains relative to the held descriptor; permission errors remain errors. Linux `std` enumeration and permission repair require accessible `/proc/self/fd`; native enumeration and ordinary descriptor-relative deletion do not.
 
 On macOS and BSD, `auto`, `native` and `std` all use descriptor-relative metadata and the platform's buffered `fdopendir`/`readdir` stream. The batch-size setting applies; the Linux directory-buffer-size setting does not change these streams. Metadata lookup and deletion run on the existing bounded worker threads, keeping the interface responsive without a separate async filesystem runtime.

@@ -2477,19 +2477,22 @@ mod tests {
             options(),
         );
         let events = collect(&scoped);
-        assert!(matches!(
-            events.as_slice(),
-            [
-                ScanEvent::RootInfo {
-                    kind: NodeKind::File,
-                    sizes,
-                    error: None,
-                    ..
-                },
-                ScanEvent::DirectoryDone { id: 0, error: None },
-                ScanEvent::Finished { cancelled: false }
-            ] if *sizes == expected.sizes
-        ));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ScanEvent::RootInfo {
+                        kind: NodeKind::File,
+                        sizes,
+                        error: None,
+                        ..
+                    },
+                    ScanEvent::DirectoryDone { id: 0, error: None },
+                    ScanEvent::Finished { cancelled: false }
+                ] if *sizes == expected.sizes
+            ),
+            "expected root metadata {expected:?}; received events: {events:?}"
+        );
     }
 
     #[cfg(unix)]
