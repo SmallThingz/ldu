@@ -867,17 +867,7 @@ fn std_metadata(metadata: fs::Metadata) -> EntryMetadata {
     } else {
         NodeKind::Other
     };
-    #[cfg(unix)]
-    let (allocated, identity, links) = {
-        use std::os::unix::fs::MetadataExt;
-        (
-            metadata.blocks().saturating_mul(512),
-            Some((metadata.dev(), metadata.ino())),
-            metadata.nlink(),
-        )
-    };
     // std does not expose allocated blocks on non-Unix targets.
-    #[cfg(not(unix))]
     let (allocated, identity, links) = (metadata.len(), None, 1);
     EntryMetadata {
         kind,
