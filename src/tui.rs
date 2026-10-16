@@ -1559,7 +1559,7 @@ impl App {
             let select = self.range_requested && self.visual.active();
             self.focus_parent(true);
             if select {
-                self.select_parent_contents(false);
+                self.ensure_parent_contents();
             }
         }
     }
@@ -2254,7 +2254,7 @@ impl App {
                     let select = self.range_requested && self.visual.active();
                     self.focus_parent(true);
                     if select {
-                        self.select_parent_contents(false);
+                        self.ensure_parent_contents();
                     }
                     return;
                 }

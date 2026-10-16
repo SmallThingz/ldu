@@ -2165,9 +2165,44 @@ fn parent_toggle_waits_for_listing_and_keeps_newly_discovered_entries() {
 }
 
 #[test]
-fn visual_shift_selection_onto_parent_selects_every_child() {
-    for key in [KeyCode::Home, KeyCode::Up] {
-        let mut app = browser_fixture();
+fn visual_shift_selection_onto_parent_adds_without_toggling_complete_groups() {
+    for key in [KeyCode::Home, KeyCode::Up, KeyCode::PageUp] {
+        for initially_all in [false, true] {
+            let mut app = browser_fixture();
+            apply(
+                &mut app,
+                ScanEvent::DirectoryDone {
+                    id: ROOT,
+                    error: None,
+                },
+            );
+            app.visual.enter(ROOT, Some(1));
+            if initially_all {
+                app.visual.select(2);
+            }
+            for next in [key, KeyCode::Home, KeyCode::Home] {
+                app.key(KeyEvent::new(next, KeyModifiers::SHIFT), None, false);
+                finish_visual(&mut app);
+                assert!(app.parent_selected && app.selected.is_none());
+                assert!(app.visual.contains(1) && app.visual.contains(2));
+                assert_eq!(app.visual.len(), 2);
+            }
+            // Explicit parent activation still toggles the completed group.
+            app.key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                None,
+                false,
+            );
+            finish_visual(&mut app);
+            assert!(app.visual.is_empty());
+        }
+    }
+}
+
+#[test]
+fn queued_shift_parent_navigation_preserves_the_preceding_complete_range() {
+    for key in [KeyCode::Home, KeyCode::PageUp] {
+        let mut app = navigation_fixture(1024, 1025..=1025);
         apply(
             &mut app,
             ScanEvent::DirectoryDone {
@@ -2176,12 +2211,56 @@ fn visual_shift_selection_onto_parent_selects_every_child() {
             },
         );
         app.visual.enter(ROOT, Some(1));
+        app.visual
+            .begin_range(Arc::clone(&app.view), 1024, RangeMode::Add);
         app.key(KeyEvent::new(key, KeyModifiers::SHIFT), None, false);
+        assert!(!app.visual_intents.is_empty());
         finish_visual(&mut app);
         assert!(app.parent_selected && app.selected.is_none());
-        assert!(app.visual.contains(1) && app.visual.contains(2));
-        assert_eq!(app.visual.len(), 2);
+        assert_eq!(app.visual.len(), 1024);
+        assert!((1..=1024).all(|id| app.visual.contains(id)));
     }
+}
+
+#[test]
+fn repeated_shift_parent_waits_for_listing_and_keeps_late_hidden_entries() {
+    let mut app = navigation_fixture(2, 3..=3);
+    app.config.show_hidden = false;
+    app.reset_order(true);
+    app.visual.enter(ROOT, Some(1));
+    app.visual.select(2);
+    let home = KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT);
+    app.key(home, None, false);
+    app.pump_visual();
+    assert!(app.parent_select_pending && app.visual.len() == 2);
+    app.key(home, None, false);
+    assert!(!app.visual_intents.is_empty());
+    apply(
+        &mut app,
+        ScanEvent::Entries {
+            parent: ROOT,
+            entries: vec![entry(3, ".late", NodeKind::File, 100)],
+        },
+    );
+    apply(
+        &mut app,
+        ScanEvent::DirectoryDone {
+            id: ROOT,
+            error: None,
+        },
+    );
+    wait_cache(&mut app, ROOT, &[3, 1, 2]);
+    finish_visual(&mut app);
+    assert!(app.config.show_hidden && app.parent_selected);
+    assert_eq!(app.visual.len(), 3);
+    assert!((1..=3).all(|id| app.visual.contains(id)));
+    app.key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        None,
+        false,
+    );
+    finish_visual(&mut app);
+    assert!(app.visual.is_empty());
 }
 
 #[test]
