@@ -159,7 +159,16 @@ impl EventSource for UnixInternalEventSource {
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
             }
-            match poll(&mut fds, timeout.leftover()) {
+            // A full read can leave one Escape waiting for a continuation.
+            // Resolve it only after observing an empty input boundary, even
+            // when the caller otherwise allows an indefinite wait.
+            let pending_escape = self.parser.buffer.as_slice() == b"\x1b";
+            let poll_timeout = if pending_escape {
+                Some(Duration::ZERO)
+            } else {
+                timeout.leftover()
+            };
+            match poll(&mut fds, poll_timeout) {
                 Err(filedescriptor::Error::Poll(e)) | Err(filedescriptor::Error::Io(e)) => {
                     match e.kind() {
                         // retry on EINTR
@@ -175,6 +184,11 @@ impl EventSource for UnixInternalEventSource {
                 }
                 Ok(_) => (),
             };
+            if pending_escape && fds[0].revents == 0 {
+                let event = parse_event(&self.parser.buffer, false)?;
+                self.parser.buffer.clear();
+                return Ok(event);
+            }
             if fds[0].revents & POLLIN != 0 {
                 loop {
                     let read_count = read_complete(&self.tty, &mut self.tty_buffer)?;
@@ -311,6 +325,7 @@ impl Iterator for Parser {
 #[cfg(all(test, not(feature = "libc")))]
 mod input_idle_tests {
     use super::*;
+    use crate::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::io::Write;
 
     fn source() -> (UnixInternalEventSource, UnixStream, UnixStream) {
@@ -379,5 +394,85 @@ mod input_idle_tests {
         assert_eq!(source.input_is_idle_with(|_, _| {
             Err(filedescriptor::Error::Poll(io::Error::from(io::ErrorKind::BrokenPipe)))
         }).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    fn assert_key(source: &mut UnixInternalEventSource, code: KeyCode, modifiers: KeyModifiers) {
+        assert_eq!(
+            source.try_read(Some(Duration::from_secs(5))).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(code, modifiers))))
+        );
+    }
+
+    fn full_read_source(
+        tail: &[u8],
+        continuation: &[u8],
+    ) -> (UnixInternalEventSource, UnixStream, UnixStream) {
+        let (mut source, mut producer, signal) = source();
+        let prefix_len = TTY_BUFFER_SIZE - tail.len();
+        let mut input = vec![b'a'; prefix_len];
+        input.extend_from_slice(tail);
+        input.extend_from_slice(continuation);
+        producer.write_all(&input).unwrap();
+        assert_key(&mut source, KeyCode::Char('a'), KeyModifiers::NONE);
+        // Prove the source reached an exact full read with its final fragment
+        // retained; an incidental short read must not satisfy this regression.
+        assert_eq!(source.parser.buffer.as_slice(), tail);
+        assert_eq!(source.parser.internal_events.len(), prefix_len - 1);
+        for _ in 1..prefix_len {
+            assert_key(&mut source, KeyCode::Char('a'), KeyModifiers::NONE);
+        }
+        assert!(source.parser.internal_events.is_empty());
+        (source, producer, signal)
+    }
+
+    #[test]
+    fn full_read_trailing_escape_resolves_without_extra_input() {
+        let (mut source, mut producer, _signal) = full_read_source(b"\x1b", b"");
+        assert!(!source.input_is_idle().unwrap());
+        // The old source reaches this finite deadline without delivering Esc.
+        // No extra input may be used to make cancellation become available.
+        assert_key(&mut source, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(source.input_is_idle().unwrap());
+        producer.write_all(b"z").unwrap();
+        assert_key(&mut source, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(source.input_is_idle().unwrap());
+    }
+
+    #[test]
+    fn full_read_escape_continuations_precede_idle_resolution() {
+        for (continuation, code, modifiers) in [
+            (b"[A".as_slice(), KeyCode::Up, KeyModifiers::NONE),
+            (b"x".as_slice(), KeyCode::Char('x'), KeyModifiers::ALT),
+            (b"\xc3\xb1".as_slice(), KeyCode::Char('ñ'), KeyModifiers::ALT),
+        ] {
+            let mut remaining = continuation.to_vec();
+            remaining.extend_from_slice(b"\rz");
+            let (mut source, _producer, _signal) = full_read_source(b"\x1b", &remaining);
+            assert_key(&mut source, code, modifiers);
+            assert_key(&mut source, KeyCode::Enter, KeyModifiers::NONE);
+            assert_key(&mut source, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(source.input_is_idle().unwrap());
+        }
+    }
+
+    #[test]
+    fn full_read_preserves_csi_and_utf8_fragments_until_continuation() {
+        for (fragment, continuation, code, modifiers) in [
+            (b"\x1b[".as_slice(), b"A".as_slice(), KeyCode::Up, KeyModifiers::NONE),
+            (b"\x1b[1;".as_slice(), b"2A".as_slice(), KeyCode::Up, KeyModifiers::SHIFT),
+            (b"\xc3".as_slice(), b"\xb1".as_slice(), KeyCode::Char('ñ'), KeyModifiers::NONE),
+        ] {
+            let (mut source, mut producer, _signal) = full_read_source(fragment, b"");
+            assert_eq!(source.try_read(Some(Duration::from_millis(100))).unwrap(), None);
+            assert_eq!(source.parser.buffer.as_slice(), fragment);
+            assert!(!source.input_is_idle().unwrap());
+            let mut remaining = continuation.to_vec();
+            remaining.extend_from_slice(b"\rz");
+            producer.write_all(&remaining).unwrap();
+            assert_key(&mut source, code, modifiers);
+            assert_key(&mut source, KeyCode::Enter, KeyModifiers::NONE);
+            assert_key(&mut source, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(source.input_is_idle().unwrap());
+        }
     }
 }

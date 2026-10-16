@@ -19,6 +19,7 @@
     "Match the private fork to LDU\u2019s Rust 1.99 requirement and use serial_test 3.5 without async/logging defaults for Windows tests.",
     "Remove redundant closure parentheses reported by the current compiler; preserve the file's upstream line endings.",
     "Serialize color-state unit tests, restore memoized state and NO_COLOR after each test, and exercise the background-color roundtrip constructor.",
-    "Write ANSI attribute parameters directly to the existing formatter while preserving the public sgr() String API; test every attribute and sink-error boundary."
+    "Write ANSI attribute parameters directly to the existing formatter while preserving the public sgr() String API; test every attribute and sink-error boundary.",
+    "Resolve a standalone Escape retained at a full Unix TTY read boundary only after a successful empty-input probe; preserve queued events and available continuations, with source-reader regressions."
   ]
 }
