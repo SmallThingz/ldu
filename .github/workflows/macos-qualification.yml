@@ -113,7 +113,7 @@ jobs:
 
       - name: Check formatting
         timeout-minutes: 2
-        run: cargo +1.99.0 fmt --all -- --check
+        run: cargo +1.99.0 fmt -p ldu -p filedescriptor -- --check
 
       - name: Run workspace tests
         if: ${{ !cancelled() && steps.identity.outcome == 'success' }}

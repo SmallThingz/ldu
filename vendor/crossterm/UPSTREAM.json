@@ -1,0 +1,22 @@
+{
+  "package": "crossterm",
+  "version": "0.29.0",
+  "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+  "archive_url": "https://crates.io/api/v1/crates/crossterm/0.29.0/download",
+  "archive_sha256": "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b",
+  "upstream_git": "36d95b26a26e64b0f8c12edfe11f410a6d56a812",
+  "license_sha256": "aca4760f2a5eba9ce9d4448fe7cd3fcf98245a8315ede59ebd0c6085dd542e61",
+  "original_manifest_sha256": "a4db652d1a5e748e0da1c3efc0e7baf3d969d7b376dd773183c308ea721a9f7e",
+  "retained_upstream": [
+    "src/**",
+    "LICENSE",
+    "Cargo.toml.orig"
+  ],
+  "local_changes": [
+    "Add an input-idle query for the Unix use-dev-tty event reader.",
+    "Replace the package manifest and README; omit examples, documentation assets and example-only dev-dependencies.",
+    "Keep existing library tests and doctests; scope serial_test to Windows tests.",
+    "Match the private fork to LDU\u2019s Rust 1.99 requirement and use serial_test 3.5 without async/logging defaults for Windows tests.",
+    "Remove redundant closure parentheses reported by the current compiler; preserve the file's upstream line endings."
+  ]
+}
