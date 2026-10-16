@@ -2114,6 +2114,34 @@ def check_owned_quit_interrupts(binary, work, threads):
     return metrics
 
 
+def check_owned_termination_signals(binary, work, threads):
+    metrics = []
+    for label, sig in (("sigterm", signal.SIGTERM), ("sighup", signal.SIGHUP)):
+        case = "paused-queue-single-" + label
+        root = work / case
+        root.mkdir()
+        victim = root / "waiting"
+        contents = b"confirmed but paused"
+        victim.write_bytes(contents)
+        session = Session(binary, root, threads)
+        try:
+            session.resize(28, 119)
+            session.wait(lambda: path_in_header(session.screen, root),
+                         f"{case} fixture scan did not complete")
+            pause_empty_queue(session)
+            enqueue_fixture(session, "waiting")
+            open_queue(session, ["waiting"])
+            # Exactly one external signal, with no following key or signal.
+            # finish verifies termios, alternate screen and mouse restoration.
+            elapsed = session.finish(sig=sig)
+            assert elapsed < 3000, f"{case} exceeded bounded shutdown plus harness slack"
+            assert victim.read_bytes() == contents, f"{case} started paused deletion"
+            metrics.append({"case": case, "first_frame_ms": session.first_frame_ms,
+                            "quit_ms": elapsed, "input": []})
+        finally:
+            session.close()
+    return metrics
+
 
 def check_owned_terminal_hangup(binary, work, threads):
     root = work / "terminal-hangup"
@@ -3882,6 +3910,7 @@ def main():
             metrics.append(check_owned_quit_guard(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_mouse_quit(args.binary, Path(work), args.threads))
             metrics.extend(check_owned_quit_interrupts(args.binary, Path(work), args.threads))
+            metrics.extend(check_owned_termination_signals(args.binary, Path(work), args.threads))
             metrics.append(check_owned_terminal_hangup(args.binary, Path(work), args.threads))
             metrics.append(check_owned_quit_completion(args.binary, Path(work), args.threads))
             metrics.append(check_owned_quit_completion(
@@ -3920,6 +3949,7 @@ def main():
             checks.append("full queued-status clicks, outside ordinary-dialog cancellation, retained errors/progress, overflow-only border scroll hints")
             checks.append("header right-click quit Yes/No with idle, paused and finishing deletions")
             checks.append("target-replacement error after terminal restoration")
+            checks.append("single SIGTERM/SIGHUP cancels a paused queue and restores the terminal")
             checks.append("stationary paused queue growth and shrink without input")
             checks.append("held normal and visual mouse rows across shrink and growth without input")
             checks.append("normal mouse click opens directories, visual click selects, scanned breadcrumbs navigate")

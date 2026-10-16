@@ -7836,7 +7836,7 @@ pub fn run(
     let output_cleanup = TerminalOutputCleanup(&cleaning_up);
     terminal.draw(|frame| app.draw(frame, false, false))?;
     #[cfg(unix)]
-    if interrupts.take()? {
+    if interrupts.take()? || interrupts.termination_requested() {
         return Ok(());
     }
     let scanner = scan::spawn(root, options.clone());
@@ -7917,14 +7917,14 @@ pub fn run(
             break;
         }
         prioritize_deletion(&mut app, &scanner, &scopes, queue.active().is_some());
-        let (interrupt, input) = if failure.is_some() {
+        let (interrupt, force_quit, input) = if failure.is_some() {
             // A disconnected input source stays ready forever. Do not poll it
             // again or skip queue completion while cancelled workers stop.
             let remaining = shutdown_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(INPUT_INTERVAL);
             std::thread::sleep(INPUT_INTERVAL.min(remaining));
-            (false, Ok(false))
+            (false, false, Ok(false))
         } else {
             #[cfg(unix)]
             let interrupt = match interrupts.take() {
@@ -7936,6 +7936,11 @@ pub fn run(
             };
             #[cfg(not(unix))]
             let interrupt = false;
+            #[cfg(unix)]
+            let force_quit = !quitting && interrupts.termination_requested();
+            #[cfg(not(unix))]
+            let force_quit = false;
+            let interrupt = interrupt || force_quit;
             let input = if interrupt {
                 Ok(true)
             } else {
@@ -7951,7 +7956,7 @@ pub fn run(
                 let ready = event::poll(input_timeout.max(Duration::from_millis(1)));
                 ready
             };
-            (interrupt, input)
+            (interrupt, force_quit, input)
         };
         match input {
             Err(error) => {
@@ -7971,6 +7976,9 @@ pub fn run(
                     }
                 };
                 let action = match event {
+                    // TERM/HUP are external termination requests, including when
+                    // confirmed work is paused. SIGINT keeps interactive two-stage quit.
+                    _ if force_quit => Some(Action::Quit),
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         // Keys can replace queue membership without changing its length.
                         refresh_retry.invalidate();

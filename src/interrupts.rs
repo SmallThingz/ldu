@@ -6,10 +6,15 @@ use signal_hook::{SigId, low_level};
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub(crate) struct Interrupts {
     reader: UnixStream,
-    registrations: [Option<SigId>; 3],
+    registrations: [Option<SigId>; 5],
+    terminate: Arc<AtomicBool>,
 }
 
 impl Interrupts {
@@ -25,9 +30,21 @@ impl Interrupts {
         rustix::net::sockopt::set_socket_nosigpipe(&writer, true)?;
         let mut interrupts = Self {
             reader,
-            registrations: [None; 3],
+            registrations: [None; 5],
+            terminate: Arc::new(AtomicBool::new(false)),
         };
-        for (slot, signal) in interrupts.registrations.iter_mut().zip(signals) {
+        // Publish termination intent before the wake callback. The sticky flag
+        // remains visible even when several notifications coalesce or a pipe is full.
+        for (slot, signal) in interrupts.registrations[..2]
+            .iter_mut()
+            .zip(signals[1..].iter().copied())
+        {
+            *slot = Some(signal_hook::flag::register(
+                signal,
+                Arc::clone(&interrupts.terminate),
+            )?);
+        }
+        for (slot, signal) in interrupts.registrations[2..].iter_mut().zip(signals) {
             *slot = Some(low_level::pipe::register(signal, writer.try_clone()?)?);
         }
         Ok(interrupts)
@@ -35,6 +52,10 @@ impl Interrupts {
 
     pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
         self.reader.as_fd()
+    }
+
+    pub(crate) fn termination_requested(&self) -> bool {
+        self.terminate.load(Ordering::SeqCst)
     }
 
     pub(crate) fn take(&mut self) -> io::Result<bool> {
@@ -81,7 +102,8 @@ mod tests {
         (
             Interrupts {
                 reader,
-                registrations: [None; 3],
+                registrations: [None; 5],
+                terminate: Arc::new(AtomicBool::new(false)),
             },
             writer,
         )
@@ -91,6 +113,7 @@ mod tests {
     fn counted_interrupts_remain_available_for_both_quit_steps() {
         let (mut interrupts, mut writer) = fixture();
         assert!(!interrupts.take().unwrap());
+        assert!(!interrupts.termination_requested());
         writer.write_all(b"XX").unwrap();
         assert!(interrupts.take().unwrap());
         assert!(interrupts.take().unwrap());
@@ -98,6 +121,7 @@ mod tests {
         writer.write_all(b"X").unwrap();
         assert!(interrupts.take().unwrap());
         assert!(!interrupts.take().unwrap());
+        assert!(!interrupts.termination_requested());
     }
 
     #[test]
@@ -129,7 +153,9 @@ mod tests {
     fn signal_registration_is_counted_and_owned() {
         // This test owns SIGUSR2 in this process; production uses other signals.
         let mut interrupts = Interrupts::register([signal_hook::consts::SIGUSR2; 3]).unwrap();
+        assert!(!interrupts.termination_requested());
         low_level::raise(signal_hook::consts::SIGUSR2).unwrap();
+        assert!(interrupts.termination_requested());
         for _ in 0..3 {
             assert!(interrupts.take().unwrap());
         }
