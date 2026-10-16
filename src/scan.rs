@@ -593,14 +593,25 @@ impl Scheduler {
         }
     }
 
-    fn complete(&mut self, mut id: NodeId) {
+    fn complete(&mut self, task: &DirectoryTask) {
+        let mut id = task.id;
+        let mut path = task.path.as_path();
         loop {
             let directory = self.directories.get_mut(&id).expect("active directory");
             directory.active -= 1;
-            let Some(parent) = directory.parent else {
+            let parent = directory.parent;
+            if parent.is_some() && directory.active == 0 && !directory.has_pending() {
+                // Progress precedes this worker's Complete. With no active or
+                // pending descendants, no later message needs this record.
+                debug_assert_eq!(directory.pending_slot, usize::MAX);
+                self.directories.remove(&id);
+                self.paths.remove(path);
+            }
+            let Some(parent) = parent else {
                 break;
             };
             id = parent;
+            path = path.parent().expect("scheduled child has a parent path");
         }
     }
 
@@ -623,7 +634,7 @@ enum WorkerMessage {
         checked: usize,
     },
     Complete {
-        id: NodeId,
+        task: DirectoryTask,
         checked: usize,
     },
 }
@@ -1021,7 +1032,7 @@ fn run_scheduler(
                 let _ = send_worker(
                     &worker_messages,
                     WorkerMessage::Complete {
-                        id,
+                        task,
                         checked: pending_checked,
                     },
                     &worker_cancel,
@@ -1039,9 +1050,9 @@ fn run_scheduler(
                         scheduler.insert(task, Some(parent));
                     }
                 }
-                Ok(WorkerMessage::Complete { id, checked }) => {
-                    scheduler.checked(id, checked);
-                    scheduler.complete(id);
+                Ok(WorkerMessage::Complete { task, checked }) => {
+                    scheduler.checked(task.id, checked);
+                    scheduler.complete(&task);
                 }
                 Err(_) => break,
             },
@@ -1431,8 +1442,8 @@ mod tests {
         assert_eq!(scheduler.take().unwrap().id, 3);
         assert_eq!(scheduler.active(), 4);
         assert!(scheduler.take().is_none());
-        for id in [1, 3, 0, 2] {
-            scheduler.complete(id);
+        for (id, path) in [(1, "first"), (3, "first/deep"), (0, ""), (2, "second")] {
+            scheduler.complete(&task(id, path));
         }
         assert!(scheduler.is_empty());
     }
@@ -1452,9 +1463,9 @@ mod tests {
             scheduler.insert(task(id, &format!("wide/child-{id}")), Some(1));
         }
         scheduler.insert(task(35, "small/child"), Some(2));
-        scheduler.complete(1);
-        scheduler.complete(2);
-        scheduler.complete(0);
+        scheduler.complete(&task(1, "wide"));
+        scheduler.complete(&task(2, "small"));
+        scheduler.complete(&task(0, ""));
         assert_eq!(scheduler.take().unwrap().id, 35);
         scheduler.checked(35, 2);
         scheduler.insert(task(36, "small/child/deep"), Some(35));
@@ -1480,7 +1491,7 @@ mod tests {
         scheduler.checked(2, (ACTIVE_EFFORT_RESERVATION / 2) as usize);
         assert_eq!(scheduler.take().unwrap().id, 3);
         assert_eq!(scheduler.take().unwrap().id, 5);
-        scheduler.complete(3);
+        scheduler.complete(&task(3, "first/a"));
         assert_eq!(scheduler.take().unwrap().id, 4);
     }
 
@@ -1508,8 +1519,9 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), 32);
-        for id in 0..=32 {
-            scheduler.complete(id);
+        scheduler.complete(&task(0, ""));
+        for id in 1..=32 {
+            scheduler.complete(&task(id, &format!("child-{id}")));
         }
         assert!(scheduler.is_empty());
     }
@@ -1524,12 +1536,92 @@ mod tests {
         for id in 2..10 {
             scheduler.insert(task(id, &format!("streamed/child-{id}")), Some(1));
             assert_eq!(scheduler.take().unwrap().id, id);
-            scheduler.complete(id);
+            scheduler.complete(&task(id, &format!("streamed/child-{id}")));
             assert!(scheduler.take().is_none());
         }
-        scheduler.complete(0);
-        scheduler.complete(1);
+        scheduler.complete(&task(0, ""));
+        scheduler.complete(&task(1, "streamed"));
         assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn completed_subtrees_release_paths_while_other_readers_remain_active() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, "scope/base"), None);
+        let root = scheduler.take().unwrap();
+        scheduler.insert(task(1, "scope/base/slow"), Some(0));
+        let slow = scheduler.take().unwrap();
+        let retained_bytes = root.path.as_os_str().len() + slow.path.as_os_str().len();
+        for id in 2..2050 {
+            scheduler.insert(task(id, &format!("scope/base/finished-{id}")), Some(0));
+            let finished = scheduler.take().unwrap();
+            assert_eq!(finished.id, id);
+            scheduler.checked(id, 1);
+            scheduler.complete(&finished);
+            assert_eq!(scheduler.directories.len(), 2);
+            assert_eq!(scheduler.paths.len(), 2);
+            assert_eq!(
+                scheduler
+                    .paths
+                    .keys()
+                    .map(|path| path.as_os_str().len())
+                    .sum::<usize>(),
+                retained_bytes,
+            );
+            // A finished focus no longer exists; the next streamed sibling still runs.
+            scheduler.focus = Some(finished.path);
+            assert!(scheduler.focused().is_none());
+            assert_eq!(scheduler.active(), 2);
+        }
+        assert_eq!(scheduler.directories[&0].checked, 2048);
+        scheduler.complete(&root);
+        assert!(!scheduler.is_empty());
+        scheduler.checked(slow.id, 7);
+        scheduler.complete(&slow);
+        assert!(scheduler.is_empty());
+        assert_eq!(scheduler.directories.len(), 1);
+        assert_eq!(scheduler.paths.len(), 1);
+        assert_eq!(scheduler.directories[&0].checked, 2055);
+        assert_eq!(scheduler.paths.get(Path::new("scope/base")), Some(&0));
+    }
+
+    #[test]
+    fn completed_readers_keep_pending_descendants_then_retire_the_ancestor_chain() {
+        let mut scheduler = Scheduler::default();
+        scheduler.insert(task(0, "scope/base"), None);
+        let root = scheduler.take().unwrap();
+        scheduler.insert(task(1, "scope/base/branch"), Some(0));
+        let branch = scheduler.take().unwrap();
+        scheduler.insert(task(2, "scope/base/branch/child"), Some(1));
+        scheduler.insert(task(3, "scope/base/waiting"), Some(0));
+        scheduler.complete(&branch);
+        scheduler.complete(&root);
+        assert!(scheduler.directories.contains_key(&1));
+        assert_eq!(
+            scheduler.paths.get(Path::new("scope/base/branch")),
+            Some(&1)
+        );
+        scheduler.focus = Some(branch.path);
+        let child = scheduler.take().unwrap();
+        assert_eq!(child.id, 2);
+        scheduler.insert(task(4, "scope/base/branch/child/grandchild"), Some(2));
+        scheduler.complete(&child);
+        assert_eq!(scheduler.focused(), Some(4));
+        let grandchild = scheduler.take().unwrap();
+        scheduler.checked(grandchild.id, 11);
+        scheduler.complete(&grandchild);
+        for id in [1, 2, 4] {
+            assert!(!scheduler.directories.contains_key(&id));
+        }
+        assert_eq!(scheduler.paths.len(), 2);
+        assert!(scheduler.focused().is_none());
+        let waiting = scheduler.take().unwrap();
+        assert_eq!(waiting.id, 3);
+        scheduler.complete(&waiting);
+        assert!(scheduler.is_empty());
+        assert_eq!(scheduler.directories.len(), 1);
+        assert_eq!(scheduler.paths.len(), 1);
+        assert_eq!(scheduler.directories[&0].checked, 11);
     }
 
     #[test]
@@ -1942,7 +2034,10 @@ mod tests {
     fn cancellation_releases_a_full_scheduler_progress_channel() {
         let (sender, _receiver) = bounded(1);
         sender
-            .send(WorkerMessage::Complete { id: 0, checked: 0 })
+            .send(WorkerMessage::Complete {
+                task: task(0, ""),
+                checked: 0,
+            })
             .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
