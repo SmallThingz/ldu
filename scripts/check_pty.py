@@ -1922,7 +1922,7 @@ def check_owned_special_previews(binary, work, threads):
     ]
     capabilities = {name: archive_helper_capability(root / name, entry, kind)
                     for name, entry, kind in archive_cases}
-    print("Archive helper capabilities: " + json.dumps(capabilities, sort_keys=True), flush=True)
+    print("Archive helper capabilities: " + json.dumps(capabilities, sort_keys=True), file=sys.stderr, flush=True)
     session = Session(binary, root, threads)
     samples = []
     try:
