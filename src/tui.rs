@@ -7003,7 +7003,7 @@ c / x              Cancel active job / remove waiting job
 Shift+↑↓ / K/J     Reorder waiting job
 D / Esc            Close queue
 
-⠋ unfinished    × queued/deleting    ~ partial size    ! read error
+⠋ unfinished    × queued/deleting    ~ partial size    ! error
 Sorting includes unfinished entries.
 Near-size groups retain their previous order.
 Graph shows the share of known directory size.
