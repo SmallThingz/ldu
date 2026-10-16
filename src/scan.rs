@@ -64,7 +64,11 @@ impl ScanHandle {
     /// Stop this path and all its descendants without interrupting other branches.
     /// Exclusions remain in effect for this handle, including tasks not yet started.
     pub fn exclude(&self, relative: &Path) {
-        self.control.exclude(relative);
+        // The original handle stays alive for anchoring after its producer exits.
+        // Completed scans cannot admit more work or need new exclusion paths.
+        if !self.is_finished() {
+            self.control.exclude(relative);
+        }
     }
 
     /// Prefer this discovered directory and its descendants on the next free
@@ -89,11 +93,15 @@ impl Drop for ScanHandle {
     }
 }
 
-struct FinishedGuard(Arc<AtomicBool>);
+struct FinishedGuard {
+    finished: Arc<AtomicBool>,
+    control: Arc<ScanControl>,
+}
 
 impl Drop for FinishedGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.control.finish();
+        self.finished.store(true, Ordering::Release);
     }
 }
 
@@ -210,6 +218,33 @@ impl ControlState {
 }
 
 impl ScanControl {
+    fn finish(&self) {
+        let excluded = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A terminal root closes admission under the same lock used by
+            // exclude(), including calls that passed the handle's finished check.
+            let excluded = std::mem::replace(
+                &mut state.excluded,
+                ExclusionTrie {
+                    terminal: true,
+                    children: BTreeMap::new(),
+                },
+            );
+            self.has_exclusions.store(true, Ordering::Release);
+            for active in state.active.values() {
+                active.cancel.store(true, Ordering::Release);
+            }
+            excluded
+        };
+        self.wake();
+        // The original handle stays alive for its anchor. Release its obsolete
+        // paths here on the producer thread, outside the shared state lock.
+        drop(excluded);
+    }
+
     fn set_paused(&self, paused: bool) {
         if self.paused.swap(paused, Ordering::AcqRel) != paused {
             self.wake();
@@ -752,7 +787,10 @@ fn spawn_with_root(root: ScanRoot, mut options: ScanOptions) -> ScanHandle {
     let spawned = thread::Builder::new()
         .name("ldu-scan".into())
         .spawn(move || {
-            let _finished = FinishedGuard(thread_finished);
+            let _finished = FinishedGuard {
+                finished: thread_finished,
+                control: Arc::clone(&thread_control),
+            };
             run(
                 root,
                 options,
@@ -1931,6 +1969,108 @@ mod tests {
     }
 
     #[test]
+    fn completed_handles_do_not_accumulate_new_exclusion_paths() {
+        let make_handle = |finished| {
+            let (_sender, receiver) = bounded(1);
+            ScanHandle {
+                receiver,
+                cancel: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(finished)),
+                anchor: Arc::new(OnceLock::new()),
+                control: Arc::new(ScanControl::default()),
+            }
+        };
+        let completed = make_handle(true);
+        let active = make_handle(false);
+        for index in 0..1024 {
+            let relative = PathBuf::from(format!("entry-{index}"));
+            completed.exclude(&relative);
+            active.exclude(&relative);
+        }
+        assert!(!completed.control.has_exclusions.load(Ordering::Acquire));
+        assert!(
+            completed
+                .control
+                .state
+                .read()
+                .unwrap()
+                .excluded
+                .children
+                .is_empty()
+        );
+        assert_eq!(
+            active.control.state.read().unwrap().excluded.children.len(),
+            1024
+        );
+        assert!(active.control.excludes(Path::new("entry-17/child")));
+        assert!(!active.control.excludes(Path::new("entry-1024")));
+
+        // Active exclusion still cancels matching work. Completion then prevents
+        // later UI confirmations from growing the retained control state.
+        let task_cancel = Arc::new(AtomicBool::new(false));
+        active.control.state.write().unwrap().active.insert(
+            1,
+            ActiveDirectory {
+                path: PathBuf::from("running/child"),
+                cancel: Arc::clone(&task_cancel),
+            },
+        );
+        active.exclude(Path::new("running"));
+        assert!(task_cancel.load(Ordering::Acquire));
+        active.finished.store(true, Ordering::Release);
+        for index in 0..1024 {
+            active.exclude(Path::new(&format!("later-{index}")));
+        }
+        assert_eq!(
+            active.control.state.read().unwrap().excluded.children.len(),
+            1025
+        );
+        assert!(!active.control.excludes(Path::new("later-0")));
+    }
+
+    #[test]
+    fn producer_completion_releases_exclusions_and_rejects_late_control_calls() {
+        let control = Arc::new(ScanControl::default());
+        let finished = Arc::new(AtomicBool::new(false));
+        let cancel = AtomicBool::new(false);
+        let blocked = control.activate(&task(1, "blocked/child"), &cancel);
+        let survivor = control.activate(&task(2, "survivor/child"), &cancel);
+        control.exclude(Path::new("blocked"));
+        assert!(blocked.cancel.load(Ordering::Acquire));
+        assert!(!survivor.cancel.load(Ordering::Acquire));
+        for index in 0..2048 {
+            control.exclude(Path::new(&format!("entry-{index}")));
+        }
+        assert_eq!(control.state.read().unwrap().excluded.children.len(), 2049);
+
+        drop(FinishedGuard {
+            finished: Arc::clone(&finished),
+            control: Arc::clone(&control),
+        });
+        assert!(finished.load(Ordering::Acquire));
+        assert!(blocked.cancel.load(Ordering::Acquire));
+        assert!(survivor.cancel.load(Ordering::Acquire));
+        assert!(!cancel.load(Ordering::Acquire));
+        {
+            let state = control.state.read().unwrap();
+            assert!(state.excluded.children.is_empty());
+            assert!(state.excluded.terminal);
+        }
+        // Model an exclusion call already admitted by the handle's fast check:
+        // it reaches the locked control path after producer cleanup finished.
+        for index in 0..2048 {
+            control.exclude(Path::new(&format!("late-{index}")));
+        }
+        assert!(control.state.read().unwrap().excluded.children.is_empty());
+        assert!(control.excludes(Path::new("late-0/child")));
+        assert!(control.excludes_child(Path::new(""), OsStr::new("future")));
+        let late = control.activate(&task(3, "future"), &cancel);
+        assert!(late.cancel.load(Ordering::Acquire));
+        drop((blocked, survivor, late));
+        assert!(control.state.read().unwrap().active.is_empty());
+    }
+
+    #[test]
     fn indexed_exclusions_cover_wide_batches_and_ancestor_supersession() {
         let control = ScanControl::default();
         for index in 0..2048 {
@@ -1993,7 +2133,17 @@ mod tests {
                 // Supersession retains the deep descendants until destruction.
                 excluded.insert(Path::new("branch"));
                 assert!(excluded.excludes(Path::new("branch/later")));
-                drop(excluded);
+                let control = Arc::new(ScanControl::default());
+                control.state.write().unwrap().excluded = excluded;
+                let finished = Arc::new(AtomicBool::new(false));
+                drop(FinishedGuard {
+                    finished: Arc::clone(&finished),
+                    control: Arc::clone(&control),
+                });
+                assert!(finished.load(Ordering::Acquire));
+                let state = control.state.read().unwrap();
+                assert!(state.excluded.children.is_empty());
+                assert!(state.excluded.terminal);
             })
             .unwrap()
             .join()
