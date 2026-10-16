@@ -484,6 +484,123 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Exercise the real driver rather than treating a working blocking fallback
+    /// as io_uring qualification. Release validation can require this capability.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    #[test]
+    fn live_io_uring_metadata_and_unlink_batches() {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, statat};
+        use std::ffi::OsString;
+        use std::os::unix::{ffi::OsStringExt, fs::symlink};
+
+        let metadata = metadata_available();
+        let unlink = unlink_available();
+        if !metadata || !unlink {
+            let message =
+                format!("live io_uring unavailable: metadata={metadata}, unlink={unlink}");
+            assert!(
+                std::env::var_os("LDU_REQUIRE_IO_URING").as_deref() != Some(OsStr::new("1")),
+                "{message}; LDU_REQUIRE_IO_URING=1 requires a real driver"
+            );
+            eprintln!("SKIP: {message}");
+            return;
+        }
+
+        std::fs::create_dir_all(".tmp").unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("live-io-uring-")
+            .tempdir_in(".tmp")
+            .unwrap();
+        let directory = fixture.path().join("entries");
+        let sentinel = fixture.path().join("sentinel");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&sentinel, b"retained target").unwrap();
+        let parent = open(
+            &directory,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+        let mut names: Vec<OsString> = (0..BATCH_LIMIT * 2 + 7)
+            .map(|index| format!("leaf-{index}").into())
+            .collect();
+        names.push(OsString::from_vec(b"raw-\xff".to_vec()));
+        for name in &names {
+            std::fs::write(directory.join(name), b"payload").unwrap();
+        }
+        let link_index = names.len();
+        names.push("link".into());
+        symlink("../sentinel", directory.join("link")).unwrap();
+        let missing_index = names.len();
+        names.push("missing".into());
+        let cancel = AtomicBool::new(false);
+
+        let outcome = metadata_batch(&parent, &names, &cancel, |_| true);
+        let BatchOutcome::Complete(entries) = outcome else {
+            panic!("live metadata batch did not complete: {outcome:?}");
+        };
+        assert_eq!(entries.len(), names.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let EntryOutcome::Completed(result) = entry else {
+                panic!("live metadata entry {index} was not completed: {entry:?}");
+            };
+            if index == missing_index {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+                continue;
+            }
+            let actual = result.unwrap();
+            let expected =
+                statat(&parent, names[index].as_os_str(), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            assert_eq!(actual.st_dev, expected.st_dev);
+            assert_eq!(actual.st_ino, expected.st_ino);
+            assert_eq!(actual.st_mode, expected.st_mode);
+            assert_eq!(actual.st_size, expected.st_size);
+            assert_eq!(actual.st_blocks, expected.st_blocks);
+            assert_eq!(actual.st_nlink, expected.st_nlink);
+            if index == link_index {
+                assert_eq!(FileType::from_raw_mode(actual.st_mode), FileType::Symlink);
+            }
+        }
+
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            unlink_batch(&parent, &names, &cancel),
+            BatchOutcome::Complete(entries)
+                if entries.len() == names.len()
+                    && entries.iter().all(|entry| matches!(entry, EntryOutcome::NotSubmitted))
+        ));
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            missing_index
+        );
+        cancel.store(false, Ordering::Relaxed);
+        let outcome = unlink_batch(&parent, &names, &cancel);
+        let BatchOutcome::Complete(entries) = outcome else {
+            panic!("live unlink batch did not complete: {outcome:?}");
+        };
+        assert_eq!(entries.len(), names.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let EntryOutcome::Completed(result) = entry else {
+                panic!("live unlink entry {index} was not completed: {entry:?}");
+            };
+            if index == missing_index {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+            } else {
+                result.unwrap();
+            }
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"retained target");
+        eprintln!(
+            "PASS: live io_uring metadata and unlink completed {} entries each",
+            names.len()
+        );
+    }
+
     struct FakeDriver<'a> {
         accepted: Vec<usize>,
         live: HashSet<usize>,
