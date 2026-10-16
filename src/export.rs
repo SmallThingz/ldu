@@ -65,8 +65,8 @@ impl<'a> Record<'a> {
 /// Write the complete tree with constant traversal space and buffered output.
 ///
 /// Directory records contain their own metadata sizes, not subtree totals.
-/// Hardlink aliases retain the model's zero charge; inode identities are not
-/// retained by the model, so the export does not invent ncdu hardlink metadata.
+/// Hardlink aliases export their counted zero bytes; this format intentionally
+/// omits inode and device metadata.
 /// Ncdu requires a directory root, so a file root is wrapped in its parent.
 pub fn write_ncdu(model: &Model, root: &Path, output: impl Write) -> io::Result<()> {
     let mut output = io::BufWriter::new(output);
