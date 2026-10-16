@@ -229,6 +229,32 @@ class PackageTests(unittest.TestCase):
             release.extract_notices(args, output)
             release.validate_notices(args.output.read_bytes(), notices)
 
+    def test_smoke_rejects_binary_replacement_before_recording_success(self):
+        binary = self.root / "input"
+        original = elf()
+        binary.write_bytes(original)
+        output = io.StringIO()
+
+        def command(arguments, **_):
+            if arguments[-1] == "--version":
+                binary.write_bytes(original + b"replacement build")
+                return "ldu 0.1.0"
+            if arguments[-1] == "--help":
+                return "Usage: --output --backend"
+            return "[]"
+
+        args = SimpleNamespace(target="x86_64-unknown-linux-musl", runner_json="[]")
+        with patch.object(release, "ROOT", self.root), \
+                patch.object(release.platform, "system", return_value="Linux"), \
+                patch.object(release, "run", side_effect=command) as run, \
+                patch.object(release, "check_ncdu_export", return_value=("same", {})), \
+                contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, "Binary changed during smoke checks"):
+                release.smoke(args, "0.1.0", binary)
+        self.assertEqual(run.call_count, 5)
+        self.assertFalse((self.root / ".tmp/release-smoke-x86_64-unknown-linux-musl.json").exists())
+        self.assertNotIn("SMOKE_METADATA", output.getvalue())
+
     def test_foreign_os_smoke_is_rejected_before_executing_any_binary(self):
         binary = self.root / "input"
         binary.write_bytes(macho())

@@ -340,6 +340,8 @@ def smoke(args, version, binary):
                 reference = exported
             else:
                 require(exported == reference, f"{backend}: export differs between backends")
+    require(binary.read_bytes() == data,
+            "Binary changed during smoke checks; rerun against a stable artifact")
     result = {
         "version": version, "target": args.target, "binary_sha256": digest(data),
         "runner": runner, "host_system": platform.system(), "host_machine": platform.machine(),
