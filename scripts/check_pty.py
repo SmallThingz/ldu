@@ -319,6 +319,28 @@ def own_terminal():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
+def require_freebsd_terminal_owner():
+    """Never attach a fixture terminal to the caller's existing session."""
+    if os.getsid(0) != os.getpid():
+        raise RuntimeError("FreeBSD PTY checks require start_new_session=True; see docs/releasing.md")
+    try:
+        descriptor = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as error:
+        if error.errno not in (errno.ENXIO, errno.ENODEV, errno.ENOTTY):
+            raise
+    else:
+        os.close(descriptor)
+        raise RuntimeError("FreeBSD PTY checks require a session without a controlling terminal")
+
+
+def foreground_terminal():
+    """Join the harness-owned session as its real foreground job."""
+    os.setpgid(0, 0)
+    os.tcsetpgrp(0, os.getpgrp())
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+
+
 def check_harness_terminal_lifetime():
     """Prove the master detects both restored and unrestored child terminal state."""
     child_code = """import sys, termios, tty
@@ -460,7 +482,7 @@ signal.pause()
 
 
 class Session:
-    def __init__(self, binary, root, threads, env=None, extra_args=()):
+    def __init__(self, binary, root, threads, env=None, extra_args=(), *, child_owns_terminal=False):
         self.master, self.slave = pty.openpty()
         self.saved = termios.tcgetattr(self.slave)
         assert termios.tcgetattr(self.master) == self.saved, "PTY endpoints disagree on terminal attributes"
@@ -482,12 +504,51 @@ class Session:
                      "TERM": "xterm-256color"}
         child_env.pop("COLORTERM", None)
         child_env.update(env or {})
-        self.child = subprocess.Popen(
-            command,
-            stdin=self.slave, stdout=self.slave, stderr=self.slave,
-            env=child_env,
-            preexec_fn=own_terminal,
-        )
+        self.child = None
+        self.parent_terminal = False
+        self.parent_terminal_signals = None
+        try:
+            prepare_terminal = own_terminal
+            if sys.platform.startswith("freebsd") and not child_owns_terminal:
+                # A FreeBSD session leader's exit revokes the slave and discards
+                # unread output. Keep its shell-like owner alive through finish().
+                self._attach_parent_terminal()
+                prepare_terminal = foreground_terminal
+            self.child = subprocess.Popen(
+                command,
+                stdin=self.slave, stdout=self.slave, stderr=self.slave,
+                env=child_env,
+                preexec_fn=prepare_terminal,
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def _attach_parent_terminal(self):
+        require_freebsd_terminal_owner()
+        self.parent_terminal_signals = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGHUP, signal.SIGTTOU)
+        }
+        # The child restores both defaults before exec. Ignoring parent HUP
+        # also lets failed-detach cleanup close owned endpoints without dying.
+        for sig in self.parent_terminal_signals:
+            signal.signal(sig, signal.SIG_IGN)
+        fcntl.ioctl(self.slave, termios.TIOCSCTTY, 0)
+        self.parent_terminal = True
+
+    def _detach_parent_terminal(self):
+        if getattr(self, "parent_terminal", False):
+            # Keep errors fatal: a failed detach cannot establish a fresh
+            # controlling-terminal relationship for the next fixture.
+            fcntl.ioctl(self.slave, termios.TIOCNOTTY, 0)
+            self.parent_terminal = False
+
+    def _restore_parent_signals(self):
+        handlers = getattr(self, "parent_terminal_signals", None)
+        if handlers is not None:
+            self.parent_terminal_signals = None
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
     def resize(self, rows, cols):
         # TIOCSWINSZ notifies the controlling PTY's foreground process group itself.
@@ -569,7 +630,10 @@ class Session:
     def hangup(self):
         """Disconnect this session's controlling terminal without reaping its child."""
         descriptor, self.master = self.master, None
-        os.close(descriptor)
+        try:
+            self._detach_parent_terminal()
+        finally:
+            os.close(descriptor)
 
     def _terminate_child(self):
         """Kill and reap only our child without leaving terminal output blocked."""
@@ -622,7 +686,7 @@ class Session:
         original_failure = sys.exception()
         try:
             try:
-                if self.child.poll() is None:
+                if self.child is not None and self.child.poll() is None:
                     self._terminate_child()
                 # Ordinary sessions still require restoration in finish().
                 if self.master is not None:
@@ -642,6 +706,60 @@ class Session:
             if original_failure is None:
                 raise
             original_failure.add_note(f"PTY cleanup also failed: {cleanup_failure!r}")
+        finally:
+            self._restore_parent_signals()
+
+
+def check_freebsd_terminal_lifetime():
+    """Check unread exit output and the unchanged finish oracle before cleanup."""
+    if not sys.platform.startswith("freebsd"):
+        return
+    child_code = r"""import os, signal, sys, termios, tty
+assert os.getsid(0) == int(sys.argv[2])
+assert os.getpgrp() == os.getpid() == os.tcgetpgrp(0)
+assert signal.getsignal(signal.SIGHUP) == signal.SIG_DFL
+assert signal.getsignal(signal.SIGTTOU) == signal.SIG_DFL
+saved = termios.tcgetattr(0)
+tty.setraw(0, termios.TCSANOW)
+os.write(1, b"\x1b[?1049h\x1b[?1000h")
+if sys.argv[1] != "raw":
+    termios.tcsetattr(0, termios.TCSANOW, saved)
+if sys.argv[1] != "missing-escape":
+    os.write(1, b"\x1b[?1049l")
+os.write(1, b"\x1b[?1000lPTY-EXIT-MARKER")
+"""
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGHUP, signal.SIGTTOU)}
+    for mode, failure in (("restore", None), ("raw", "terminal attributes were not restored"),
+                          ("missing-escape", "alternate screen was not restored")):
+        session = Session(Path(sys.executable), Path("fixture"), None,
+                          extra_args=("-c", child_code, mode, str(os.getpid())))
+        try:
+            # Deliberately do not drain until the actual app PID has exited.
+            # The owner must preserve bytes, not win a read-versus-exit race.
+            assert session.child.wait(timeout=5) == 0, "foreground terminal fixture failed"
+            assert not session.raw, "terminal fixture drained before child exit"
+            try:
+                session.finish()
+            except AssertionError as error:
+                assert failure is not None and str(error) == failure, error
+            else:
+                assert failure is None, "finish hid a missing terminal restoration"
+            assert b"PTY-EXIT-MARKER" in session.raw, "owner lost unread shutdown output"
+        finally:
+            session.close()
+        assert all(signal.getsignal(sig) == handler for sig, handler in handlers.items())
+        require_freebsd_terminal_owner()
+
+    # A failed exec must release the harness's new terminal and signal state.
+    with tempfile.TemporaryDirectory(prefix="ldu-pty-exec-failure-", dir=".tmp") as work:
+        try:
+            Session(Path(work) / "missing-executable", Path(work), None)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("missing executable unexpectedly started")
+    assert all(signal.getsignal(sig) == handler for sig, handler in handlers.items())
+    require_freebsd_terminal_owner()
 
 
 def local_executable(binary):
@@ -2534,7 +2652,9 @@ def check_owned_terminal_hangup(binary, work, threads):
         directory.mkdir()
         for index in range(1024):
             (directory / f"item-{index:04d}").touch()
-    session = Session(binary, root, threads)
+    # This destructive case needs the real kernel HUP delivered to LDU as
+    # session leader; it intentionally cannot check a disconnected transcript.
+    session = Session(binary, root, threads, child_owns_terminal=True)
     try:
         session.wait(lambda: path_in_header(session.screen, root),
                      "terminal hangup fixture scan did not complete", timeout=30)
@@ -4309,8 +4429,11 @@ def main():
         parser.error("max-input-ms must be a finite positive number")
     if not args.binary.is_file():
         parser.error(f"binary does not exist: {args.binary}")
+    if sys.platform.startswith("freebsd"):
+        require_freebsd_terminal_owner()
     check_harness_terminal_lifetime()
     Path(".tmp").mkdir(exist_ok=True)
+    check_freebsd_terminal_lifetime()
     check_harness_failure_cleanup()
     check_archive_helper_cleanup()
     with tempfile.TemporaryDirectory(prefix="ldu-pty-", dir=".tmp") as work:

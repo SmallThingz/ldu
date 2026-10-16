@@ -125,3 +125,9 @@ Run `scripts/release.py smoke` inside the target operating system against the fi
 Linux cross-architecture checks accept an emulator as a JSON argument list, for example `--runner-json '["qemu-riscv64"]'`. That option assumes the same filesystem and OS interface. It is not a remote-host or cross-OS adapter. For a VM or a configured `cross-run` guest, stage the repository and packaged binary, then execute the smoke script inside the guest so its fixtures and `lstat` reference use that guest's filesystem. A launcher that only starts the executable without forwarding arguments and exit status cannot run this qualification.
 
 Terminal interaction, deletion, cancellation and idle behavior also need the project's PTY qualification before release. Record whether the Linux qualification kernel permits io_uring: a passing fallback run does not exercise live ring operations. On macOS and BSD, exercise kqueue readiness and its descriptor-wait fallback. Cross-compilation and header inspection alone provide no runtime evidence.
+
+On FreeBSD, run the PTY harness in an isolated session without an existing controlling terminal. The harness holds each fixture terminal until restoration is checked, while LDU remains its direct foreground child. For a standalone run from the project directory:
+
+```sh
+python3 -c 'import subprocess,sys; sys.exit(subprocess.run([sys.executable,"scripts/check_pty.py",*sys.argv[1:]],start_new_session=True).returncode)' --binary target/debug/ldu
+```
