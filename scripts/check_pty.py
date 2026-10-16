@@ -900,7 +900,8 @@ def check_owned_modal_geometry(session, root):
     session.wait(lambda: "Delete?" in session.screen.text(), "long-path deletion confirmation missing")
     session.key(b"\x1b[F")
     session.wait(lambda: "END-OF-OWNED-NAME" in session.screen.text()
-                 and "Yes · Enter" in session.screen.words(), "deletion End did not reveal the full path")
+                 and "Yes · Enter" in session.screen.words()
+                 and "Cancel · Esc" in session.screen.words(), "deletion End did not reveal the full path")
     assert "Yes · Enter" in session.screen.words() and "Cancel · Esc" in session.screen.words()
     click_modal_option(session, "Cancel · Esc")
     session.wait(lambda: "Delete?" not in session.screen.text() and session.screen.normal_view(), "long-path deletion click did not cancel")
@@ -951,7 +952,8 @@ def check_hidden_and_delete(session, root):
                      "victim ordering did not become visible")
         session.key(b"d")
         session.wait(lambda: "Delete?" in session.screen.text() and filename in session.screen.text()
-                     and "Yes · Enter" in session.screen.words(),
+                     and "Yes · Enter" in session.screen.words()
+                     and "Cancel · Esc" in session.screen.words(),
                      "delete confirmation did not identify the selected victim")
         assert "Yes · Enter" in session.screen.words() and "Cancel · Esc" in session.screen.words()
         victim = directory / filename
@@ -2538,16 +2540,73 @@ def displayed_size(size):
 
 def check_snapshot_info(session, snapshot):
     apparent, allocated, items = snapshot_totals(snapshot)
+    expected_sizes = f"Allocated: {displayed_size(allocated)} Apparent: {displayed_size(apparent)}"
+    expected_counts = f"Directory · {items} items · 0 errors"
     session.key(b"i")
-    session.wait(lambda: session.screen.has_modal_title("Info"),
-                 "parent total information did not open")
-    words = session.screen.words()
-    assert f"Allocated: {displayed_size(allocated)} Apparent: {displayed_size(apparent)}" in words, \
-        f"scoped refresh changed retained/global hardlink totals: {words}"
-    assert f"Directory · {items} items · 0 errors" in words and "Complete" in words, \
-        f"scoped refresh changed retained item/error/completion counts: {words}"
+    # A PTY read can stop after the title or size line of the same frame.
+    # Keep the complete expected body as the oracle while later rows arrive.
+    session.wait(lambda: session.screen.has_modal_title("Info")
+                 and expected_sizes in session.screen.words()
+                 and expected_counts in session.screen.words()
+                 and "Complete" in session.screen.words(),
+                 f"parent total information did not match {expected_sizes}; {expected_counts}; Complete")
     session.key(b"\x1b")
     session.wait(lambda: session.screen.normal_view(), "parent information did not close")
+
+
+def check_snapshot_info_fragments():
+    """Exercise the real assertion helper across partial frames and wrong totals."""
+    class Directory:
+        st_mode = stat.S_IFDIR
+        st_size = 1024
+        st_blocks = 8
+
+    class FragmentedSession:
+        def __init__(self, sizes, counts, completion):
+            self.screen = Screen(rows=6)
+            self.parts = [
+                ("\x1b[1;1H\x1b[48;5;0m┌─\x1b[1m Info \x1b[22m─┐\x1b[0m"
+                 "\x1b[2;1H/fixture\x1b[3;1H" + sizes).encode(),
+                ("\x1b[4;1H" + counts).encode(),
+                ("\x1b[5;1H" + completion).encode(),
+            ]
+            self.pending = []
+            self.keys = []
+
+        def key(self, key):
+            self.keys.append(key)
+            assert not self.pending, "Info was accepted before its complete body arrived"
+            if key == b"i":
+                self.pending = self.parts.copy()
+            else:
+                assert key == b"\x1b", key
+                self.pending = [b"\x1b[0m\x1b[2J\x1b[1;1H/fixture  Scan complete"
+                                b"\x1b[1;95H? help\x1b[2;1H../"]
+
+        def wait(self, predicate, description):
+            while not predicate():
+                assert self.pending, description
+                self.screen.feed(self.pending.pop(0))
+
+    sizes = "Allocated: 4.0 KiB Apparent: 1.0 KiB"
+    counts = "Directory · 0 items · 0 errors"
+    for body in ((sizes, counts, "Complete"),
+                 (sizes.replace("4.0", "8.0"), counts, "Complete"),
+                 (sizes.replace("1.0", "2.0"), counts, "Complete"),
+                 (sizes, "Directory · 1 items · 0 errors", "Complete"),
+                 (sizes, "Directory · 0 items · 1 errors", "Complete"),
+                 (sizes, counts, "Partial total")):
+        valid = body == (sizes, counts, "Complete")
+        session = FragmentedSession(*body)
+        try:
+            check_snapshot_info(session, {Path("."): Directory()})
+        except AssertionError as error:
+            assert not valid, "fragmented valid Info was rejected"
+            assert str(error).startswith("parent total information did not match"), error
+            assert session.keys == [b"i"], "incorrect Info was accepted and closed"
+        else:
+            assert valid, "incorrect snapshot Info passed its full-body oracle"
+            assert session.keys == [b"i", b"\x1b"] and not session.pending
 
 
 def refresh_fixture(session, key, current):
@@ -4065,6 +4124,7 @@ def main():
         raise SystemExit("PTY qualification requires assertions; rerun without -O or PYTHONOPTIMIZE")
     check_screen_widgets()
     check_printable_names()
+    check_snapshot_info_fragments()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/ldu"))
     parser.add_argument("--root", type=Path,
