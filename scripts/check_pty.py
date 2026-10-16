@@ -3371,7 +3371,7 @@ def check_owned_leaf_root_idle(binary, work, threads):
                          f"{label} root information did not retain its leaf kind")
             if label == "missing":
                 session.wait(
-                    lambda: "Latest scan error:" in session.screen.words(),
+                    lambda: "Latest error:" in session.screen.words(),
                     "missing root information omitted the scanner error")
             assert sentinel.name not in session.screen.text(), \
                 "symlink root exposed its target's child"

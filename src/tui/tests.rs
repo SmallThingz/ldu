@@ -16494,3 +16494,31 @@ fn opening_delayed_capture_retains_elapsed_hover_guard_until_input_drains() {
     app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None, false);
     assert!(app.modal.is_none());
 }
+
+#[test]
+fn deletion_error_info_and_report_escape_the_same_raw_diagnostic_once() {
+    for (message, escaped) in [
+        ("ordinary deletion failure", "ordinary deletion failure"),
+        (
+            "could not restore permissions of /scan/one\\two: denied",
+            r"could not restore permissions of /scan/one\\two: denied",
+        ),
+        (
+            "path\nwith\ttab\rreturn\u{1b}[31m\u{202e}",
+            r"path\nwith\ttab\rreturn\u{1b}[31m\u{202e}",
+        ),
+    ] {
+        let mut app = browser_fixture();
+        app.delete_failed(2, &io::Error::other(message), Vec::new());
+        let raw = format!("Delete failed: {message}");
+        assert_eq!(app.model.last_error.as_deref(), Some(raw.as_str()));
+        let report = &app.delete_notices[0];
+        assert_eq!(report.errors[0].message, message);
+        let line = report.visible_lines(1, 1, 0, 200, Color::Cyan)[0].to_string();
+        assert_eq!(line, escaped);
+        assert!(
+            app.info()
+                .ends_with(&format!("\n\nLatest error: Delete failed: {line}"))
+        );
+    }
+}

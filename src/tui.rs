@@ -1118,10 +1118,7 @@ impl App {
         mut errors: Vec<DeleteError>,
         path: PathBuf,
     ) {
-        let message = printable(OsStr::new(&error.to_string()));
-        let changed = self
-            .model
-            .note_error(id, format!("Delete failed: {message}"));
+        let changed = self.model.note_error(id, format!("Delete failed: {error}"));
         self.changed(changed);
         if errors.is_empty() {
             errors.push(DeleteError {
@@ -5355,7 +5352,7 @@ impl App {
             text.push_str("\nHardlink already counted elsewhere.");
         }
         if let Some(error) = self.model.last_error.as_ref() {
-            text.push_str("\n\nLatest scan error: ");
+            text.push_str("\n\nLatest error: ");
             text.push_str(&printable(OsStr::new(error)));
         }
         text
