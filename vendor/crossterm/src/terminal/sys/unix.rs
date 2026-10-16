@@ -18,7 +18,7 @@ use rustix::{
     termios::{Termios, Winsize},
 };
 
-use std::{fs::File, io, process};
+use std::{fs::File, io};
 #[cfg(feature = "libc")]
 use std::{
     mem,
@@ -95,13 +95,8 @@ pub(crate) fn window_size() -> io::Result<WindowSize> {
     Ok(size.into())
 }
 
-#[allow(clippy::useless_conversion)]
 pub(crate) fn size() -> io::Result<(u16, u16)> {
-    if let Ok(window_size) = window_size() {
-        return Ok((window_size.columns, window_size.rows));
-    }
-
-    tput_size().ok_or_else(|| std::io::Error::last_os_error().into())
+    window_size().map(|size| (size.columns, size.rows))
 }
 
 #[cfg(feature = "libc")]
@@ -266,36 +261,6 @@ fn query_keyboard_enhancement_flags_raw() -> io::Result<Option<KeyboardEnhanceme
     }
 }
 
-/// execute tput with the given argument and parse
-/// the output as a u16.
-///
-/// The arg should be "cols" or "lines"
-fn tput_value(arg: &str) -> Option<u16> {
-    let output = process::Command::new("tput").arg(arg).output().ok()?;
-    let value = output
-        .stdout
-        .into_iter()
-        .filter_map(|b| char::from(b).to_digit(10))
-        .fold(0, |v, n| v * 10 + n as u16);
-
-    if value > 0 {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// Returns the size of the screen as determined by tput.
-///
-/// This alternate way of computing the size is useful
-/// when in a subshell.
-fn tput_size() -> Option<(u16, u16)> {
-    match (tput_value("cols"), tput_value("lines")) {
-        (Some(w), Some(h)) => Some((w, h)),
-        _ => None,
-    }
-}
-
 #[cfg(feature = "libc")]
 // Transform the given mode into an raw mode (non-canonical) mode.
 fn raw_terminal_attr(termios: &mut Termios) {
@@ -321,6 +286,100 @@ fn wrap_with_result(result: i32) -> io::Result<()> {
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "use-dev-tty"))]
+mod size_failure_tests {
+    use std::{
+        fs, io,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::{Child, Command, ExitStatus, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::{size, window_size};
+
+    const CHILD_FIXTURE: &str = "CROSSTERM_LDU_SIZE_FAILURE_FIXTURE";
+    const TEST_NAME: &str =
+        "terminal::sys::unix::size_failure_tests::size_failure_returns_without_helpers";
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait_until(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn size_failure_returns_without_helpers() -> io::Result<()> {
+        if let Some(directory) = std::env::var_os(CHILD_FIXTURE) {
+            // This child inherits the parent's process group, so it can create a fresh session.
+            rustix::process::setsid()?;
+            assert!(fs::File::open("/dev/tty").is_err());
+            let expected = window_size().expect_err("fixture must have no terminal");
+            let actual = size().expect_err("failed size query must not use a helper");
+            assert!(expected.raw_os_error().is_some());
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+            fs::write(PathBuf::from(directory).join("checked"), b"checked")?;
+            return Ok(());
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("crossterm-size-failure-{}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let fixture = Fixture(directory);
+        let directory = fixture.0.canonicalize()?;
+        let helper = directory.join("tput");
+        fs::write(
+            &helper,
+            b"#!/bin/sh\nprintf x > \"$CROSSTERM_LDU_SIZE_FAILURE_FIXTURE/invoked\"\nprintf '80\\n'\n",
+        )?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
+
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["--exact", TEST_NAME, "--test-threads=1"])
+            .env(CHILD_FIXTURE, &directory)
+            .env("PATH", &directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = command.spawn()?;
+        let outcome = wait_until(&mut child, Duration::from_secs(30));
+        if !matches!(outcome, Ok(Some(_))) {
+            // Keep the direct child unreaped until any required signal has been sent.
+            let stop = child.kill();
+            let reaped = wait_until(&mut child, Duration::from_secs(5));
+            assert!(
+                matches!(reaped, Ok(Some(_))),
+                "size fixture did not stop: kill={stop:?}, wait={reaped:?}"
+            );
+        }
+        assert!(
+            !directory.join("invoked").exists(),
+            "size() invoked tput after the terminal query failed"
+        );
+        let status = outcome?.expect("terminal-size fixture exceeded its finite completion deadline");
+        assert!(status.success(), "terminal-size child failed: {status}");
+        assert!(directory.join("checked").is_file(), "child test did not run");
         Ok(())
     }
 }
