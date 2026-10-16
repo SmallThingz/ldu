@@ -1116,7 +1116,7 @@ fn headless_export_accepts_its_first_temporary_candidate_as_the_output_name() {
             r#"exec "$1" -0 --threads 2 --backend native -o "$2/.ldu-export-$$-0" "$3""#,
             "ldu-export-fixture",
         ])
-        .arg(env!("CARGO_BIN_EXE_ldu"))
+        .arg(ldu_command().get_program())
         .arg(work.path())
         .arg(&root)
         .env(
