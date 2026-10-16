@@ -358,6 +358,108 @@ if sys.argv[1] == "restore":
                     os.close(slave)
 
 
+def check_harness_failure_cleanup():
+    """Reap an owned, backpressured PTY child without hiding the original failure."""
+    child_code = """import os, signal, sys, termios, tty
+tty.setraw(0, termios.TCSANOW)
+os.set_blocking(1, False)
+queued = 0
+while queued < 8 * 1024 * 1024:
+    try:
+        queued += os.write(1, b"x" * 4096)
+    except BlockingIOError:
+        break
+else:
+    raise AssertionError("PTY fixture did not reach output backpressure")
+assert queued > 0
+os.write(int(sys.argv[1]), b"ready")
+os.close(int(sys.argv[1]))
+signal.pause()
+"""
+    session = Session.__new__(Session)
+    session.master, session.slave = pty.openpty()
+    child = None
+    wait = None
+    ready_read, ready_write = os.pipe()
+    config_home = tempfile.TemporaryDirectory(prefix="ldu-pty-cleanup-", dir=".tmp")
+    config_path = Path(config_home.name)
+    session.config_home = config_home
+    try:
+        session.saved = termios.tcgetattr(session.slave)
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(ready_write)],
+            stdin=session.slave, stdout=session.slave, stderr=session.slave,
+            pass_fds=(ready_write,), preexec_fn=own_terminal,
+        )
+        session.child = child
+        os.close(ready_write)
+        ready_write = None
+        assert select.select([ready_read], [], [], 5)[0], "PTY cleanup fixture did not become ready"
+        assert os.read(ready_read, 5) == b"ready", "PTY cleanup fixture exited before filling output"
+        assert child.poll() is None, "PTY cleanup fixture exited before cleanup"
+        assert select.select([session.master], [], [], 0)[0], "PTY cleanup fixture has no queued output"
+        assert termios.tcgetattr(session.master) != session.saved, "PTY cleanup fixture never entered raw mode"
+        master, slave = session.master, session.slave
+        wait = child.wait
+
+        def bounded_wait(timeout=None):
+            # Reject the old unbounded wait before it can hang the regression.
+            # Still reap the real, directly owned child when the call is bounded.
+            assert timeout is not None and 0 < timeout <= 5, "PTY cleanup used an unbounded wait"
+            return wait(timeout=timeout)
+
+        def reject_observer(*_args):
+            raise AssertionError("PTY failure cleanup interpreted output through an observer")
+
+        child.wait = bounded_wait
+        session.pump = reject_observer
+        session.observe = reject_observer
+        original = AssertionError("intentional PTY fixture failure")
+        try:
+            try:
+                raise original
+            finally:
+                session.close()
+        except AssertionError as observed:
+            assert observed is original, "PTY cleanup replaced the original assertion"
+            assert not getattr(observed, "__notes__", ()), "PTY cleanup unexpectedly failed"
+        else:
+            raise AssertionError("PTY cleanup swallowed the original assertion")
+        assert child.returncode == -signal.SIGKILL, "PTY cleanup did not reap its owned child"
+        assert not config_path.exists(), "PTY cleanup retained its configuration directory"
+        for descriptor in (master, slave):
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                assert error.errno == errno.EBADF, error
+            else:
+                raise AssertionError("PTY cleanup retained an owned endpoint")
+    finally:
+        # Failure cleanup for this control must also avoid unread-output waits.
+        # Close the endpoints before the final bounded reap, even with old close().
+        try:
+            if child is not None and child.poll() is None:
+                child.kill()
+        finally:
+            for name in ("master", "slave"):
+                descriptor = getattr(session, name)
+                if descriptor is not None:
+                    setattr(session, name, None)
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+            try:
+                if child is not None:
+                    (wait or child.wait)(timeout=5)
+            finally:
+                os.close(ready_read)
+                if ready_write is not None:
+                    os.close(ready_write)
+                config_home.cleanup()
+
+
 class Session:
     def __init__(self, binary, root, threads, env=None, extra_args=()):
         self.master, self.slave = pty.openpty()
@@ -470,25 +572,77 @@ class Session:
         descriptor, self.master = self.master, None
         os.close(descriptor)
 
-    def close(self):
+    def _terminate_child(self):
+        """Kill and reap only our child without leaving terminal output blocked."""
         try:
-            if self.child.poll() is None:
-                # Only this harness's ldu child is terminated on assertion failures.
-                self.child.kill()
-                self.child.wait()
-            # A disconnected terminal cannot accept restored attributes. Ordinary
-            # sessions still require restoration in finish() before this cleanup.
+            self.child.kill()
+            deadline = time.monotonic() + 5
             if self.master is not None:
-                termios.tcsetattr(self.master, termios.TCSANOW, self.saved)
+                os.set_blocking(self.master, False)
+            while self.child.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"PTY child {self.child.pid} did not exit during cleanup")
+                if self.master is None:
+                    self.child.wait(timeout=remaining)
+                    break
+                ready, _, _ = select.select([self.master], [], [], min(0.05, remaining))
+                if ready:
+                    try:
+                        data = os.read(self.master, 65536)
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        data = b""
+                    if data:
+                        # An assertion's observer may itself fail. Drain without
+                        # interpreting or retaining more output during cleanup.
+                        continue
+                    try:
+                        self.child.wait(timeout=min(0.05, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
         finally:
+            if self.child.poll() is None:
+                # BSD session-leader exit may wait for queued terminal output.
+                # Disconnect both owned endpoints before one final bounded reap.
+                try:
+                    if self.master is not None:
+                        self.hangup()
+                finally:
+                    try:
+                        if self.slave is not None:
+                            descriptor, self.slave = self.slave, None
+                            os.close(descriptor)
+                    finally:
+                        self.child.wait(timeout=5)
+
+    def close(self):
+        original_failure = sys.exception()
+        try:
             try:
+                if self.child.poll() is None:
+                    self._terminate_child()
+                # Ordinary sessions still require restoration in finish().
                 if self.master is not None:
-                    os.close(self.master)
+                    termios.tcsetattr(self.master, termios.TCSANOW, self.saved)
             finally:
                 try:
-                    os.close(self.slave)
+                    if self.master is not None:
+                        self.hangup()
                 finally:
-                    self.config_home.cleanup()
+                    try:
+                        if self.slave is not None:
+                            descriptor, self.slave = self.slave, None
+                            os.close(descriptor)
+                    finally:
+                        self.config_home.cleanup()
+        except BaseException as cleanup_failure:
+            if original_failure is None:
+                raise
+            original_failure.add_note(f"PTY cleanup also failed: {cleanup_failure!r}")
 
 
 def local_executable(binary):
@@ -3928,6 +4082,7 @@ def main():
         parser.error(f"binary does not exist: {args.binary}")
     check_harness_terminal_lifetime()
     Path(".tmp").mkdir(exist_ok=True)
+    check_harness_failure_cleanup()
     with tempfile.TemporaryDirectory(prefix="ldu-pty-", dir=".tmp") as work:
         root = args.root or Path(work)
         if args.root is None:
