@@ -284,7 +284,8 @@ def add_runtime(book, root, target):
     bundled = root / "licenses" / "runtime"
     sources = json.loads((bundled / "sources.json").read_text(encoding="utf-8"))
     if system == "linux-musl":
-        require("musl-COPYRIGHT.txt" in sources, "Missing musl notice provenance")
+        for name in ("musl-COPYRIGHT.txt", "musl-THIRD-PARTY-NOTICES.txt"):
+            require(name in sources, f"Missing musl notice provenance: {name}")
     elif system == "freebsd":
         require(any(name.startswith("freebsd-14.5-") for name in sources),
                 "Missing FreeBSD startup notice provenance")

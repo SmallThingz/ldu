@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import unittest
@@ -170,11 +171,43 @@ class NoticeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundled = root / "licenses/runtime"
-            bundled.mkdir(parents=True)
+            shutil.copytree(Path(__file__).resolve().parents[1] / "licenses/runtime", bundled)
             (bundled / "musl-COPYRIGHT.txt").write_bytes(b"tampered")
-            (bundled / "sources.json").write_text(json.dumps({"musl-COPYRIGHT.txt": {
-                "url": "https://example.test/musl", "sha256": hashlib.sha256(b"expected").hexdigest()}}))
             with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                licenses.add_runtime(licenses.NoticeBook(), root, "x86_64-unknown-linux-musl")
+
+    def test_musl_supplement_preserves_complete_original_permission_blocks(self):
+        root = Path(__file__).resolve().parents[1]
+        book = licenses.NoticeBook()
+        licenses.add_runtime(book, root, "armv7-unknown-linux-musleabihf")
+        rendered = book.render()
+        supplement = root / "licenses/runtime/musl-THIRD-PARTY-NOTICES.txt"
+        self.assertIn(supplement.read_bytes(), rendered)
+        # Original comment hashes from the pinned musl 1.2.5 archive, covering
+        # the full BSD disclaimer, Arm copyrights and Sun permission text.
+        expected = {
+            'src/math/sin.c': '0c3d0381d2cd647be68590170490be5f624c962d9f95eb698489e578c1de8f05',
+            'src/string/aarch64/memcpy.S': '6eca170c32acaced38b3e559fda9908b2f16717fc7b4cde36ced5fb407f4f114',
+            'src/string/aarch64/memset.S': 'b538ed96d0c4574442e0e3d9be99ca108335ab88db8ef8ca96a08bc9e8d74fa8',
+            'src/string/arm/memcpy.S': '695731bda1c73c7f88c0d04d76ae94efa1eb1cc820b9e97fc384d274571a20d1',
+        }
+        bodies = {hashlib.sha256(body).hexdigest()
+                  for body in re.findall(rb"/\*.*?\*/", rendered, re.DOTALL)}
+        for path, digest in expected.items():
+            with self.subTest(source=path):
+                self.assertIn(path.encode(), rendered)
+                self.assertIn(digest, bodies)
+
+    def test_missing_musl_supplement_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundled = root / "licenses/runtime"
+            shutil.copytree(Path(__file__).resolve().parents[1] / "licenses/runtime", bundled)
+            inventory = bundled / "sources.json"
+            sources = json.loads(inventory.read_text())
+            del sources["musl-THIRD-PARTY-NOTICES.txt"]
+            inventory.write_text(json.dumps(sources))
+            with self.assertRaisesRegex(RuntimeError, "Missing musl notice provenance"):
                 licenses.add_runtime(licenses.NoticeBook(), root, "x86_64-unknown-linux-musl")
 
     def test_unsupported_runtime_is_rejected(self):
@@ -195,6 +228,10 @@ class NoticeTests(unittest.TestCase):
                 rendered = book.render()
                 self.assertIn(wanted, rendered)
                 self.assertNotIn(unwanted, rendered)
+                if "linux-musl" in target:
+                    self.assertIn(b"musl-THIRD-PARTY-NOTICES.txt", rendered)
+                else:
+                    self.assertNotIn(b"musl-THIRD-PARTY-NOTICES.txt", rendered)
                 if "apple" in target:
                     self.assertNotIn(b"freebsd-14.5-", rendered)
 

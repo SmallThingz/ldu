@@ -10,3 +10,9 @@ These notices accompany the Rust 1.99.0 standard library and statically linked r
 The packaging script also copies `COPYRIGHT-library.html` and the license texts from the installed, pinned Rust toolchain's `share/doc/rust` directory. Cargo package notices and source links are collected separately. A notice included here does not imply that every build links every runtime.
 
 Runtime notices are filtered by target: musl appears only in Linux packages, FreeBSD startup notices only in FreeBSD packages. macOS links Apple system libraries rather than redistributing them. The Rust runtime catalog remains conservative across all three systems. Cross-linkers that substitute a different CRT must supply its applicable notices before packaging.
+
+`musl-THIRD-PARTY-NOTICES.txt` preserves the complete copyright and permission
+comment blocks from the pinned musl 1.2.5 archive, with source paths. Its 48
+identical-body groups cover 128 source files conservatively; they do not claim
+that every routine is linked. The archive and generated notice hashes are pinned
+in `sources.json`. This supplement is included only for Linux musl targets.

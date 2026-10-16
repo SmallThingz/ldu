@@ -6,6 +6,15 @@
       "linux-musl"
     ]
   },
+  "musl-THIRD-PARTY-NOTICES.txt": {
+    "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+    "sha256": "536bdbe042bf2accc03a39398d5fa407c25e6c62933a815b38d4e86b603b0482",
+    "source_sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+    "extraction": "Complete original copyright, SPDX, redistribution and permission comment blocks from 128 source files; 48 byte-identical bodies grouped with every source path preserved inline.",
+    "platforms": [
+      "linux-musl"
+    ]
+  },
   "compiler-builtins-LICENSE.txt": {
     "url": "https://raw.githubusercontent.com/rust-lang/rust/1.99.0/library/compiler-builtins/LICENSE.txt",
     "sha256": "ab6eec6caf0fa5775e411c7a8bc6a45c4ef2956b0980b157ab74fc5cd62a928b"
