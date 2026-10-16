@@ -17,6 +17,7 @@
     "Replace the package manifest and README; omit examples, documentation assets and example-only dev-dependencies.",
     "Keep existing library tests and doctests; scope serial_test to Windows tests.",
     "Match the private fork to LDU\u2019s Rust 1.99 requirement and use serial_test 3.5 without async/logging defaults for Windows tests.",
-    "Remove redundant closure parentheses reported by the current compiler; preserve the file's upstream line endings."
+    "Remove redundant closure parentheses reported by the current compiler; preserve the file's upstream line endings.",
+    "Serialize color-state unit tests, restore memoized state and NO_COLOR after each test, and exercise the background-color roundtrip constructor."
   ]
 }

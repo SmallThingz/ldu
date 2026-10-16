@@ -155,8 +155,50 @@ impl fmt::Display for Colored {
 #[cfg(test)]
 mod tests {
     use crate::style::{Color, Colored};
+    use parking_lot::{Mutex, MutexGuard};
+
+    // Every test that reads or changes the memoized color flag holds this lock.
+    static COLOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ColorTestGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: bool,
+    }
+
+    impl Drop for ColorTestGuard {
+        fn drop(&mut self) {
+            Colored::set_ansi_color_disabled(self.original);
+        }
+    }
+
+    fn color_test_guard() -> ColorTestGuard {
+        let lock = COLOR_TEST_LOCK.lock();
+        // Initialize before overriding so inherited NO_COLOR is restored too.
+        let original = Colored::ansi_color_disabled_memoized();
+        Colored::set_ansi_color_disabled(false);
+        ColorTestGuard { _lock: lock, original }
+    }
+
+    #[test]
+    fn test_color_guard_restores_state_after_unwind() {
+        let mut original = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = color_test_guard();
+            original = Some(guard.original);
+            assert!(!Colored::ansi_color_disabled_memoized());
+            Colored::set_ansi_color_disabled(!guard.original);
+            panic!("color guard unwind");
+        }));
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"color guard unwind")
+        );
+        let _lock = COLOR_TEST_LOCK.lock();
+        assert_eq!(Colored::ansi_color_disabled_memoized(), original.unwrap());
+    }
 
     fn check_format_color(colored: Colored, expected: &str) {
+        let _guard = color_test_guard();
         Colored::set_ansi_color_disabled(true);
         assert_eq!(colored.to_string(), "");
         Colored::set_ansi_color_disabled(false);
@@ -206,11 +248,12 @@ mod tests {
 
     #[test]
     fn test_parse_ansi_bg() {
-        test_parse_ansi(Colored::ForegroundColor)
+        test_parse_ansi(Colored::BackgroundColor)
     }
 
     /// Used for test_parse_ansi_fg and test_parse_ansi_bg
     fn test_parse_ansi(bg_or_fg: impl Fn(Color) -> Colored) {
+        let _guard = color_test_guard();
         /// Formats a re-parses `color` to check the result.
         macro_rules! test {
             ($color:expr) => {
@@ -308,13 +351,16 @@ mod tests {
 
     #[test]
     fn test_no_color() {
-        std::env::set_var("NO_COLOR", "1");
-        assert!(Colored::ansi_color_disabled());
-        std::env::set_var("NO_COLOR", "XXX");
-        assert!(Colored::ansi_color_disabled());
-        std::env::set_var("NO_COLOR", "");
-        assert!(!Colored::ansi_color_disabled());
-        std::env::remove_var("NO_COLOR");
-        assert!(!Colored::ansi_color_disabled());
+        let _guard = color_test_guard();
+        for (value, disabled) in [
+            (Some("1"), true),
+            (Some("XXX"), true),
+            (Some(""), false),
+            (None, false),
+        ] {
+            temp_env::with_var("NO_COLOR", value, || {
+                assert_eq!(Colored::ansi_color_disabled(), disabled);
+            });
+        }
     }
 }
