@@ -197,12 +197,13 @@ class PackageTests(unittest.TestCase):
                 patch.object(release.platform, "system", return_value="Linux"), \
                 contextlib.redirect_stdout(io.StringIO()):
             release.package(args, "0.1.0", binary)
-        return self.root / "out" / f"ldu-v0.1.0-{target}"
+        return self.root / "out" / release.asset_name(target)
 
     def test_mac_package_preserves_every_signed_byte_and_records_no_runtime_claim(self):
         notices = {"LICENSE": b"terms", "licenses/THIRD-PARTY-NOTICES.txt": b"required"}
         data = macho(archive=release.notice_contents(notices, 1700000000))
         output = self.package(data, notices)
+        self.assertEqual(output.name, "ldu-macos-arm64")
         self.assertEqual(output.read_bytes(), data)
         manifest = json.loads((self.root / ".tmp/release-manifest-aarch64-apple-darwin.json").read_text())
         self.assertFalse(manifest["runtime_tested"])

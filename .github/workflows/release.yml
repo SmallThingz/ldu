@@ -79,8 +79,8 @@ jobs:
 
       - name: Test the final executable
         run: |
-          release_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          python3 scripts/release.py smoke --target "$LDU_TARGET" --binary "dist/ldu-v${release_version}-${LDU_TARGET}" --runner-json "$LDU_SMOKE_RUNNER"
+          release_name="$(PYTHONPATH=scripts python3 -c 'import os, release; print(release.asset_name(os.environ["LDU_TARGET"]))')"
+          python3 scripts/release.py smoke --target "$LDU_TARGET" --binary "dist/$release_name" --runner-json "$LDU_SMOKE_RUNNER"
 
       - name: Upload the standalone executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

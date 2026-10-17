@@ -145,10 +145,11 @@ jobs:
           codesign --verify --strict "target/$LDU_TARGET/release/ldu"
           python3 scripts/release.py package --target "$LDU_TARGET" --output .tmp/native-macos/bin
           python3 - <<'PY'
-          import hashlib, json, os, tomllib
+          import hashlib, json, os, sys
           from pathlib import Path
-          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
-          binary = Path(f'.tmp/native-macos/bin/ldu-v{version}-{os.environ["LDU_TARGET"]}').resolve()
+          sys.path.insert(0, "scripts")
+          from release import asset_name
+          binary = (Path(".tmp/native-macos/bin") / asset_name(os.environ["LDU_TARGET"])).resolve()
           record = {"binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     "target": os.environ["LDU_TARGET"], "source_commit": os.environ["GITHUB_SHA"]}
           Path(".tmp/native-macos/artifact.json").write_text(json.dumps(record, sort_keys=True))

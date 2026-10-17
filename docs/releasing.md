@@ -1,6 +1,6 @@
 # Preparing binaries
 
-These commands create local binaries. They do not publish a release or change existing GitHub assets. Each output directory contains only executables; build and smoke reports stay under `.tmp/`. The v0.1.0 installer in `scripts/install.sh` expects plain binary assets named `ldu-v0.1.0-TARGET` and installs into `~/.local/bin`, or `LDU_INSTALL_DIR` when set.
+These commands create local binaries. They do not publish a release or change existing GitHub assets. Each output directory contains only executables; build and smoke reports stay under `.tmp/`. The v0.1.0 installer in `scripts/install.sh` expects plain binary assets named `ldu-SYSTEM-ARCH` (for example, `ldu-linux-x86_64` or `ldu-macos-arm64`) and installs into `~/.local/bin`, or `LDU_INSTALL_DIR` when set.
 
 The [release workflow](../.github/workflows/release.yml) still builds the four Linux musl targets. The local packager also accepts macOS and FreeBSD:
 
@@ -10,7 +10,7 @@ The [release workflow](../.github/workflows/release.yml) still builds the four L
 | macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Apple system libraries |
 | FreeBSD | `x86_64-unknown-freebsd`, `aarch64-unknown-freebsd` | FreeBSD base-system libraries |
 
-Runtime qualification uses Linux checks, FreeBSD 14.5 VMs and the [manual native macOS workflow](../.github/workflows/macos-qualification.yml). The macOS workflow runs tests, Clippy, signature verification, package smoke checks, PTY checks and filesystem CLI checks on Intel and Apple Silicon runners; it publishes no binaries. Qualification requires a successful run tied to the source commit and packaged binary hash. A cross-build alone is not runtime evidence. OpenBSD, NetBSD and DragonFly source paths require their own build and runtime checks; no binaries for those systems are prepared here.
+Runtime qualification uses Linux checks, FreeBSD 14.5 VMs and the [manual native macOS workflow](../.github/workflows/macos-qualification.yml). The macOS workflow runs tests, Clippy, signature verification, package smoke checks, PTY checks and filesystem CLI checks on Intel and Apple Silicon runners; it retains the verified binaries as workflow artifacts without publishing a release. Qualification requires a successful run tied to the source commit and packaged binary hash. A cross-build alone is not runtime evidence. OpenBSD, NetBSD and DragonFly source paths require their own build and runtime checks; no binaries for those systems are prepared here.
 
 For a development build on the host OS, run `cargo build --locked --release` and then `./target/release/ldu .`. Packaging needs the additional platform steps below.
 
@@ -79,7 +79,7 @@ Every packaged binary carries the project license and applicable third-party not
 
 ```sh
 python3 scripts/release.py extract-notices --target aarch64-apple-darwin \
-  --binary .tmp/release/ldu-v0.1.0-aarch64-apple-darwin --output .tmp/notices.zip
+  --binary .tmp/release/ldu-macos-arm64 --output .tmp/notices.zip
 ```
 
 The destination must not already exist. ZIP readers can also inspect the Linux and FreeBSD binaries directly. Crates that omit notice files use only the exact-version fallbacks documented in [licenses/dependencies](../licenses/dependencies/README.md).
@@ -100,7 +100,7 @@ The packager verifies the UPX tool checksum, uses NRV2E compression and checks t
 UPX's inspection tool expects its own footer at the end of the file. To inspect or decompress a packaged file, first remove its notice ZIP from a copy:
 
 ```sh
-python3 - .tmp/release-packed/ldu-v0.1.0-x86_64-unknown-linux-musl .tmp/ldu-packed-prefix <<'PY'
+python3 - .tmp/release-packed/ldu-linux-x86_64 .tmp/ldu-packed-prefix <<'PY'
 from pathlib import Path
 import sys
 import zipfile

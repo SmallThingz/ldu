@@ -42,9 +42,9 @@ arguments = sys.argv[1:]
 output = Path(arguments[arguments.index('--output') + 1])
 Path(os.environ['LDU_TEST_LOG']).write_text(arguments[-1])
 mode = os.environ.get('LDU_TEST_DOWNLOAD', 'valid')
-target = arguments[-1].rsplit('/', 1)[-1].removeprefix('ldu-v0.1.0-')
-arch = target.split('-')[0]
-mac = target.endswith('apple-darwin')
+asset = arguments[-1].rsplit('/', 1)[-1]
+_, system, arch = asset.split('-')
+mac = system == 'macos'
 if mode == 'fail':
     output.write_bytes(b'partial download')
     raise SystemExit(22)
@@ -63,8 +63,8 @@ else:
         header_size, phsize = (52, 32) if arm else (64, 56)
         data = bytearray(header_size + phsize)
         data[:9] = b'\x7fELF' + bytes([1 if arm else 2, 1, 1,
-                                      9 if target.endswith('freebsd') else 0, 0])
-        machine = {'x86_64': 62, 'aarch64': 183, 'armv7': 40, 'riscv64gc': 243}[arch]
+                                      9 if system == 'freebsd' else 0, 0])
+        machine = {'x86_64': 62, 'arm64': 183, 'armv7': 40, 'riscv64': 243}[arch]
         struct.pack_into('<HHI', data, 16, 2, machine, 1)
         if arm:
             struct.pack_into('<IIIIHHHHHH', data, 24,
@@ -73,7 +73,7 @@ else:
                 len(data), len(data), 5, 4096)
         else:
             struct.pack_into('<QQQIHHHHHH', data, 24,
-                0, header_size, 0, 5 if arch == 'riscv64gc' else 0,
+                0, header_size, 0, 5 if arch == 'riscv64' else 0,
                 header_size, phsize, 1, 0, 0, 0)
             struct.pack_into('<IIQQQQQQ', data, header_size, 1, 5, 0, 0, 0,
                 len(data), len(data), 4096)
@@ -90,7 +90,7 @@ else:
             if mac:
                 data[:4] = b'\x7fELF'
             else:
-                data[7] = 0 if target.endswith('freebsd') else 9
+                data[7] = 0 if system == 'freebsd' else 9
         elif mode == 'wrong-type':
             struct.pack_into('<I' if mac else '<H', data, 12 if mac else 16, 1)
         elif mode == 'wrong-class':
@@ -134,30 +134,30 @@ output.write_bytes(data)
 
     def test_supported_targets_install_plain_binary_with_0755_and_no_staging_files(self):
         cases = [
-            ('Linux', 'x86_64', 'x86_64-unknown-linux-musl'),
-            ('Linux', 'aarch64', 'aarch64-unknown-linux-musl'),
-            ('Linux', 'armv7l', 'armv7-unknown-linux-musleabihf'),
-            ('Linux', 'riscv64', 'riscv64gc-unknown-linux-musl'),
-            ('Darwin', 'x86_64', 'x86_64-apple-darwin'),
-            ('Darwin', 'arm64', 'aarch64-apple-darwin'),
-            ('FreeBSD', 'amd64', 'x86_64-unknown-freebsd'),
-            ('FreeBSD', 'aarch64', 'aarch64-unknown-freebsd'),
+            ('Linux', 'x86_64', 'ldu-linux-x86_64'),
+            ('Linux', 'aarch64', 'ldu-linux-arm64'),
+            ('Linux', 'armv7l', 'ldu-linux-armv7'),
+            ('Linux', 'riscv64', 'ldu-linux-riscv64'),
+            ('Darwin', 'x86_64', 'ldu-macos-x86_64'),
+            ('Darwin', 'arm64', 'ldu-macos-arm64'),
+            ('FreeBSD', 'amd64', 'ldu-freebsd-x86_64'),
+            ('FreeBSD', 'aarch64', 'ldu-freebsd-arm64'),
         ]
-        for system, architecture, target in cases:
-            with self.subTest(target=target):
+        for system, architecture, asset in cases:
+            with self.subTest(asset=asset):
                 result = self.install(system, architecture)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 installed = self.destination / 'ldu'
                 self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
                 self.assertTrue(installed.read_bytes().endswith(b'embedded notices'))
                 self.assertEqual(self.log.read_text(),
-                    f'https://github.com/SmallThingz/ldu/releases/download/v0.1.0/ldu-v0.1.0-{target}')
+                    f'https://github.com/SmallThingz/ldu/releases/download/v0.1.0/{asset}')
                 self.assert_clean()
 
     def test_rosetta_prefers_native_apple_silicon(self):
         result = self.install('Darwin', 'x86_64', LDU_TEST_ROSETTA='1')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.log.read_text().endswith('-aarch64-apple-darwin'))
+        self.assertTrue(self.log.read_text().endswith('/ldu-macos-arm64'))
 
     def test_unsupported_target_never_downloads_or_creates_install_directory(self):
         for system, architecture in [('OpenBSD', 'amd64'), ('NetBSD', 'aarch64'),

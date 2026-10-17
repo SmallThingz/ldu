@@ -16,20 +16,20 @@ command -v od >/dev/null 2>&1 || fail 'od is required'
 system=$(uname -s)
 architecture=$(uname -m)
 case "$system/$architecture" in
-    Linux/x86_64|Linux/amd64) target=x86_64-unknown-linux-musl ;;
-    Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-musl ;;
-    Linux/armv7l|Linux/armv7) target=armv7-unknown-linux-musleabihf ;;
-    Linux/riscv64) target=riscv64gc-unknown-linux-musl ;;
-    Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin ;;
+    Linux/x86_64|Linux/amd64) target=x86_64-unknown-linux-musl; asset=ldu-linux-x86_64 ;;
+    Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-musl; asset=ldu-linux-arm64 ;;
+    Linux/armv7l|Linux/armv7) target=armv7-unknown-linux-musleabihf; asset=ldu-linux-armv7 ;;
+    Linux/riscv64) target=riscv64gc-unknown-linux-musl; asset=ldu-linux-riscv64 ;;
+    Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin; asset=ldu-macos-arm64 ;;
     Darwin/x86_64)
         if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
-            target=aarch64-apple-darwin
+            target=aarch64-apple-darwin; asset=ldu-macos-arm64
         else
-            target=x86_64-apple-darwin
+            target=x86_64-apple-darwin; asset=ldu-macos-x86_64
         fi
         ;;
-    FreeBSD/amd64|FreeBSD/x86_64) target=x86_64-unknown-freebsd ;;
-    FreeBSD/arm64|FreeBSD/aarch64) target=aarch64-unknown-freebsd ;;
+    FreeBSD/amd64|FreeBSD/x86_64) target=x86_64-unknown-freebsd; asset=ldu-freebsd-x86_64 ;;
+    FreeBSD/arm64|FreeBSD/aarch64) target=aarch64-unknown-freebsd; asset=ldu-freebsd-arm64 ;;
     *) fail "no binary for $system/$architecture" ;;
 esac
 
@@ -51,7 +51,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 binary=$work_dir/ldu
-url=https://github.com/$repository/releases/download/v$version/ldu-v$version-$target
+url=https://github.com/$repository/releases/download/v$version/$asset
 curl --proto '=https' --tlsv1.2 --fail --location --retry 2 \
     --connect-timeout 10 --max-time 120 --max-filesize 16777216 \
     --output "$binary" "$url"

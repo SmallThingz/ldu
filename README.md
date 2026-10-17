@@ -7,9 +7,9 @@ Browse disk usage, preview files and queue deletions in your terminal.
 The command requires Bash and curl.
 
 ```sh
-bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/SmallThingz/ldu/v0.1.0/scripts/install.sh | sh'
+bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/SmallThingz/ldu/v0.1.0/scripts/install.sh | bash'
 ```
 
-Installs `ldu` in `~/.local/bin`. Add that directory to `PATH`, then run `ldu` or `ldu DIRECTORY`.
+Detects Linux, macOS or FreeBSD and installs `ldu` in `~/.local/bin`. Add that directory to `PATH`, then run `ldu` or `ldu DIRECTORY`.
 
 [Controls and configuration](docs/behavior.md) · [Platforms and builds](docs/releasing.md) · [MIT license](LICENSE)

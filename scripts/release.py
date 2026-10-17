@@ -19,15 +19,16 @@ import zipfile
 from licenses import collect_licenses, collect_upx_licenses
 
 TARGETS = {
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
-    "armv7-unknown-linux-musleabihf",
-    "riscv64gc-unknown-linux-musl",
-    "x86_64-unknown-freebsd",
-    "aarch64-unknown-freebsd",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl": "ldu-linux-x86_64",
+    "aarch64-unknown-linux-musl": "ldu-linux-arm64",
+    "armv7-unknown-linux-musleabihf": "ldu-linux-armv7",
+    "riscv64gc-unknown-linux-musl": "ldu-linux-riscv64",
+    "x86_64-unknown-freebsd": "ldu-freebsd-x86_64",
+    "aarch64-unknown-freebsd": "ldu-freebsd-arm64",
+    "x86_64-apple-darwin": "ldu-macos-x86_64",
+    "aarch64-apple-darwin": "ldu-macos-arm64",
 }
+
 TOOLCHAIN = "1.99.0"
 UPX_VERSION = "5.2.1"
 # Official unmodified Linux executables from github.com/upx/upx/releases/tag/v5.2.1.
@@ -61,6 +62,11 @@ def require(condition, message):
 
 def binary_for(target):
     return ROOT / "target" / target / "release" / "ldu"
+
+
+def asset_name(target):
+    require(target in TARGETS, f"Unsupported release target: {target}")
+    return TARGETS[target]
 
 
 def target_system(target):
@@ -454,7 +460,7 @@ def package(args, version, binary):
     notices = release_notices(args.target)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    released = output / f"ldu-v{version}-{args.target}"
+    released = output / asset_name(args.target)
     require(released != binary, "Release destination must differ from the build output")
     compression = None
     # Assemble next to the destination and rename only after all checks pass.
