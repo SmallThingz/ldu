@@ -1,5 +1,5 @@
 #!/bin/sh
-# Draft installer for the unpublished v0.1.0 binary assets.
+# Installer for the v0.1.0 binary assets.
 set -eu
 
 version=0.1.0

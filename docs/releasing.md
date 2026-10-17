@@ -1,6 +1,6 @@
 # Preparing binaries
 
-These commands create local binaries. They do not publish a release or change existing GitHub assets. Each output directory contains only executables; build and smoke reports stay under `.tmp/`. The v0.1.0 installer in `scripts/install.sh` is a local draft: it expects plain binary assets named `ldu-v0.1.0-TARGET` and installs into `~/.local/bin`, or `LDU_INSTALL_DIR` when set. It is not published.
+These commands create local binaries. They do not publish a release or change existing GitHub assets. Each output directory contains only executables; build and smoke reports stay under `.tmp/`. The v0.1.0 installer in `scripts/install.sh` expects plain binary assets named `ldu-v0.1.0-TARGET` and installs into `~/.local/bin`, or `LDU_INSTALL_DIR` when set.
 
 The [release workflow](../.github/workflows/release.yml) still builds the four Linux musl targets. The local packager also accepts macOS and FreeBSD:
 
