@@ -127,8 +127,29 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       MAKEFLAGS: "-j2"
     steps:
-      - name: Install declared build dependencies
-        run: pacman -Syu --noconfirm --needed git rust python
+      - name: Install declared build dependencies and verify Rust notices
+        run: |
+          printf '%s\n' 'Effective NoExtract before setup:'
+          pacman-conf NoExtract
+          # Keep Rust SPDX texts otherwise excluded by the official container.
+          mkdir -p .tmp/arch-setup
+          awk '/^[[:space:]]*NoExtract[[:space:]]*=/ { for (i = 3; i <= NF; i++) if ($i == "usr/share/doc/*") $i = "" } { print }' /etc/pacman.conf > .tmp/arch-setup/pacman.conf
+          cat .tmp/arch-setup/pacman.conf > /etc/pacman.conf
+          printf '%s\n' 'Effective NoExtract after setup:'
+          pacman-conf NoExtract
+          # Reinstall even preinstalled Rust so previously excluded files return.
+          pacman -Syu --noconfirm git rust python
+          command -v rustc
+          rustc -vV
+          rust_sysroot=$(rustc --print sysroot)
+          printf 'Rust sysroot: %s\n' "$rust_sysroot"
+          pacman -Ql rust | awk '/COPYRIGHT-library|rustc\/licenses\//'
+          catalog="$rust_sysroot/share/licenses/rust/COPYRIGHT-library.html.rustc"
+          texts="$rust_sysroot/share/doc/rustc/licenses"
+          ls -ld "$catalog" "$texts"
+          test -s "$catalog"
+          test -s "$texts/MIT.txt"
+          test -s "$texts/Apache-2.0.txt"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
