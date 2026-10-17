@@ -12,4 +12,4 @@ bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/SmallThingz/ld
 
 Detects Linux, macOS or FreeBSD and installs `ldu` in `~/.local/bin`. Add that directory to `PATH`, then run `ldu` or `ldu DIRECTORY`.
 
-[Controls and configuration](docs/behavior.md) · [Platforms and builds](docs/releasing.md) · [MIT license](LICENSE)
+[Controls and configuration](docs/behavior.md) · [Platforms and builds](docs/releasing.md) · [Distribution](docs/distribution.md) · [MIT license](LICENSE)
