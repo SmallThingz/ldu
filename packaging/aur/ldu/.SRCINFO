@@ -8,7 +8,7 @@ pkgbase = ldu
 	arch = armv7h
 	arch = riscv64
 	license = MIT
-	makedepends = rust>=1.99
+	makedepends = rust
 	makedepends = python
 	depends = gcc-libs
 	depends = glibc
