@@ -1,0 +1,167 @@
+name: Distribution qualification
+
+on:
+  push:
+    branches:
+      - "packaging/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  homebrew:
+    name: Homebrew (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            machine: x86_64
+            asset: ldu-linux-x86_64
+            sha256: 48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4
+          - runner: macos-15-intel
+            machine: x86_64
+            asset: ldu-macos-x86_64
+            sha256: 9ccb4502d4bef6368248db7e6185bba9cd3390f9568d94564ad29c1ef86b2601
+          - runner: macos-15
+            machine: arm64
+            asset: ldu-macos-arm64
+            sha256: 7e7d66b1b7913d8e4c55976dc777550c99551c08dbdf625e1bd81fd660c6b81d
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      LDU_ASSET: ${{ matrix.asset }}
+      LDU_SHA256: ${{ matrix.sha256 }}
+      LDU_MACHINE: ${{ matrix.machine }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: Homebrew/actions/setup-homebrew@4790763c0a3ba4036f72634dc079c4a7dfcd4878
+      - name: Install the actual formula from a local tap
+        run: |
+          test "$(uname -m)" = "$LDU_MACHINE"
+          tap_dir="$(brew --repository)/Library/Taps/smallthingz/homebrew-tap"
+          mkdir -p "$tap_dir/Formula"
+          cp packaging/homebrew/ldu.rb "$tap_dir/Formula/ldu.rb"
+          brew install smallthingz/tap/ldu
+          brew test smallthingz/tap/ldu
+      - name: Verify installed bytes, signature and tiny export
+        run: |
+          mkdir -p .tmp/homebrew-ci/fixture
+          curl --fail --location --retry 2 --connect-timeout 10 --max-time 120 \
+            --output .tmp/homebrew-ci/released \
+            "https://github.com/SmallThingz/ldu/releases/download/v0.1.0/$LDU_ASSET"
+          installed="$(brew --prefix smallthingz/tap/ldu)/bin/ldu"
+          cmp .tmp/homebrew-ci/released "$installed"
+          python3 -c 'import hashlib,os; from pathlib import Path; assert hashlib.sha256(Path(".tmp/homebrew-ci/released").read_bytes()).hexdigest() == os.environ["LDU_SHA256"]'
+          if [ "$(uname -s)" = Darwin ]; then codesign --verify --strict "$installed"; fi
+          test "$("$installed" --version)" = 'ldu 0.1.0'
+          "$installed" --help > /dev/null
+          printf 'payload' > .tmp/homebrew-ci/fixture/payload
+          "$installed" -o .tmp/homebrew-ci/export.json .tmp/homebrew-ci/fixture
+          python3 -c 'import json; d=json.load(open(".tmp/homebrew-ci/export.json")); assert d[:2] == [1,2]; assert any(isinstance(e,dict) and e.get("name") == "payload" for e in d[3][1:])'
+
+  nix:
+    name: Nix evaluation and native Linux install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@2cb76beab460be7e44442c7ebdcbc30b638416df
+      - name: Lock inputs and evaluate all supported systems
+        run: |
+          if [ ! -f flake.lock ]; then nix flake lock; fi
+          for system in x86_64-linux aarch64-linux x86_64-darwin aarch64-darwin; do
+            nix eval --raw ".#packages.$system.ldu.drvPath"
+            nix eval --raw ".#apps.$system.ldu.program"
+          done
+      - name: Build and smoke the native package
+        run: |
+          mkdir -p .tmp/nix-ci/fixture
+          nix build --no-write-lock-file .#packages.x86_64-linux.ldu --out-link .tmp/nix-ci/result
+          installed=.tmp/nix-ci/result/bin/ldu
+          test "$("$installed" --version)" = 'ldu 0.1.0'
+          "$installed" --help > /dev/null
+          python3 -c 'import hashlib; from pathlib import Path; assert hashlib.sha256(Path(".tmp/nix-ci/result/bin/ldu").read_bytes()).hexdigest() == "48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4"'
+          printf 'payload' > .tmp/nix-ci/fixture/payload
+          "$installed" -o .tmp/nix-ci/export.json .tmp/nix-ci/fixture
+          python3 -c 'import json; d=json.load(open(".tmp/nix-ci/export.json")); assert d[:2] == [1,2]; assert any(isinstance(e,dict) and e.get("name") == "payload" for e in d[3][1:])'
+      - name: Retain the actual evaluated lock
+        if: ${{ always() && hashFiles('flake.lock') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: distribution-flake-lock
+          path: flake.lock
+          if-no-files-found: error
+          retention-days: 7
+
+  aur:
+    name: Arch source and binary packages
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: "2"
+      MAKEFLAGS: "-j2"
+    steps:
+      - name: Install declared build dependencies
+        run: pacman -Syu --noconfirm --needed git rust rust-docs python
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build both recipes as an unprivileged user
+        run: |
+          useradd --create-home --user-group builder
+          mkdir -p .tmp/aur-ci
+          cp -a packaging/aur/ldu packaging/aur/ldu-bin .tmp/aur-ci/
+          chown -R builder:builder .tmp/aur-ci
+          for recipe in ldu ldu-bin; do
+            runuser -u builder -- env CARGO_BUILD_JOBS=2 MAKEFLAGS=-j2 \
+              bash -euo pipefail -c '
+                cd "$1"
+                makepkg --printsrcinfo > actual.SRCINFO
+                diff -u .SRCINFO actual.SRCINFO
+                makepkg --verifysource --noconfirm
+                makepkg --cleanbuild --noconfirm
+              ' bash "$PWD/.tmp/aur-ci/$recipe"
+          done
+      - name: Verify package payloads and tiny exports
+        run: |
+          for recipe in ldu ldu-bin; do
+            directory=".tmp/aur-ci/$recipe"
+            mapfile -t archives < <(find "$directory" -maxdepth 1 -name "$recipe-0.1.0-1-*.pkg.tar.*" ! -name '*.sig')
+            test "${#archives[@]}" -eq 1
+            mkdir -p "$directory/extracted" "$directory/fixture"
+            bsdtar -xf "${archives[0]}" -C "$directory/extracted"
+            installed="$directory/extracted/usr/bin/ldu"
+            test "$("$installed" --version)" = 'ldu 0.1.0'
+            "$installed" --help > /dev/null
+            if [ "$recipe" = ldu-bin ]; then
+              python -c 'import hashlib,sys; from pathlib import Path; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4"' "$installed"
+            else
+              test -s "$directory/extracted/usr/share/licenses/ldu/THIRD-PARTY-NOTICES.txt"
+            fi
+            printf 'payload' > "$directory/fixture/payload"
+            "$installed" -o "$directory/export.json" "$directory/fixture"
+            python -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[:2] == [1,2]; assert any(isinstance(e,dict) and e.get("name") == "payload" for e in d[3][1:])' "$directory/export.json"
+          done
