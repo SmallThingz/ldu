@@ -11,9 +11,11 @@ depends=('gcc-libs' 'glibc')
 # Arch's rust package supplies Cargo and the standard-library license catalog.
 makedepends=('rust' 'python')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
-        'generate-notices.py')
+        'generate-notices.py'
+        'rust-1.99.0-notices.tar.gz')
 sha256sums=('a074a8a806ba732458fdd59b7b55d96116b984597ed3f7e3fbc0dfeac5b15470'
-            '040a4cd243f6c868285ce2d6be4cbfb7e05bb368b5d32c7f35b8b97b665b3990')
+            'b8f098e1daadb8445400d9e1519ac882b5a78bd44dd032e1f4b05929b147ee03'
+            '82dc19f9a3494b9c6971aa3f31e2e1e8fdaacaa7d7e2f177aee7d612d253301c')
 
 prepare() {
     cd "$pkgname-$pkgver"
@@ -36,8 +38,9 @@ build() {
         return 1
     }
     export CARGO_TARGET_DIR=target
+    python "$srcdir/generate-notices.py" --source . --output THIRD-PARTY-NOTICES.txt \
+        --rust-notices "$srcdir/rust-1.99.0-notices"
     cargo build --frozen --release --bin ldu
-    python "$srcdir/generate-notices.py" --source . --output THIRD-PARTY-NOTICES.txt
 }
 
 package() {

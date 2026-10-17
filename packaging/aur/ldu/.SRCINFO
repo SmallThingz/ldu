@@ -14,7 +14,9 @@ pkgbase = ldu
 	depends = glibc
 	source = ldu-0.1.0.tar.gz::https://github.com/SmallThingz/ldu/archive/refs/tags/v0.1.0.tar.gz
 	source = generate-notices.py
+	source = rust-1.99.0-notices.tar.gz
 	sha256sums = a074a8a806ba732458fdd59b7b55d96116b984597ed3f7e3fbc0dfeac5b15470
-	sha256sums = 040a4cd243f6c868285ce2d6be4cbfb7e05bb368b5d32c7f35b8b97b665b3990
+	sha256sums = b8f098e1daadb8445400d9e1519ac882b5a78bd44dd032e1f4b05929b147ee03
+	sha256sums = 82dc19f9a3494b9c6971aa3f31e2e1e8fdaacaa7d7e2f177aee7d612d253301c
 
 pkgname = ldu

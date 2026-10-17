@@ -38,9 +38,9 @@ makepkg -si
 makepkg --printsrcinfo > .SRCINFO
 ```
 
-Create an [AUR account](https://aur.archlinux.org/register), add your SSH public key, and clone the package repository, for example `git clone ssh://aur@aur.archlinux.org/ldu-bin.git`. Copy the recipe files and `.SRCINFO` into that checkout, then commit and push. The source package also needs `generate-notices.py`. Follow the [AUR submission guidelines](https://wiki.archlinux.org/title/AUR_submission_guidelines).
+Create an [AUR account](https://aur.archlinux.org/register), add your SSH public key, and clone the package repository, for example `git clone ssh://aur@aur.archlinux.org/ldu-bin.git`. Copy the recipe files and `.SRCINFO` into that checkout, then commit and push. The source package also needs `generate-notices.py` and `rust-1.99.0-notices.tar.gz`. Follow the [AUR submission guidelines](https://wiki.archlinux.org/title/AUR_submission_guidelines).
 
-For updates, change the version, source URLs and checksums in each `PKGBUILD`, rebuild, and regenerate `.SRCINFO` before pushing. For the source package, also update the compiler/runtime notices and `SOURCE_COMMIT` in `generate-notices.py`. Neither package has been submitted here.
+For updates, change the version, source URLs and checksums in each `PKGBUILD`, rebuild, and regenerate `.SRCINFO` before pushing. For the source package, also update the compiler/runtime notices and `SOURCE_COMMIT` in `generate-notices.py`. Changing the supported compiler requires refreshing and revalidating the Rust notice archive too. Neither package has been submitted here.
 
 ## crates.io
 
