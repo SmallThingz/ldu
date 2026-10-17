@@ -1,0 +1,28 @@
+# Maintainer: ldu contributors <https://github.com/SmallThingz/ldu>
+pkgname=ldu-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Live disk usage with effort-first scanning (prebuilt binary)'
+arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
+url='https://github.com/SmallThingz/ldu'
+license=('MIT')
+provides=("ldu=$pkgver")
+conflicts=('ldu')
+# Do not rewrite the upstream executable or its embedded license archive.
+options=('!strip' '!debug')
+source=('LICENSE')
+sha256sums=('31382227e9e2b10b06cabcab5d9b523191eb8a33270f5b82fc13546a993c5ab6')
+source_x86_64=("ldu-$pkgver-x86_64::$url/releases/download/v$pkgver/ldu-linux-x86_64")
+sha256sums_x86_64=('48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4')
+source_aarch64=("ldu-$pkgver-aarch64::$url/releases/download/v$pkgver/ldu-linux-arm64")
+sha256sums_aarch64=('642220cafc90272ff4877829dc1abb9320620bcfc983823579ebd4491280f1d7')
+source_armv7h=("ldu-$pkgver-armv7h::$url/releases/download/v$pkgver/ldu-linux-armv7")
+sha256sums_armv7h=('cbdac2037597852618882b0d13a42c709611cc46b930855d0c30a590fdaed6ee')
+source_riscv64=("ldu-$pkgver-riscv64::$url/releases/download/v$pkgver/ldu-linux-riscv64")
+sha256sums_riscv64=('f4a8f810b4051da17a4b80d30c570e775f95425ef16e8beda98927d309428700')
+noextract=("ldu-$pkgver-x86_64" "ldu-$pkgver-aarch64" "ldu-$pkgver-armv7h" "ldu-$pkgver-riscv64")
+
+package() {
+    install -Dm755 "ldu-$pkgver-$CARCH" "$pkgdir/usr/bin/ldu"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

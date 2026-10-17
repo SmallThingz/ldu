@@ -1,0 +1,30 @@
+pkgbase = ldu-bin
+	pkgdesc = Live disk usage with effort-first scanning (prebuilt binary)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/SmallThingz/ldu
+	arch = x86_64
+	arch = aarch64
+	arch = armv7h
+	arch = riscv64
+	license = MIT
+	provides = ldu=0.1.0
+	conflicts = ldu
+	noextract = ldu-0.1.0-x86_64
+	noextract = ldu-0.1.0-aarch64
+	noextract = ldu-0.1.0-armv7h
+	noextract = ldu-0.1.0-riscv64
+	options = !strip
+	options = !debug
+	source = LICENSE
+	sha256sums = 31382227e9e2b10b06cabcab5d9b523191eb8a33270f5b82fc13546a993c5ab6
+	source_x86_64 = ldu-0.1.0-x86_64::https://github.com/SmallThingz/ldu/releases/download/v0.1.0/ldu-linux-x86_64
+	sha256sums_x86_64 = 48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4
+	source_aarch64 = ldu-0.1.0-aarch64::https://github.com/SmallThingz/ldu/releases/download/v0.1.0/ldu-linux-arm64
+	sha256sums_aarch64 = 642220cafc90272ff4877829dc1abb9320620bcfc983823579ebd4491280f1d7
+	source_armv7h = ldu-0.1.0-armv7h::https://github.com/SmallThingz/ldu/releases/download/v0.1.0/ldu-linux-armv7
+	sha256sums_armv7h = cbdac2037597852618882b0d13a42c709611cc46b930855d0c30a590fdaed6ee
+	source_riscv64 = ldu-0.1.0-riscv64::https://github.com/SmallThingz/ldu/releases/download/v0.1.0/ldu-linux-riscv64
+	sha256sums_riscv64 = f4a8f810b4051da17a4b80d30c570e775f95425ef16e8beda98927d309428700
+
+pkgname = ldu-bin

@@ -1,0 +1,47 @@
+# Maintainer: ldu contributors <https://github.com/SmallThingz/ldu>
+pkgname=ldu
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Live disk usage with effort-first scanning'
+arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
+url='https://github.com/SmallThingz/ldu'
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+# The helper checks the compiler release exactly; package epochs are distro-owned.
+makedepends=('cargo>=1.99' 'rust>=1.99' 'rust-docs>=1.99' 'python')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        'generate-notices.py')
+sha256sums=('a074a8a806ba732458fdd59b7b55d96116b984597ed3f7e3fbc0dfeac5b15470'
+            '4c3cc332b42cf409632af3356ed745eb04d4efeaeea20d8b8729293801ff476e')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    # Use Rust 1.99.0 from the distribution or an already installed rustup toolchain.
+    export RUSTUP_TOOLCHAIN=1.99.0
+    export RUSTUP_AUTO_INSTALL=0
+    [[ $(rustc --version) == 'rustc 1.99.0 '* ]] || {
+        error 'Rust 1.99.0 is required by the bundled runtime notice attribution'
+        return 1
+    }
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=1.99.0
+    export RUSTUP_AUTO_INSTALL=0
+    [[ $(rustc --version) == 'rustc 1.99.0 '* ]] || {
+        error 'Rust 1.99.0 is required by the bundled runtime notice attribution'
+        return 1
+    }
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --bin ldu
+    python "$srcdir/generate-notices.py" --source . --output THIRD-PARTY-NOTICES.txt
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/ldu "$pkgdir/usr/bin/ldu"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 THIRD-PARTY-NOTICES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
+}
