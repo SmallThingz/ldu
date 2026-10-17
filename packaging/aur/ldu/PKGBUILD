@@ -2,17 +2,18 @@
 pkgname=ldu
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Live disk usage with effort-first scanning'
+pkgdesc='Browse disk usage, preview files and queue deletions in your terminal'
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
 url='https://github.com/SmallThingz/ldu'
 license=('MIT')
 depends=('gcc-libs' 'glibc')
 # The helper checks the compiler release exactly; package epochs are distro-owned.
-makedepends=('cargo>=1.99' 'rust>=1.99' 'rust-docs>=1.99' 'python')
+# Arch's rust package supplies Cargo and the standard-library license catalog.
+makedepends=('rust>=1.99' 'python')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         'generate-notices.py')
 sha256sums=('a074a8a806ba732458fdd59b7b55d96116b984597ed3f7e3fbc0dfeac5b15470'
-            '4c3cc332b42cf409632af3356ed745eb04d4efeaeea20d8b8729293801ff476e')
+            '040a4cd243f6c868285ce2d6be4cbfb7e05bb368b5d32c7f35b8b97b665b3990')
 
 prepare() {
     cd "$pkgname-$pkgver"

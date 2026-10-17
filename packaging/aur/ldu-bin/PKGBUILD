@@ -2,7 +2,7 @@
 pkgname=ldu-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Live disk usage with effort-first scanning (prebuilt binary)'
+pkgdesc='Browse disk usage, preview files and queue deletions in your terminal'
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
 url='https://github.com/SmallThingz/ldu'
 license=('MIT')

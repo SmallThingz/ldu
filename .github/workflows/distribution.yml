@@ -99,6 +99,9 @@ jobs:
           installed=.tmp/nix-ci/result/bin/ldu
           test "$("$installed" --version)" = 'ldu 0.1.0'
           "$installed" --help > /dev/null
+          test "$(nix run --no-write-lock-file .# -- --version)" = 'ldu 0.1.0'
+          nix profile install --no-write-lock-file --profile "$PWD/.tmp/nix-ci/profile" .#
+          test "$(.tmp/nix-ci/profile/bin/ldu --version)" = 'ldu 0.1.0'
           python3 -c 'import hashlib; from pathlib import Path; assert hashlib.sha256(Path(".tmp/nix-ci/result/bin/ldu").read_bytes()).hexdigest() == "48f965d47ca9cb8e9d1768e12ab6a506b764ce9fda8bc6b6c0f2d09585f010b4"'
           printf 'payload' > .tmp/nix-ci/fixture/payload
           "$installed" -o .tmp/nix-ci/export.json .tmp/nix-ci/fixture
@@ -125,7 +128,7 @@ jobs:
       MAKEFLAGS: "-j2"
     steps:
       - name: Install declared build dependencies
-        run: pacman -Syu --noconfirm --needed git rust rust-docs python
+        run: pacman -Syu --noconfirm --needed git rust python
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false

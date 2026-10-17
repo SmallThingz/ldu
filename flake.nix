@@ -1,7 +1,7 @@
 {
   description = "LDU release binaries for Linux and macOS";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs = { self, nixpkgs }:
     let
@@ -60,7 +60,7 @@
             '';
 
             meta = {
-              description = "Live disk usage with effort-first scanning";
+              description = "Browse disk usage, preview files and queue deletions in your terminal";
               homepage = "https://github.com/SmallThingz/ldu";
               license = nixpkgs.lib.licenses.mit;
               sourceProvenance = [ nixpkgs.lib.sourceTypes.binaryNativeCode ];

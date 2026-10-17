@@ -1,5 +1,5 @@
 pkgbase = ldu
-	pkgdesc = Live disk usage with effort-first scanning
+	pkgdesc = Browse disk usage, preview files and queue deletions in your terminal
 	pkgver = 0.1.0
 	pkgrel = 1
 	url = https://github.com/SmallThingz/ldu
@@ -8,15 +8,13 @@ pkgbase = ldu
 	arch = armv7h
 	arch = riscv64
 	license = MIT
-	makedepends = cargo>=1.99
 	makedepends = rust>=1.99
-	makedepends = rust-docs>=1.99
 	makedepends = python
 	depends = gcc-libs
 	depends = glibc
 	source = ldu-0.1.0.tar.gz::https://github.com/SmallThingz/ldu/archive/refs/tags/v0.1.0.tar.gz
 	source = generate-notices.py
 	sha256sums = a074a8a806ba732458fdd59b7b55d96116b984597ed3f7e3fbc0dfeac5b15470
-	sha256sums = 4c3cc332b42cf409632af3356ed745eb04d4efeaeea20d8b8729293801ff476e
+	sha256sums = 040a4cd243f6c868285ce2d6be4cbfb7e05bb368b5d32c7f35b8b97b665b3990
 
 pkgname = ldu
